@@ -1,0 +1,11 @@
+﻿numpy>=1.26
+scipy>=1.11
+h5py>=3.10
+PyYAML>=6.0
+mne>=1.6
+moabb>=1.1
+scikit-learn>=1.4
+pandas>=2.0
+streamlit>=1.39
+pytest>=8.0
+

@@ -1,0 +1,13 @@
+# Independent data-preparation environment only.
+#
+# The main training/replay environment reads the already generated HDF5 file
+# directly and does not install or import MOABB. Create a separate environment
+# for downloading BNCI2014_001 and regenerating data/processed/*.h5.
+
+numpy==1.26.4
+scipy>=1.11
+h5py>=3.10
+PyYAML>=6.0
+mne>=1.6
+moabb>=1.1
+

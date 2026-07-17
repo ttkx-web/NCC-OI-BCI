@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: bci-dayloop
+Version: 0.1.0
+Summary: Day-one BNCI2014-001 to LaBraM linear-probe BCI pipeline
+Requires-Python: <3.12,>=3.11
+Requires-Dist: h5py>=3.10
+Requires-Dist: mne>=1.6
+Requires-Dist: numpy==1.26.4
+Requires-Dist: pandas>=2.0
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: scikit-learn>=1.4
+Requires-Dist: scipy>=1.11
+Requires-Dist: streamlit>=1.39
+Requires-Dist: torch<2.1,>=2.0.1
+Requires-Dist: torchvision==0.15.2
+Requires-Dist: torchaudio==2.0.2
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"

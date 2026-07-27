@@ -8,8 +8,7 @@ import numpy as np
 
 from bci_dayloop.acquisition.base import AbstractAcquirer
 from bci_dayloop.control.commands import command_for_prediction
-from bci_dayloop.data.preprocessing import EEGPreprocessor
-from bci_dayloop.models.base import BaseModelAdapter
+from bci_dayloop.models.base import BaseModelAdapter, ModelPreprocessor, add_batch_dimension
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +30,7 @@ class SlidingWindowDecoder:
     def __init__(
         self,
         model: BaseModelAdapter,
-        preprocessor: EEGPreprocessor,
+        preprocessor: ModelPreprocessor,
         class_names: list[str],
         *,
         sample_rate: float,
@@ -80,7 +79,7 @@ class SlidingWindowDecoder:
             self.input_unit,
             reshape=True,
         )
-        probabilities = self.model.predict_proba(model_input[None, ...])[0]
+        probabilities = self.model.predict_proba(add_batch_dimension(model_input))[0]
         class_id = int(np.argmax(probabilities))
         confidence = float(probabilities[class_id])
         prediction = self.class_names[class_id]

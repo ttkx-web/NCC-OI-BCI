@@ -1,0 +1,1 @@
+"""50M EEG foundation model integration package."""

@@ -15,8 +15,35 @@
 | 会话划分 | `0train` / `1test` |
 | 任务 | 四分类运动想象 |
 | 类别 | `left_hand`、`right_hand`、`feet`、`tongue` |
-| 窗口长度 | 4 秒 |
-| 窗口步长 | 0.5 秒 |
+| 历史 LaBraM Pipeline 窗口长度 | 4 秒 |
+| 历史 LaBraM Pipeline 窗口步长 | 0.5 秒 |
+
+## 阶段 0.5 窗口决策
+
+### 历史 LaBraM 基线
+
+- 原 LaBraM Pipeline 使用 4 秒窗口。
+- 步长为 0.5 秒。
+
+### 当前正式 50M 决定
+
+- 阶段 0.5 的 50M Pipeline 使用 10 秒窗口，步长保持 0.5 秒。
+- 目标采样率为 100 Hz；标准输入形状为 `64 × 1000`。
+- patch 长度为 100 samples；时间 patch 数为 10；token 数为 640。
+- embedding 维度为 512；Transformer 深度为 12；`output_layer_idx=8`；`aggregation=flatten`。
+- 四分类顺序固定为：`left_hand`、`right_hand`、`feet`、`tongue`。
+
+### 已核验的 50M checkpoint
+
+- 路径：`E:\code\BCI_DayLoop\checkpoints\50M\pretrain_checkpoint_4.pt`
+- SHA-256：`97335B696B3AE9138DCB51C736F49EE1C6008FDC22FC42F13EA9A5301452F36E`
+- 顶层权重 key：`model_state_dict`
+- `time_embed.weight=(10,512)`
+- `channel_embed.weight=(64,512)`
+- `tokenizer.proj.0.weight=(512,100)`
+- objective：基于权重与输出头结构，高置信度为 `timefreq`。
+
+50M Adapter、四分类分类头和模型包加载尚未作为阶段 0.5 交付完成；以上记录不表示它们已接入 Pipeline。
 
 ## 环境与命令结果
 

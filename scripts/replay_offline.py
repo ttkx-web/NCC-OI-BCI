@@ -52,6 +52,20 @@ def main() -> None:
         confidence_threshold=float(replay["confidence_threshold"]),
         command_map=command_map,
     )
+    expected_window_samples = round(
+        float(replay["window_sec"]) * metadata.sample_rate
+    )
+
+    print("Replay window:", float(replay["window_sec"]), "seconds")
+    print("Raw EEG sample rate:", metadata.sample_rate, "Hz")
+    print("Decoder window samples:", decoder.window_samples)
+    print("Expected window samples:", expected_window_samples)
+
+    assert decoder.window_samples == expected_window_samples, (
+        "Decoder window size does not match the replay configuration: "
+        f"decoder={decoder.window_samples}, "
+        f"expected={expected_window_samples}"
+    )
     maximum = args.max_windows or int(replay["max_windows"])
     for result in decoder.run(acquirer, max_windows=maximum):
         print(json.dumps(result.to_dict(), ensure_ascii=False))

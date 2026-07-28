@@ -23,6 +23,9 @@ src/bci_dayloop/models/base.py
 src/bci_dayloop/models/factory.py
 src/bci_dayloop/models/labram_backbone.py
 src/bci_dayloop/models/labram_linear.py
+src/bci_dayloop/models/model_50m/config.py
+src/bci_dayloop/models/model_50m/preprocessing.py
+src/bci_dayloop/models/model_50m/tokenization.py
 src/bci_dayloop/training/__init__.py
 src/bci_dayloop/training/pipeline.py
 src/bci_dayloop/utils/__init__.py

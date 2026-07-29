@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,7 +11,6 @@ from typing import Any
 from _bootstrap import ROOT  # noqa: F401
 from bci_dayloop.acquisition.factory import AcquirerFactory
 from bci_dayloop.data.hdf5_dataset import EEGHDF5, HDF5Metadata
-from bci_dayloop.data.preprocessing import EEGPreprocessor
 from bci_dayloop.inference.observability import (
     JsonlWindowLogger,
     PipelineRunStats,
@@ -22,6 +21,7 @@ from bci_dayloop.inference.realtime import SlidingWindowDecoder
 from bci_dayloop.inference.run_report import PipelineRunReport
 from bci_dayloop.inference.runtime_control import PipelineController, PipelineControllerSnapshot, PipelineState
 from bci_dayloop.models.factory import ModelFactory
+from bci_dayloop.models.runtime_package import ModelRuntimePackage, validate_runtime_request
 from bci_dayloop.utils.config import load_yaml, resolve_path
 
 
@@ -143,6 +143,7 @@ def build_report(
     controller_snapshot: PipelineControllerSnapshot | None,
     fallback_state: PipelineState = PipelineState.IDLE,
     fallback_error: Exception | None = None,
+    runtime_package: ModelRuntimePackage | None = None,
 ) -> PipelineRunReport:
     if controller_snapshot is None:
         state = fallback_state.value
@@ -187,6 +188,8 @@ def build_report(
         jsonl_log_path=str(settings.jsonl_log_path) if settings.jsonl_log_path is not None else None,
         last_error_type=error_type,
         last_error_message=error_message,
+        is_test_head=runtime_package.is_test_head if runtime_package else False,
+        model_warning=runtime_package.warning_message if runtime_package else None,
     )
 
 
@@ -194,9 +197,10 @@ def build_pipeline_controller(
     settings: ReplaySettings,
     *,
     model: Any,
-    preprocessor: EEGPreprocessor,
+    preprocessor: Any,
     metadata: HDF5Metadata,
     command_map: dict[str, str],
+    class_names: list[str] | tuple[str, ...] | None = None,
     stats: PipelineRunStats,
     target_windows: int,
 ) -> PipelineController:
@@ -204,7 +208,7 @@ def build_pipeline_controller(
     decoder = SlidingWindowDecoder(
         model,
         preprocessor,
-        metadata.class_names,
+        list(class_names or metadata.class_names),
         sample_rate=metadata.sample_rate,
         input_unit=metadata.unit,
         window_sec=settings.window_sec,
@@ -264,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     stats = PipelineRunStats()
     metadata: HDF5Metadata | None = None
     model_name: str | None = None
+    runtime_package: ModelRuntimePackage | None = None
     expected_windows = 0
     target_windows = 0
     controller: PipelineController | None = None
@@ -274,6 +279,17 @@ def main(argv: list[str] | None = None) -> int:
         dataset = EEGHDF5(settings.data_path)
         metadata = dataset.metadata
         trials = dataset.load(settings.session)["data"]
+        runtime_package = ModelFactory.load_runtime_package(settings.model_package, metadata, device=settings.device)
+        package_window = runtime_package.window_sec
+        package_step = runtime_package.step_sec
+        explicit_window = args.window_sec is not None
+        explicit_step = args.step_sec is not None
+        if runtime_package.model_name == "50m-linear":
+            if explicit_window or "window_sec" in config.get("replay", {}):
+                validate_runtime_request(runtime_package, window_sec=settings.window_sec, step_sec=package_step)
+            if explicit_step or "step_sec" in config.get("replay", {}):
+                validate_runtime_request(runtime_package, window_sec=package_window, step_sec=settings.step_sec)
+            settings = dataclass_replace(settings, window_sec=package_window, step_sec=package_step)
         expected_windows, target_windows = expected_and_target_windows(
             trial_count=int(trials.shape[0]),
             samples_per_trial=int(trials.shape[-1]),
@@ -284,18 +300,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         stats.set_expected_windows(target_windows)
 
-        model_yaml = load_yaml(settings.model_package / "model.yaml")
-        model_name = str(model_yaml.get("name")) if model_yaml.get("name") is not None else None
-        model = ModelFactory.load_package(settings.model_package, device=settings.device)
-        preprocessor = EEGPreprocessor(load_yaml(settings.model_package / "preprocessing.yaml"))
-        with (settings.model_package / "command_map.json").open("r", encoding="utf-8") as handle:
-            command_map = json.load(handle)
+        model_name = runtime_package.model_name
+        if runtime_package.is_test_head:
+            print(f"WARNING: {runtime_package.warning_message}", file=sys.stderr)
         controller = build_pipeline_controller(
             settings,
-            model=model,
-            preprocessor=preprocessor,
+            model=runtime_package.model,
+            preprocessor=runtime_package.preprocessor,
             metadata=metadata,
-            command_map=command_map,
+            command_map=runtime_package.command_map,
+            class_names=runtime_package.class_names,
             stats=stats,
             target_windows=target_windows,
         )
@@ -320,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
             controller_snapshot=snapshot,
             fallback_state=fallback_state,
             fallback_error=caught_error,
+            runtime_package=runtime_package,
         )
         try:
             report.save_json(settings.summary_json_path)

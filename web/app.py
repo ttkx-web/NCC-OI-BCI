@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -17,7 +16,6 @@ if str(SRC) not in sys.path:
 
 from bci_dayloop.acquisition.factory import AcquirerFactory  # noqa: E402
 from bci_dayloop.data.hdf5_dataset import EEGHDF5  # noqa: E402
-from bci_dayloop.data.preprocessing import EEGPreprocessor  # noqa: E402
 from bci_dayloop.inference.observability import (  # noqa: E402
     JsonlWindowLogger,
     PipelineRunStats,
@@ -26,6 +24,7 @@ from bci_dayloop.inference.observability import (  # noqa: E402
 from bci_dayloop.inference.realtime import SlidingWindowDecoder  # noqa: E402
 from bci_dayloop.inference.runtime_control import PipelineController, PipelineState  # noqa: E402
 from bci_dayloop.models.factory import ModelFactory  # noqa: E402
+from bci_dayloop.models.runtime_package import validate_runtime_request  # noqa: E402
 from bci_dayloop.utils.config import load_yaml  # noqa: E402
 from web.ui_runtime import (  # noqa: E402
     UiEventQueue,
@@ -48,11 +47,6 @@ def describe_data(path: str) -> tuple[list[str], list[str], float, str, list[str
 def describe_session(path: str, session: str) -> tuple[int, int]:
     trials = EEGHDF5(path).load(session)["data"]
     return int(trials.shape[0]), int(trials.shape[-1])
-
-
-@st.cache_resource(max_entries=4)
-def load_model_package(path: str, device: str):
-    return ModelFactory.load_package(path, device=device)
 
 
 def discover_hdf5() -> list[str]:
@@ -122,6 +116,14 @@ with st.sidebar:
         )
     else:
         package_path = st.selectbox("Model package", packages, disabled=not availability.configuration_enabled)
+    try:
+        selected_package_name = str(load_yaml(Path(package_path) / "model.yaml").get("name"))
+    except Exception:  # noqa: BLE001
+        selected_package_name = None
+    package_window_default = 10.0 if selected_package_name == "50m-linear" else 4.0
+    package_step_default = 0.5
+    if selected_package_name:
+        st.caption(f"Package model: {selected_package_name}")
     acquirer_name = st.selectbox(
         "Acquirer", AcquirerFactory.list_acquirers(), disabled=not availability.configuration_enabled
     )
@@ -142,12 +144,12 @@ with st.sidebar:
     )
     window_sec = float(
         st.number_input(
-            "Window seconds", min_value=0.1, value=4.0, step=0.5, disabled=not availability.configuration_enabled
+            "Window seconds", min_value=0.1, value=package_window_default, step=0.5, disabled=not availability.configuration_enabled
         )
     )
     step_sec = float(
         st.number_input(
-            "Step seconds", min_value=0.1, value=0.5, step=0.1, disabled=not availability.configuration_enabled
+            "Step seconds", min_value=0.1, value=package_step_default, step=0.1, disabled=not availability.configuration_enabled
         )
     )
     enable_jsonl = st.checkbox("Enable JSONL logging", disabled=not availability.configuration_enabled)
@@ -206,13 +208,10 @@ if start_clicked:
         if step_sec <= 0 or step_sec > window_sec:
             raise ValueError("Step seconds must be greater than zero and no greater than Window seconds")
         package = Path(package_path)
-        model_yaml = load_yaml(package / "model.yaml")
-        if model_yaml.get("name") != model_name:
-            raise ValueError(f"Package contains {model_yaml.get('name')}, not {model_name}")
-        model = load_model_package(str(package.resolve()), str(device))
-        preprocessing = EEGPreprocessor(load_yaml(package / "preprocessing.yaml"))
-        with (package / "command_map.json").open("r", encoding="utf-8") as handle:
-            command_map = json.load(handle)
+        runtime_package = ModelFactory.load_runtime_package(package, EEGHDF5(data_path).metadata, device=str(device))
+        validate_runtime_request(runtime_package, window_sec=window_sec, step_sec=step_sec)
+        if runtime_package.is_test_head:
+            st.warning(runtime_package.warning_message or "仅用于链路验证，预测和置信度无准确率意义")
 
         target_windows = target_window_count(expected_windows, max_windows)
         stats = PipelineRunStats()
@@ -220,15 +219,15 @@ if start_clicked:
         event_queue = UiEventQueue()
         logger = JsonlWindowLogger(jsonl_path) if enable_jsonl else None
         decoder = SlidingWindowDecoder(
-            model,
-            preprocessing,
-            class_names,
+            runtime_package.model,
+            runtime_package.preprocessor,
+            list(runtime_package.class_names),
             sample_rate=sample_rate,
             input_unit=input_unit,
             window_sec=window_sec,
             step_sec=step_sec,
             confidence_threshold=float(threshold),
-            command_map=command_map,
+            command_map=runtime_package.command_map,
             run_stats=stats,
             jsonl_logger=logger,
         )
@@ -255,15 +254,16 @@ if start_clicked:
             "data_path": data_path,
             "session": session,
             "model_package": package_path,
-            "model": model_name,
-            "window_sec": window_sec,
-            "step_sec": step_sec,
+            "model": runtime_package.model_name,
+            "window_sec": runtime_package.window_sec,
+            "step_sec": runtime_package.step_sec,
             "maximum_windows": max_windows,
             "expected_windows": target_windows,
             "channel_names": channel_names,
             "input_unit": input_unit,
             "jsonl_logging": enable_jsonl,
             "jsonl_path": jsonl_path if enable_jsonl else None,
+            "model_warning": runtime_package.warning_message,
         }
         controller.start()
     except Exception as exc:  # noqa: BLE001

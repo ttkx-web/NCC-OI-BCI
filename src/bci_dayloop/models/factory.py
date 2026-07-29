@@ -8,11 +8,13 @@ from bci_dayloop.models.base import BaseModelAdapter
 
 ModelBuilder = Callable[..., BaseModelAdapter]
 PackageLoader = Callable[..., BaseModelAdapter]
+RuntimeLoader = Callable[..., Any]
 
 
 class ModelFactory:
     _registry: dict[str, ModelBuilder] = {}
     _package_loaders: dict[str, PackageLoader] = {}
+    _runtime_loaders: dict[str, RuntimeLoader] = {}
 
     @classmethod
     def register(cls, name: str, builder: ModelBuilder) -> None:
@@ -48,6 +50,24 @@ class ModelFactory:
             )
         return cls._package_loaders[name](path, device=device)
 
+    @classmethod
+    def register_runtime_loader(cls, name: str, loader: RuntimeLoader) -> None:
+        cls._runtime_loaders[name] = loader
+
+    @classmethod
+    def list_runtime_loaders(cls) -> list[str]:
+        return sorted(cls._runtime_loaders)
+
+    @classmethod
+    def load_runtime_package(cls, package_path: str | Path, metadata: Any, device: str = "cpu") -> Any:
+        from bci_dayloop.utils.config import load_yaml
+
+        package = Path(package_path)
+        name = str(load_yaml(package / "model.yaml")["name"])
+        if name not in cls._runtime_loaders:
+            raise ValueError(f"Unknown model runtime package '{name}'. Available: {', '.join(cls.list_runtime_loaders())}")
+        return cls._runtime_loaders[name](package, metadata, device=device)
+
 
 def register_default_models() -> None:
     if "labram-linear" not in ModelFactory._registry or "labram-linear" not in ModelFactory._package_loaders:
@@ -79,6 +99,11 @@ def register_default_models() -> None:
                 ModelFactory.register("50m-linear", Model50MAdapter)
             if "50m-linear" not in ModelFactory._package_loaders:
                 ModelFactory.register_package_loader("50m-linear", Model50MAdapter.from_package)
+    from bci_dayloop.models.runtime_package import load_50m_runtime_package, load_labram_runtime_package
+    if "labram-linear" not in ModelFactory._runtime_loaders:
+        ModelFactory.register_runtime_loader("labram-linear", load_labram_runtime_package)
+    if "50m-linear" not in ModelFactory._runtime_loaders:
+        ModelFactory.register_runtime_loader("50m-linear", load_50m_runtime_package)
 
 
 register_default_models()

@@ -55,6 +55,8 @@ class PipelineRunReport:
     jsonl_log_path: str | None
     last_error_type: str | None
     last_error_message: str | None
+    is_test_head: bool = False
+    model_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _native_json_value(asdict(self))

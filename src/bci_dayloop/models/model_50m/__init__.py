@@ -11,6 +11,12 @@ from .classifier import Model50MClassifier
 from .config import Model50MConfig
 from .preprocessing import Model50MPreprocessor
 from .tokenization import Model50MTokenizer
+from .runtime import (
+    Model50MRuntime,
+    Model50MRuntimePrediction,
+    build_50m_runtime,
+    build_50m_runtime_from_metadata,
+)
 
 __all__ = [
     "AdapterTiming",
@@ -22,4 +28,8 @@ __all__ = [
     "Model50MTokenizer",
     "RawPredictionResult",
     "build_model50m_adapter",
+    "Model50MRuntime",
+    "Model50MRuntimePrediction",
+    "build_50m_runtime",
+    "build_50m_runtime_from_metadata",
 ]

@@ -20,14 +20,21 @@ preprocessing:
   patch_samples: 200
 
 model:
-  name: labram-linear
-  architecture: labram_base_patch200_200
-  checkpoint: checkpoints/labram-base.pth
-  device: cuda
-  amp: true
+  name: 50m-linear
+  checkpoint: checkpoints/50m/model_deploy.pt
+  classifier: checkpoints/50m/test_linear_head.pt
+  device: cpu
   freeze_encoder: true
-  embedding_batch_size: 4
-  random_init: false
+
+model_50m:
+  target_sample_rate: 100.0
+  window_seconds: 10.0
+  patch_seconds: 1.0
+  patch_stride_seconds: 1.0
+  output_layer_idx: 8
+  aggregation: flatten
+  reference_mode: none
+  filter_hz: [0.1, 75.0]
 
 training:
   validation_fraction: 0.2

@@ -22,10 +22,10 @@ def main() -> None:
 
     runtime = build_50m_runtime_from_metadata(
         checkpoint_path=(
-            ROOT / "/Volumes/file/NCC-OI-BCI/checkpoints/model.pt"
+            ROOT / "checkpoints/model.pt"
         ),
         classifier_path=(
-            ROOT / "/Volumes/file/NCC-OI-BCI/checkpoints/test_linear_head.pt"
+            ROOT / "checkpoints/test_linear_head.pt"
         ),
         metadata=metadata,
         device="cpu",

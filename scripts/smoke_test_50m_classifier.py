@@ -17,12 +17,12 @@ from bci_dayloop.models.model_50m.config import (
 from bci_dayloop.models.model_50m.tokenization import (
     Model50MTokenizer,
 )
-
+from _bootstrap import ROOT
 
 def main() -> None:
     config = Model50MConfig(
-        checkpoint_path=Path(
-            "/Volumes/file/NCC-OI-BCI/checkpoints/model.pt"
+        checkpoint_path=(
+            ROOT / "checkpoints/model.pt"
         ),
         classifier_path=None,
         device="cpu",
@@ -103,9 +103,7 @@ def main() -> None:
     )
 
     # 测试任务头保存与重新加载。
-    head_path = Path(
-        "/Volumes/file/NCC-OI-BCI/checkpoints/test_linear_head.pt"
-    )
+    head_path = (ROOT / "checkpoints/test_linear_head.pt")
 
     save_classifier_checkpoint(
         classifier=classifier,

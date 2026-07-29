@@ -9,14 +9,16 @@ from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
 )
 
+from _bootstrap import ROOT
+
 
 def main() -> None:
     config = Model50MConfig(
-        checkpoint_path=Path(
-            "/Volumes/file/NCC-OI-BCI/checkpoints/model.pt"
+        checkpoint_path=(
+            ROOT / "checkpoints/model.pt"
         ),
-        classifier_path=Path(
-            "/Volumes/file/NCC-OI-BCI/checkpoints/test_linear_head.pt"
+        classifier_path=(
+            ROOT / "checkpoints/test_linear_head.pt"
         ),
         device="cpu",
         aggregation="flatten",

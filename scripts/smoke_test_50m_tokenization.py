@@ -3,10 +3,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.bci_dayloop.models.model_50m.config import (
+from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
 )
-from src.bci_dayloop.models.model_50m.tokenization import (
+from bci_dayloop.models.model_50m.tokenization import (
     Model50MTokenizer,
 )
 
@@ -63,23 +63,6 @@ print(
 print(
     "batched token_time_indices:",
     batch.token_time_indices.shape,
-)
-print(
-
-    "Replay window:",
-
-    replay_config["window_sec"],
-
-)
-
-
-
-print(
-
-    "Decoder window samples:",
-
-    decoder.window_samples,
-
 )
 
 assert tokens.token_inputs.shape == (640, 100)

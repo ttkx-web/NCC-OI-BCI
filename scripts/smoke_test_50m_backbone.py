@@ -11,12 +11,12 @@ from bci_dayloop.models.model_50m.config import (
 from bci_dayloop.models.model_50m.tokenization import (
     Model50MTokenizer,
 )
-
+from _bootstrap import ROOT
 
 def main() -> None:
     config = Model50MConfig(
-        checkpoint_path=Path(
-            "/Volumes/file/NCC-OI-BCI/checkpoints/model.pt"
+        checkpoint_path=(
+            ROOT / "checkpoints/model.pt"
         ),
         device="cpu",
     )

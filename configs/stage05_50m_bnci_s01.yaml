@@ -1,0 +1,69 @@
+project:
+  seed: 42
+  run_dir: runs/day1_bnci_s01
+
+data:
+  dataset: BNCI2014_001
+  subject: 1
+  output_hdf5: data/processed/bnci2014_001_s01.h5
+  train_session: 0train
+  test_session: 1test
+  trial_tmin_sec: 2.0
+  trial_tmax_sec: 6.0
+
+preprocessing:
+  bandpass_hz: [0.1, 75.0]
+  notch_hz: 50.0
+  target_sample_rate: 200.0
+  output_unit: uV
+  zscore_epsilon: 1.0e-6
+  patch_samples: 200
+
+model:
+  name: 50m-linear
+  checkpoint: checkpoints/50m/model_deploy.pt
+  classifier: checkpoints/50m/test_linear_head.pt
+  device: cpu
+  freeze_encoder: true
+
+model_50m:
+  target_sample_rate: 100.0
+  window_seconds: 10.0
+  patch_seconds: 1.0
+  patch_stride_seconds: 1.0
+  output_layer_idx: 8
+  aggregation: flatten
+  reference_mode: none
+  filter_hz: [0.1, 75.0]
+
+training:
+  validation_fraction: 0.2
+  epochs: 80
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  patience: 12
+
+replay:
+  acquirer: replay
+  session: 1test
+  speed: 1.0
+  loop: false
+
+  # 50M 原始配置使用 10 秒窗口。
+  window_sec: 10.0
+
+  # 保持每 0.5 秒产生一次预测。
+  step_sec: 0.5
+
+  confidence_threshold: 0.55
+  max_windows: 100
+
+labels:
+  class_names: [left_hand, right_hand, feet, tongue]
+  command_map:
+    left_hand: LEFT
+    right_hand: RIGHT
+    feet: FORWARD
+    tongue: STOP
+

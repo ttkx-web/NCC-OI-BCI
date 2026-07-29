@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
+from typing import Protocol
 
 import numpy as np
 
@@ -10,6 +11,10 @@ from bci_dayloop.acquisition.base import AbstractAcquirer
 from bci_dayloop.control.commands import command_for_prediction
 from bci_dayloop.inference.observability import JsonlWindowLogger, LatencyBreakdown, PipelineRunStats
 from bci_dayloop.models.base import BaseModelAdapter, ModelPreprocessor, add_batch_dimension
+
+
+class StopEvent(Protocol):
+    def is_set(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +151,7 @@ class SlidingWindowDecoder:
         *,
         max_windows: int | None = None,
         callback: Callable[[DecodeResult, np.ndarray], None] | None = None,
+        stop_event: StopEvent | None = None,
     ) -> Iterator[DecodeResult]:
         self.reset()
         if self.run_stats is not None:
@@ -154,8 +160,14 @@ class SlidingWindowDecoder:
         emitted = 0
         try:
             while max_windows is None or emitted < max_windows:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 samples, _ = acquirer.get_new_samples()
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if samples.shape[1] == 0:
+                    break
+                if stop_event is not None and stop_event.is_set():
                     break
                 result = self.push(
                     samples,
@@ -167,6 +179,8 @@ class SlidingWindowDecoder:
                 emitted += 1
                 if callback is not None:
                     callback(result, samples)
+                if stop_event is not None and stop_event.is_set():
+                    break
                 yield result
         finally:
             acquirer.stop_stream()

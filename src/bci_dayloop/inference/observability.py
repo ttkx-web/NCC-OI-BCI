@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,69 +45,77 @@ class PipelineRunStats:
     """In-memory counters and latency statistics for one decoder run."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self.reset()
 
     def start(self) -> None:
-        if self._started_at is None:
-            self._started_at = time.perf_counter()
+        with self._lock:
+            if self._started_at is None:
+                self._started_at = time.perf_counter()
 
     def reset(self) -> None:
-        self._started_at: float | None = None
-        self._chunks_received = 0
-        self._expected_windows: int | None = None
-        self._emitted_windows = 0
-        self._successful_windows = 0
-        self._failed_windows = 0
-        self._latencies: list[LatencyBreakdown] = []
+        with self._lock:
+            self._started_at: float | None = None
+            self._chunks_received = 0
+            self._expected_windows: int | None = None
+            self._emitted_windows = 0
+            self._successful_windows = 0
+            self._failed_windows = 0
+            self._latencies: list[LatencyBreakdown] = []
 
     def record_chunk(self) -> None:
-        self.start()
-        self._chunks_received += 1
+        with self._lock:
+            self.start()
+            self._chunks_received += 1
 
     def record_success(self, latency: LatencyBreakdown) -> None:
-        self.start()
-        self._emitted_windows += 1
-        self._successful_windows += 1
-        self._latencies.append(latency)
+        with self._lock:
+            self.start()
+            self._emitted_windows += 1
+            self._successful_windows += 1
+            self._latencies.append(latency)
 
     def record_failure(self) -> None:
-        self.start()
-        self._emitted_windows += 1
-        self._failed_windows += 1
+        with self._lock:
+            self.start()
+            self._emitted_windows += 1
+            self._failed_windows += 1
 
     def set_expected_windows(self, value: int | None) -> None:
         if value is not None and value < 0:
             raise ValueError(f"expected_windows must be non-negative or None, got {value}")
-        self._expected_windows = value
+        with self._lock:
+            self._expected_windows = value
 
     def snapshot(self) -> PipelineStatsSnapshot:
-        runtime_sec = 0.0 if self._started_at is None else time.perf_counter() - self._started_at
-        if not self._latencies:
-            current_latency_ms = average_latency_ms = p95_latency_ms = None
-            preprocessing_average_ms = model_average_ms = None
-        else:
-            totals = np.asarray([item.total_ms for item in self._latencies], dtype=float)
-            preprocessings = np.asarray([item.preprocessing_ms for item in self._latencies], dtype=float)
-            models = np.asarray([item.model_ms for item in self._latencies], dtype=float)
-            current_latency_ms = float(totals[-1])
-            average_latency_ms = float(totals.mean())
-            p95_latency_ms = float(np.percentile(totals, 95))
-            preprocessing_average_ms = float(preprocessings.mean())
-            model_average_ms = float(models.mean())
-        return PipelineStatsSnapshot(
-            started_at=self._started_at,
-            runtime_sec=float(runtime_sec),
-            chunks_received=self._chunks_received,
-            expected_windows=self._expected_windows,
-            emitted_windows=self._emitted_windows,
-            successful_windows=self._successful_windows,
-            failed_windows=self._failed_windows,
-            current_latency_ms=current_latency_ms,
-            average_latency_ms=average_latency_ms,
-            p95_latency_ms=p95_latency_ms,
-            preprocessing_average_ms=preprocessing_average_ms,
-            model_average_ms=model_average_ms,
-        )
+        with self._lock:
+            runtime_sec = 0.0 if self._started_at is None else time.perf_counter() - self._started_at
+            if not self._latencies:
+                current_latency_ms = average_latency_ms = p95_latency_ms = None
+                preprocessing_average_ms = model_average_ms = None
+            else:
+                totals = np.asarray([item.total_ms for item in self._latencies], dtype=float)
+                preprocessings = np.asarray([item.preprocessing_ms for item in self._latencies], dtype=float)
+                models = np.asarray([item.model_ms for item in self._latencies], dtype=float)
+                current_latency_ms = float(totals[-1])
+                average_latency_ms = float(totals.mean())
+                p95_latency_ms = float(np.percentile(totals, 95))
+                preprocessing_average_ms = float(preprocessings.mean())
+                model_average_ms = float(models.mean())
+            return PipelineStatsSnapshot(
+                started_at=self._started_at,
+                runtime_sec=float(runtime_sec),
+                chunks_received=self._chunks_received,
+                expected_windows=self._expected_windows,
+                emitted_windows=self._emitted_windows,
+                successful_windows=self._successful_windows,
+                failed_windows=self._failed_windows,
+                current_latency_ms=current_latency_ms,
+                average_latency_ms=average_latency_ms,
+                p95_latency_ms=p95_latency_ms,
+                preprocessing_average_ms=preprocessing_average_ms,
+                model_average_ms=model_average_ms,
+            )
 
 
 def calculate_expected_windows(total_samples: int, window_samples: int, step_samples: int) -> int:

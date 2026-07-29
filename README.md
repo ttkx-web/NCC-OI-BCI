@@ -9,6 +9,12 @@ interfaces follow their useful adapter/factory/replay patterns, while the
 PyTorch-only LaBraM backbone follows the official `labram_base_patch200_200`
 state-dict layout and channel-position indexing.
 
+## 50M Model Adapter
+
+阶段 0.5 的 50M 模型适配说明见：
+
+- [50M Model Adapter README](docs/README_50M_MODEL_ADAPTER.md)
+
 ## Pipeline
 
 1. A separate data-preparation environment uses MOABB to download BNCI2014_001 Subject 1.
@@ -164,8 +170,3 @@ keep `checkpoints/labram-base.pth` available when moving or reloading a package.
 Real EEG devices, Unity/physical vehicle control, LoRA, full fine-tuning,
 Kubernetes, MLflow, databases, React, and FastAPI are not implemented.
 
-## 50M Model Adapter
-
-阶段 0.5 的 50M 模型适配说明见：
-
-- [50M Model Adapter README](docs/README_50M_MODEL_ADAPTER.md)

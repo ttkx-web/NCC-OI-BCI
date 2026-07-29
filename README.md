@@ -163,3 +163,9 @@ keep `checkpoints/labram-base.pth` available when moving or reloading a package.
 
 Real EEG devices, Unity/physical vehicle control, LoRA, full fine-tuning,
 Kubernetes, MLflow, databases, React, and FastAPI are not implemented.
+
+## 50M Model Adapter
+
+阶段 0.5 的 50M 模型适配说明见：
+
+- [50M Model Adapter README](docs/README_50M_MODEL_ADAPTER.md)

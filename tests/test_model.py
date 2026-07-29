@@ -77,7 +77,7 @@ def test_labram_package_loader_is_registered():
 def test_unknown_model_package_name_has_clear_error(tmp_path):
     (tmp_path / "model.yaml").write_text("name: unknown-model\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Unknown model package 'unknown-model'. Available: labram-linear"):
+    with pytest.raises(ValueError, match="Unknown model package 'unknown-model'. Available: 50m-linear, labram-linear"):
         ModelFactory.load_package(tmp_path)
 
 

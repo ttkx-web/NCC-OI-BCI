@@ -57,6 +57,28 @@ def register_default_models() -> None:
             ModelFactory.register("labram-linear", LaBraMLinearAdapter)
         if "labram-linear" not in ModelFactory._package_loaders:
             ModelFactory.register_package_loader("labram-linear", LaBraMLinearAdapter.from_package)
+    if "50m-linear" not in ModelFactory._registry or "50m-linear" not in ModelFactory._package_loaders:
+        try:
+            from bci_dayloop.models.model_50m.adapter import Model50MAdapter
+        except ImportError as import_error:
+            def unavailable_50m_adapter(
+                *args: Any,
+                _import_error: ImportError = import_error,
+                **kwargs: Any,
+            ) -> BaseModelAdapter:
+                raise RuntimeError(
+                    "50m-linear is unavailable because its optional dependencies could not be imported"
+                ) from _import_error
+
+            if "50m-linear" not in ModelFactory._registry:
+                ModelFactory.register("50m-linear", unavailable_50m_adapter)
+            if "50m-linear" not in ModelFactory._package_loaders:
+                ModelFactory.register_package_loader("50m-linear", unavailable_50m_adapter)
+        else:
+            if "50m-linear" not in ModelFactory._registry:
+                ModelFactory.register("50m-linear", Model50MAdapter)
+            if "50m-linear" not in ModelFactory._package_loaders:
+                ModelFactory.register_package_loader("50m-linear", Model50MAdapter.from_package)
 
 
 register_default_models()

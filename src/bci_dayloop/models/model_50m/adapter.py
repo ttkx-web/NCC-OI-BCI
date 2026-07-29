@@ -3,16 +3,23 @@ from __future__ import annotations
 import time
 import warnings
 from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 import torch
+
+from bci_dayloop.models.base import BaseModelAdapter, ModelInput
+from bci_dayloop.utils.config import dump_json, dump_yaml, load_yaml
 
 from .backbone import Model50MBackbone
 from .classifier import (
     ClassifierLoadReport,
     Model50MClassifier,
     load_classifier_checkpoint,
+    save_classifier_checkpoint,
 )
 from .config import Model50MConfig
 from .preprocessing import (
@@ -79,7 +86,7 @@ class RawPredictionResult:
         }
 
 
-class Model50MAdapter:
+class Model50MAdapter(BaseModelAdapter):
     """
     50M 模型与当前 BCI Pipeline 之间的适配层。
 
@@ -110,6 +117,8 @@ class Model50MAdapter:
     因此，只要 50M 专用预处理返回 [64, 1000]，
     当前 Decoder 不需要修改 predict_proba 调用方式。
     """
+
+    model_name = "50m-linear"
 
     def __init__(
         self,
@@ -185,10 +194,6 @@ class Model50MAdapter:
             self.config.n_channels,
             self.config.target_num_points,
         )
-
-    @property
-    def model_name(self) -> str:
-        return "50M"
 
     def _normalize_input_shape(
         self,
@@ -447,7 +452,7 @@ class Model50MAdapter:
     @torch.no_grad()
     def predict_proba(
         self,
-        X: np.ndarray,
+        X: ModelInput,
         channel_valid_masks: np.ndarray | None = None,
     ) -> np.ndarray:
         """
@@ -465,11 +470,25 @@ class Model50MAdapter:
             probabilities:
                 np.float32，[B, num_classes]。
         """
+        if isinstance(X, dict):
+            if "signal" not in X:
+                raise ValueError("50M model input dictionary is missing required key 'signal'")
+            if "channel_valid_mask" not in X:
+                raise ValueError("50M model input dictionary is missing required key 'channel_valid_mask'")
+            if channel_valid_masks is not None:
+                raise ValueError("Pass channel_valid_mask either in the model input dictionary or as a keyword, not both")
+            signals = X["signal"]
+            channel_valid_masks = X["channel_valid_mask"]
+        elif isinstance(X, np.ndarray):
+            signals = X
+        else:
+            raise TypeError("50M model input must be numpy.ndarray or dict[str, numpy.ndarray]")
+
         total_start = time.perf_counter()
 
         model_batch, conversion_ms, tokenization_ms = (
             self._build_model_batch(
-                X=X,
+                X=signals,
                 channel_valid_masks=channel_valid_masks,
             )
         )
@@ -515,6 +534,188 @@ class Model50MAdapter:
             )
 
         return probabilities
+
+    def fit(self, X: np.ndarray, y: np.ndarray, **kwargs: Any) -> dict[str, Any]:
+        del X, y, kwargs
+        raise NotImplementedError(
+            "Model50MAdapter currently supports loading an existing classifier head and inference only; "
+            "this does not mean a classifier head has been trained. A formal 50M classifier training script "
+            "must provide fit() in a later delivery."
+        )
+
+    def update(self, X: np.ndarray, y: np.ndarray, **kwargs: Any) -> dict[str, Any]:
+        del X, y, kwargs
+        raise NotImplementedError(
+            "Model50MAdapter currently supports loading an existing classifier head and inference only; "
+            "this does not mean a classifier head has been trained. A formal 50M classifier training script "
+            "must provide update() in a later delivery."
+        )
+
+    @staticmethod
+    def _checkpoint_sha256(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _required_package_file(package: Path, name: str) -> Path:
+        path = package / name
+        if not path.is_file():
+            raise FileNotFoundError(f"50M model package file was not found: {path.resolve()}")
+        return path
+
+    @staticmethod
+    def _resolve_checkpoint_reference(package: Path, value: str | Path) -> Path:
+        reference = Path(value).expanduser()
+        candidates = [reference] if reference.is_absolute() else [package / reference, reference]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        raise FileNotFoundError(f"50M backbone checkpoint was not found: {candidates[0].resolve()}")
+
+    def save(
+        self,
+        path: str | Path,
+        *,
+        preprocessing: dict[str, Any] | None = None,
+        label_map: dict[int | str, str] | None = None,
+        command_map: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> Path:
+        del kwargs
+        package = Path(path)
+        package.mkdir(parents=True, exist_ok=True)
+        classifier_path = save_classifier_checkpoint(
+            self.classifier,
+            package / "classifier.pt",
+            extra_metadata={"class_names": list(self.class_names)},
+        )
+        model_payload = {
+            "name": self.model_name,
+            "num_classes": int(self.config.num_classes),
+            "aggregation": self.config.aggregation,
+            "output_layer_idx": int(self.config.output_layer_idx),
+            "window_seconds": float(self.config.window_seconds),
+            "target_sample_rate": float(self.config.target_sample_rate),
+            "patch_seconds": float(self.config.patch_seconds),
+            "patch_stride_seconds": float(self.config.patch_stride_seconds),
+            "n_channels": int(self.config.n_channels),
+            "d_model": int(self.config.d_model),
+            "n_heads": int(self.config.n_heads),
+            "depth": int(self.config.depth),
+            "mlp_ratio": float(self.config.mlp_ratio),
+            "dropout": float(self.config.dropout),
+            "class_names": list(self.class_names),
+        }
+        preprocessing_payload = {
+            "filter_enabled": bool(self.config.filter_enabled),
+            "filter_low_hz": float(self.config.filter_low_hz),
+            "filter_high_hz": float(self.config.filter_high_hz),
+            "filter_order": int(self.config.filter_order),
+            "reference_mode": self.config.reference_mode,
+            "zscore_enabled": bool(self.config.zscore_enabled),
+            "zscore_eps": float(self.config.zscore_eps),
+            "missing_channel_fill_value": float(self.config.missing_channel_fill_value),
+            "strict_window_duration": bool(self.config.strict_window_duration),
+            "window_tolerance_seconds": float(self.config.window_tolerance_seconds),
+        }
+        preprocessing_payload.update(preprocessing or {})
+        dump_yaml(model_payload, package / "model.yaml")
+        dump_yaml(preprocessing_payload, package / "preprocessing.yaml")
+        saved_label_map = label_map or {str(index): name for index, name in enumerate(self.class_names)}
+        dump_json({str(key): value for key, value in saved_label_map.items()}, package / "label_map.json")
+        dump_json(command_map or {}, package / "command_map.json")
+        checkpoint = Path(self.config.checkpoint_path).expanduser().resolve()
+        dump_json(
+            {
+                "backbone": "50M",
+                "checkpoint_path": str(self.config.checkpoint_path),
+                "checkpoint_path_absolute": str(checkpoint),
+                "checkpoint_sha256": self._checkpoint_sha256(checkpoint),
+                "classifier_path": classifier_path.name,
+            },
+            package / "base_model.json",
+        )
+        return package
+
+    def load(self, path: str | Path) -> "Model50MAdapter":
+        package = Path(path)
+        model = load_yaml(self._required_package_file(package, "model.yaml"))
+        if model.get("name") != self.model_name:
+            raise ValueError(f"Expected 50M model package name '{self.model_name}', got {model.get('name')!r}")
+        for key, actual, expected in (
+            ("num_classes", model.get("num_classes"), self.config.num_classes),
+            ("aggregation", model.get("aggregation"), self.config.aggregation),
+            ("output_layer_idx", model.get("output_layer_idx"), self.config.output_layer_idx),
+        ):
+            if actual != expected:
+                raise ValueError(f"50M model package metadata mismatch for {key}: package={actual!r}, adapter={expected!r}")
+        report = load_classifier_checkpoint(
+            self.classifier,
+            self._required_package_file(package, "classifier.pt"),
+            strict_metadata=True,
+        )
+        saved_classes = report.metadata.get("class_names")
+        if saved_classes is not None and tuple(saved_classes) != self.class_names:
+            raise ValueError("50M classifier metadata class_names does not match the current adapter")
+        self.classifier_load_report = report
+        return self
+
+    @classmethod
+    def from_package(cls, path: str | Path, device: str = "cpu") -> "Model50MAdapter":
+        package = Path(path).expanduser().resolve()
+        model_path = cls._required_package_file(package, "model.yaml")
+        preprocessing_path = cls._required_package_file(package, "preprocessing.yaml")
+        label_path = cls._required_package_file(package, "label_map.json")
+        cls._required_package_file(package, "command_map.json")
+        base_path = cls._required_package_file(package, "base_model.json")
+        classifier_path = cls._required_package_file(package, "classifier.pt")
+        model = load_yaml(model_path)
+        if model.get("name") != cls.model_name:
+            raise ValueError(f"Expected 50M model package name '{cls.model_name}', got {model.get('name')!r}")
+        preprocessing = load_yaml(preprocessing_path)
+        with label_path.open("r", encoding="utf-8") as handle:
+            label_map = json.load(handle)
+        with base_path.open("r", encoding="utf-8") as handle:
+            base_model = json.load(handle)
+        checkpoint_value = base_model.get("checkpoint_path_absolute") or base_model.get("checkpoint_path")
+        if checkpoint_value is None:
+            raise ValueError(f"50M model package base_model.json is missing checkpoint_path: {base_path}")
+        checkpoint_path = cls._resolve_checkpoint_reference(package, checkpoint_value)
+        class_names = tuple(str(label_map[str(index)]) for index in range(int(model["num_classes"])))
+        config = Model50MConfig(
+            checkpoint_path=checkpoint_path,
+            classifier_path=classifier_path,
+            device=device,
+            target_sample_rate=float(model["target_sample_rate"]),
+            window_seconds=float(model["window_seconds"]),
+            patch_seconds=float(model["patch_seconds"]),
+            patch_stride_seconds=float(model["patch_stride_seconds"]),
+            n_channels=int(model["n_channels"]),
+            filter_enabled=bool(preprocessing.get("filter_enabled", True)),
+            filter_low_hz=float(preprocessing.get("filter_low_hz", 0.1)),
+            filter_high_hz=float(preprocessing.get("filter_high_hz", 75.0)),
+            filter_order=int(preprocessing.get("filter_order", 4)),
+            reference_mode=preprocessing.get("reference_mode", "none"),
+            zscore_enabled=bool(preprocessing.get("zscore_enabled", True)),
+            zscore_eps=float(preprocessing.get("zscore_eps", 1e-8)),
+            missing_channel_fill_value=float(preprocessing.get("missing_channel_fill_value", 0.0)),
+            strict_window_duration=bool(preprocessing.get("strict_window_duration", True)),
+            window_tolerance_seconds=float(preprocessing.get("window_tolerance_seconds", 0.02)),
+            d_model=int(model["d_model"]),
+            n_heads=int(model["n_heads"]),
+            depth=int(model["depth"]),
+            mlp_ratio=float(model["mlp_ratio"]),
+            dropout=float(model["dropout"]),
+            output_layer_idx=int(model["output_layer_idx"]),
+            aggregation=model["aggregation"],
+            num_classes=int(model["num_classes"]),
+        )
+        return cls(config=config, class_names=class_names, strict_head_metadata=True)
 
     @torch.no_grad()
     def predict(

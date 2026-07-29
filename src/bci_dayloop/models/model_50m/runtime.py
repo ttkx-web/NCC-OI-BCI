@@ -6,6 +6,8 @@ from typing import Any, Protocol, Sequence
 
 import numpy as np
 
+from bci_dayloop.models.base import add_batch_dimension
+
 from .adapter import Model50MAdapter
 from .config import Model50MConfig
 from .pipeline_preprocessor import Model50MPipelinePreprocessor
@@ -92,31 +94,12 @@ class Model50MRuntime:
         Returns:
             Model50MRuntimePrediction
         """
-        model_input = self.preprocessor.transform(raw_window)
-
-        channel_valid_mask = (
-            self.preprocessor.last_channel_valid_mask
+        model_input = self.preprocessor.transform(
+            raw_window,
+            self.preprocessor.sample_rate,
+            self.preprocessor.input_unit,
         )
-        preprocess_result = self.preprocessor.last_result
-
-        if channel_valid_mask is None:
-            raise RuntimeError(
-                "50M preprocessor did not produce "
-                "channel_valid_mask."
-            )
-
-        if preprocess_result is None:
-            raise RuntimeError(
-                "50M preprocessor did not retain "
-                "PreprocessResult."
-            )
-
-        probabilities_batch = self.adapter.predict_proba(
-            model_input[None, ...],
-            channel_valid_masks=(
-                channel_valid_mask[None, ...]
-            ),
-        )
+        probabilities_batch = self.adapter.predict_proba(add_batch_dimension(model_input))
 
         if probabilities_batch.shape != (
             1,
@@ -143,6 +126,7 @@ class Model50MRuntime:
         # 因此暂时返回 None。后续可以在其 transform() 内增加计时。
         preprocessing_ms = None
 
+        diagnostics = self.preprocessor.last_diagnostics
         return Model50MRuntimePrediction(
             prediction=prediction,
             confidence=confidence,
@@ -151,16 +135,10 @@ class Model50MRuntime:
             ),
             preprocessing_ms=preprocessing_ms,
             adapter_timing=adapter_timing,
-            mapped_channel_count=(
-                preprocess_result.mapped_channel_count
-            ),
-            missing_channel_count=(
-                preprocess_result.missing_channel_count
-            ),
-            unknown_channel_names=(
-                preprocess_result.unknown_channel_names
-            ),
-            notes=preprocess_result.notes,
+            mapped_channel_count=diagnostics.mapped_channel_count if diagnostics else None,
+            missing_channel_count=diagnostics.missing_channel_count if diagnostics else None,
+            unknown_channel_names=diagnostics.unknown_channel_names if diagnostics else (),
+            notes=diagnostics.notes if diagnostics else (),
         )
 
     def health_check(self) -> dict[str, Any]:

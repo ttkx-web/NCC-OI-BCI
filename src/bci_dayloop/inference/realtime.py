@@ -8,6 +8,7 @@ import numpy as np
 
 from bci_dayloop.acquisition.base import AbstractAcquirer
 from bci_dayloop.control.commands import command_for_prediction
+from bci_dayloop.inference.observability import JsonlWindowLogger, LatencyBreakdown, PipelineRunStats
 from bci_dayloop.models.base import BaseModelAdapter, ModelPreprocessor, add_batch_dimension
 
 
@@ -21,6 +22,15 @@ class DecodeResult:
     probabilities: list[float]
     trial_id: int | None = None
     expected_class_id: int | None = None
+    preprocessing_latency_ms: float = 0.0
+    model_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.total_latency_ms == 0.0 and self.latency_ms != 0.0:
+            object.__setattr__(self, "total_latency_ms", float(self.latency_ms))
+        if self.latency_ms != self.total_latency_ms:
+            raise ValueError("latency_ms must equal total_latency_ms")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -39,6 +49,8 @@ class SlidingWindowDecoder:
         step_sec: float = 0.5,
         confidence_threshold: float = 0.55,
         command_map: dict[str, str] | None = None,
+        run_stats: PipelineRunStats | None = None,
+        jsonl_logger: JsonlWindowLogger | None = None,
     ) -> None:
         self.model = model
         self.preprocessor = preprocessor
@@ -49,12 +61,16 @@ class SlidingWindowDecoder:
         self.step_samples = round(step_sec * sample_rate)
         self.confidence_threshold = float(confidence_threshold)
         self.command_map = command_map
+        self.run_stats = run_stats
+        self.jsonl_logger = jsonl_logger
         self._buffer: np.ndarray | None = None
         self._new_since_decode = 0
+        self._window_id = 0
 
     def reset(self) -> None:
         self._buffer = None
         self._new_since_decode = 0
+        self._window_id = 0
 
     def push(
         self,
@@ -66,35 +82,63 @@ class SlidingWindowDecoder:
         chunk = np.asarray(samples, dtype=np.float32)
         if chunk.ndim != 2:
             raise ValueError(f"Expected samples [C,T], got {chunk.shape}")
+        if self.run_stats is not None:
+            self.run_stats.record_chunk()
         self._buffer = chunk.copy() if self._buffer is None else np.concatenate((self._buffer, chunk), axis=1)
         self._buffer = self._buffer[:, -self.window_samples :]
         self._new_since_decode += chunk.shape[1]
         if self._buffer.shape[1] < self.window_samples or self._new_since_decode < self.step_samples:
             return None
         self._new_since_decode %= self.step_samples
-        started = time.perf_counter()
-        model_input = self.preprocessor.transform(
-            self._buffer,
-            self.sample_rate,
-            self.input_unit,
-            reshape=True,
-        )
-        probabilities = self.model.predict_proba(add_batch_dimension(model_input))[0]
+        self._window_id += 1
+        window_id = self._window_id
+        total_started = time.perf_counter()
+        try:
+            preprocessing_started = time.perf_counter()
+            model_input = self.preprocessor.transform(
+                self._buffer,
+                self.sample_rate,
+                self.input_unit,
+                reshape=True,
+            )
+            preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000.0
+            model_started = time.perf_counter()
+            probabilities = self.model.predict_proba(add_batch_dimension(model_input))[0]
+            model_ms = (time.perf_counter() - model_started) * 1000.0
+        except Exception as error:
+            if self.run_stats is not None:
+                self.run_stats.record_failure()
+            if self.jsonl_logger is not None:
+                try:
+                    self.jsonl_logger.log_error(window_id=window_id, error=error)
+                except Exception as logger_error:
+                    raise error from logger_error
+            raise
         class_id = int(np.argmax(probabilities))
         confidence = float(probabilities[class_id])
         prediction = self.class_names[class_id]
         command = command_for_prediction(prediction, confidence, self.confidence_threshold, self.command_map)
-        latency_ms = (time.perf_counter() - started) * 1000.0
-        return DecodeResult(
+        total_ms = (time.perf_counter() - total_started) * 1000.0
+        result = DecodeResult(
             prediction,
             confidence,
-            latency_ms,
+            total_ms,
             command,
             class_id,
             probabilities.tolist(),
             trial_id,
             expected_class_id,
+            preprocessing_ms,
+            model_ms,
+            total_ms,
         )
+        if self.run_stats is not None:
+            self.run_stats.record_success(
+                LatencyBreakdown(preprocessing_ms, model_ms, total_ms)
+            )
+        if self.jsonl_logger is not None:
+            self.jsonl_logger.log_success(window_id=window_id, result=result)
+        return result
 
     def run(
         self,
@@ -104,6 +148,8 @@ class SlidingWindowDecoder:
         callback: Callable[[DecodeResult, np.ndarray], None] | None = None,
     ) -> Iterator[DecodeResult]:
         self.reset()
+        if self.run_stats is not None:
+            self.run_stats.start()
         acquirer.start_stream()
         emitted = 0
         try:

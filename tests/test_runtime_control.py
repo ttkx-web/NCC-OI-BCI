@@ -109,6 +109,24 @@ def test_start_is_non_blocking_completion_callbacks_and_max_windows():
     assert run_id == 1
 
 
+def test_result_with_samples_callback_preserves_existing_result_callback():
+    chunks = [np.ones((2, 20), dtype=np.float32)]
+    results = []
+    sample_shapes = []
+    controller = PipelineController(
+        make_decoder(),
+        lambda: FakeAcquirer(chunks),
+        on_result=results.append,
+        on_result_with_samples=lambda result, samples: sample_shapes.append((result.prediction, samples.shape)),
+    )
+
+    controller.start()
+
+    assert controller.wait(timeout=1.0)
+    assert [result.prediction for result in results] == ["feet"]
+    assert sample_shapes == [("feet", (2, 20))]
+
+
 def test_duplicate_start_stop_and_short_window_stop_do_not_fail():
     controller = PipelineController(
         make_decoder(),

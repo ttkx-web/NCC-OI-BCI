@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+import numpy as np
+
 from bci_dayloop.acquisition.base import AbstractAcquirer
 from bci_dayloop.inference.observability import PipelineRunStats
 from bci_dayloop.inference.realtime import DecodeResult, SlidingWindowDecoder
@@ -35,6 +37,7 @@ class PipelineControllerSnapshot:
 
 AcquirerFactory = Callable[[], AbstractAcquirer]
 ResultCallback = Callable[[DecodeResult], None]
+ResultWithSamplesCallback = Callable[[DecodeResult, np.ndarray], None]
 StateCallback = Callable[[PipelineControllerSnapshot], None]
 
 
@@ -48,12 +51,14 @@ class PipelineController:
         *,
         max_windows: int | None = None,
         on_result: ResultCallback | None = None,
+        on_result_with_samples: ResultWithSamplesCallback | None = None,
         on_state_change: StateCallback | None = None,
     ) -> None:
         self.decoder = decoder
         self.acquirer_factory = acquirer_factory
         self.max_windows = max_windows
         self.on_result = on_result
+        self.on_result_with_samples = on_result_with_samples
         self.on_state_change = on_state_change
         self.stats = decoder.run_stats or PipelineRunStats()
         self.decoder.run_stats = self.stats
@@ -107,18 +112,24 @@ class PipelineController:
         self._notify_state_change(snapshot)
 
     def _worker(self, run_id: int, acquirer: AbstractAcquirer, stop_event: threading.Event) -> None:
+        def on_decoder_result(result: DecodeResult, samples: np.ndarray) -> None:
+            with self._lock:
+                if run_id != self._run_id:
+                    return
+                self._results_emitted += 1
+            if self.on_result is not None:
+                self.on_result(result)
+            if self.on_result_with_samples is not None:
+                self.on_result_with_samples(result, samples)
+
         try:
-            for result in self.decoder.run(
+            for _ in self.decoder.run(
                 acquirer,
                 max_windows=self.max_windows,
+                callback=on_decoder_result,
                 stop_event=stop_event,
             ):
-                with self._lock:
-                    if run_id != self._run_id:
-                        return
-                    self._results_emitted += 1
-                if self.on_result is not None:
-                    self.on_result(result)
+                pass
         except Exception as error:
             self._mark_failed(error)
             with self._lock:
@@ -145,7 +156,9 @@ class PipelineController:
             self._run_id += 1
             run_id = self._run_id
             self.decoder.reset()
+            expected_windows = self.stats.snapshot().expected_windows
             self.stats.reset()
+            self.stats.set_expected_windows(expected_windows)
             self.stats.start()
             self._results_emitted = 0
             self._last_error = None

@@ -11,6 +11,10 @@ import numpy as np
 # 与仓库其他 scripts 一样，将项目根目录和 src 加入 Python 路径。
 from _bootstrap import ROOT  # noqa: F401
 
+from bci_dayloop.models.base import add_batch_dimension
+from bci_dayloop.data.hdf5_dataset import EEGHDF5
+from bci_dayloop.models.base import add_batch_dimension
+from bci_dayloop.models.model_50m.adapter import Model50MAdapter
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
 from bci_dayloop.models.model_50m.adapter import Model50MAdapter
 from bci_dayloop.models.model_50m.config import Model50MConfig
@@ -711,17 +715,42 @@ def main() -> None:
     preprocess_start = time.perf_counter()
 
     model_input = pipeline_preprocessor.transform(
-        raw_window
+        samples=raw_window,
+        sample_rate=metadata.sample_rate,
+        input_unit=metadata.unit,
+        reshape=True,
     )
 
     preprocess_ms = (
-        time.perf_counter() - preprocess_start
-    ) * 1000.0
+                            time.perf_counter() - preprocess_start
+                    ) * 1000.0
+
+    # 新版通用 Pipeline 返回一个字典：
+    # {
+    #     "signal": [64, 1000],
+    #     "channel_valid_mask": [64],
+    # }
+    if not isinstance(model_input, dict):
+        raise RuntimeError(
+            "Model50MPipelinePreprocessor should return "
+            "dict[str, np.ndarray]."
+        )
+
+    if "signal" not in model_input:
+        raise RuntimeError(
+            "50M preprocessing output is missing 'signal'."
+        )
+
+    if "channel_valid_mask" not in model_input:
+        raise RuntimeError(
+            "50M preprocessing output is missing "
+            "'channel_valid_mask'."
+        )
+
+    model_signal = model_input["signal"]
+    channel_valid_mask = model_input["channel_valid_mask"]
 
     preprocess_result = pipeline_preprocessor.last_result
-    channel_valid_mask = (
-        pipeline_preprocessor.last_channel_valid_mask
-    )
 
     if preprocess_result is None:
         raise RuntimeError(
@@ -734,43 +763,53 @@ def main() -> None:
             "last_channel_valid_mask."
         )
 
-    if model_input.shape != (
+    expected_signal_shape = (
         config.n_channels,
         config.target_num_points,
-    ):
+    )
+
+    if model_signal.shape != expected_signal_shape:
         raise RuntimeError(
-            "Unexpected preprocessed input shape: "
-            f"{model_input.shape}."
+            "Unexpected preprocessed signal shape: "
+            f"expected {expected_signal_shape}, "
+            f"got {model_signal.shape}."
         )
 
-    if model_input.dtype != np.float32:
+    if model_signal.dtype != np.float32:
         raise RuntimeError(
-            "Preprocessed model input must be float32, "
-            f"got {model_input.dtype}."
+            "Preprocessed signal must be float32, "
+            f"got {model_signal.dtype}."
         )
 
-    if not np.isfinite(model_input).all():
+    if not np.isfinite(model_signal).all():
         raise RuntimeError(
-            "Preprocessed model input contains NaN or Inf."
+            "Preprocessed signal contains NaN or Inf."
+        )
+
+    expected_mask_shape = (config.n_channels,)
+
+    if channel_valid_mask.shape != expected_mask_shape:
+        raise RuntimeError(
+            "Unexpected channel_valid_mask shape: "
+            f"expected {expected_mask_shape}, "
+            f"got {channel_valid_mask.shape}."
+        )
+
+    if channel_valid_mask.dtype != np.float32:
+        raise RuntimeError(
+            "channel_valid_mask must be float32, "
+            f"got {channel_valid_mask.dtype}."
+        )
+
+    if not np.isfinite(channel_valid_mask).all():
+        raise RuntimeError(
+            "channel_valid_mask contains NaN or Inf."
         )
 
     print("[5/6] 50M preprocessing completed")
-    print("  Preprocessed shape:", model_input.shape)
-    print("  Preprocessed dtype:", model_input.dtype)
-    print(
-        "  Valid channels:",
-        preprocess_result.mapped_channel_count,
-    )
-    print(
-        "  Missing channels:",
-        preprocess_result.missing_channel_count,
-    )
-    print(
-        "  Unknown channels:",
-        preprocess_result.unknown_channel_names,
-    )
-    print("  Preprocessing time:", f"{preprocess_ms:.2f} ms")
-    print("  Notes:", preprocess_result.notes)
+    print("  Preprocessed signal shape:", model_signal.shape)
+    print("  Preprocessed signal dtype:", model_signal.dtype)
+    print("  Channel mask shape:", channel_valid_mask.shape)
     print()
 
     # ------------------------------------------------------------------
@@ -780,12 +819,16 @@ def main() -> None:
     prediction_probabilities: list[np.ndarray] = []
     prediction_timings: list[dict[str, float]] = []
 
+    batched_model_input = add_batch_dimension(model_input)
+
+    prediction_probabilities: list[np.ndarray] = []
+    prediction_timings: list[dict[str, float]] = []
+
     for repeat_index in range(args.repeat):
+        batched_model_input = add_batch_dimension(model_input)
+
         probabilities = adapter.predict_proba(
-            model_input[None, ...],
-            channel_valid_masks=(
-                channel_valid_mask[None, ...]
-            ),
+            batched_model_input
         )
 
         if probabilities.shape != (
@@ -957,8 +1000,14 @@ def main() -> None:
             "segments": segments,
         },
         "preprocessing": {
-            "output_shape": list(model_input.shape),
-            "output_dtype": str(model_input.dtype),
+            "output_shape": list(model_signal.shape),
+            "output_dtype": str(model_signal.dtype),
+            "channel_valid_mask_shape": list(
+                channel_valid_mask.shape
+            ),
+            "valid_channel_count": int(
+                channel_valid_mask.sum()
+            ),
             "mapped_channel_count": (
                 preprocess_result.mapped_channel_count
             ),
@@ -1026,7 +1075,7 @@ def main() -> None:
         np.savez_compressed(
             save_npz_path,
             raw_window=raw_window,
-            model_input=model_input,
+            model_signal=model_signal,
             channel_valid_mask=channel_valid_mask,
             probabilities=reference_probabilities,
             window_labels=window_labels,

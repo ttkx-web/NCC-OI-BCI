@@ -16,3 +16,5 @@ checkpoints/*.pt
 runs/*
 !runs/.gitkeep
 *.log
+.DS_Store
+*.egg-info/

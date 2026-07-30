@@ -70,6 +70,17 @@ def test_model_factory_is_dynamic():
     assert "labram-linear" in ModelFactory.list_models()
 
 
+def test_labram_package_loader_is_registered():
+    assert "labram-linear" in ModelFactory.list_package_loaders()
+
+
+def test_unknown_model_package_name_has_clear_error(tmp_path):
+    (tmp_path / "model.yaml").write_text("name: unknown-model\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown model package 'unknown-model'. Available: 50m-linear, labram-linear"):
+        ModelFactory.load_package(tmp_path)
+
+
 def test_missing_checkpoint_has_actionable_message(tmp_path):
     with pytest.raises(FileNotFoundError, match="LaBraM Base checkpoint is missing"):
         LaBraMLinearAdapter(

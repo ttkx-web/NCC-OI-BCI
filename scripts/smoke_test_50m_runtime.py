@@ -22,7 +22,7 @@ def main() -> None:
 
     runtime = build_50m_runtime_from_metadata(
         checkpoint_path=(
-            ROOT / "checkpoints/model.pt"
+            ROOT / "checkpoints/50m/model_deploy.pt"
         ),
         classifier_path=(
             ROOT / "checkpoints/test_linear_head.pt"

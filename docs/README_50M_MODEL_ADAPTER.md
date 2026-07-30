@@ -153,7 +153,7 @@ python -c "import bci_dayloop; print(bci_dayloop.__file__)"
 
 ```text
 data/processed/bnci2014_001_s01.h5
-checkpoints/model.pt
+checkpoints/50m/model_deploy.pt
 checkpoints/50m_bnci2014_001_s01_linear_head.pt
 ```
 
@@ -184,7 +184,7 @@ python scripts/train_50m_linear_head.py \
   --data data/processed/bnci2014_001_s01.h5 \
   --train-session 0train \
   --test-session 1test \
-  --checkpoint checkpoints/model.pt \
+  --checkpoint checkpoints/50m/model_deploy.pt \
   --output checkpoints/50m_bnci2014_001_s01_linear_head.pt \
   --device cpu \
   --window-sec 10 \
@@ -219,7 +219,7 @@ python scripts/train_50m_linear_head.py \
 ```bash
 python scripts/export_50m_model_package.py \
   --data data/processed/bnci2014_001_s01.h5 \
-  --checkpoint checkpoints/model.pt \
+  --checkpoint checkpoints/50m/model_deploy.pt \
   --classifier checkpoints/50m_bnci2014_001_s01_linear_head.pt \
   --output runs/stage05_50m/model_package \
   --device cpu \
@@ -340,7 +340,7 @@ python scripts/smoke_test_50m_runtime.py
 python scripts/test_50m_offline_window.py \
   --data data/processed/bnci2014_001_s01.h5 \
   --session 1test \
-  --checkpoint checkpoints/model.pt \
+  --checkpoint checkpoints/50m/model_deploy.pt \
   --classifier checkpoints/50m_bnci2014_001_s01_linear_head.pt \
   --device cpu \
   --window-sec 10 \

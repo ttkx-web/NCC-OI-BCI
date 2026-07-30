@@ -22,7 +22,7 @@ preprocessing:
 model:
   name: 50m-linear
   checkpoint: checkpoints/50m/model_deploy.pt
-  classifier: checkpoints/50m/test_linear_head.pt
+  classifier: checkpoints/50m_bnci2014_001_s01_linear_head.pt
   device: cpu
   freeze_encoder: true
 

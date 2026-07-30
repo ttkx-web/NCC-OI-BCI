@@ -1,6 +1,6 @@
 project:
   seed: 42
-  run_dir: runs/day1_bnci_s01
+  run_dir: runs/stage05_50m
 
 data:
   dataset: BNCI2014_001
@@ -45,19 +45,21 @@ training:
   patience: 12
 
 replay:
+  model_package: runs/stage05_50m/model_package
+
   acquirer: replay
   session: 1test
   speed: 1.0
   loop: false
 
-  # 50M 原始配置使用 10 秒窗口。
   window_sec: 10.0
-
-  # 保持每 0.5 秒产生一次预测。
   step_sec: 0.5
 
   confidence_threshold: 0.55
   max_windows: 100
+
+  jsonl_log: runs/stage05_50m/pipeline_windows.jsonl
+  summary_json: runs/stage05_50m/replay_summary.json
 
 labels:
   class_names: [left_hand, right_hand, feet, tongue]

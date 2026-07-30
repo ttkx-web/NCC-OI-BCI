@@ -153,13 +153,13 @@ python -c "import bci_dayloop; print(bci_dayloop.__file__)"
 
 ```text
 data/processed/bnci2014_001_s01.h5
-checkpoints/50m/model_deploy.pt
+checkpoints/model.pt
 checkpoints/50m_bnci2014_001_s01_linear_head.pt
 ```
 
 ### 5.1 50M Backbone
 
-`model_deploy.pt` 必须是只包含 Tensor 和普通 Python 数据结构的部署 checkpoint。原始预训练 checkpoint 如果包含 `configs.Config` 对象，应先在原 50M 仓库环境中转换。
+`model.pt` 必须是只包含 Tensor 和普通 Python 数据结构的部署 checkpoint。原始预训练 checkpoint 如果包含 `configs.Config` 对象，应先在原 50M 仓库环境中转换。
 
 ### 5.2 正式分类头
 
@@ -184,7 +184,7 @@ python scripts/train_50m_linear_head.py \
   --data data/processed/bnci2014_001_s01.h5 \
   --train-session 0train \
   --test-session 1test \
-  --checkpoint checkpoints/50m/model_deploy.pt \
+  --checkpoint checkpoints/model.pt \
   --output checkpoints/50m_bnci2014_001_s01_linear_head.pt \
   --device cpu \
   --window-sec 10 \
@@ -219,7 +219,7 @@ python scripts/train_50m_linear_head.py \
 ```bash
 python scripts/export_50m_model_package.py \
   --data data/processed/bnci2014_001_s01.h5 \
-  --checkpoint checkpoints/50m/model_deploy.pt \
+  --checkpoint checkpoints/model.pt \
   --classifier checkpoints/50m_bnci2014_001_s01_linear_head.pt \
   --output runs/stage05_50m/model_package \
   --device cpu \
@@ -340,7 +340,7 @@ python scripts/smoke_test_50m_runtime.py
 python scripts/test_50m_offline_window.py \
   --data data/processed/bnci2014_001_s01.h5 \
   --session 1test \
-  --checkpoint checkpoints/50m/model_deploy.pt \
+  --checkpoint checkpoints/model.pt \
   --classifier checkpoints/50m_bnci2014_001_s01_linear_head.pt \
   --device cpu \
   --window-sec 10 \

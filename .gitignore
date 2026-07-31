@@ -18,3 +18,7 @@ runs/*
 *.log
 .DS_Store
 *.egg-info/
+checkpoints/50m/
+checkpoints
+checkpoints/stage1
+data/processed

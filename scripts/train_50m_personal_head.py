@@ -63,6 +63,15 @@ from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
 )
 
+import subprocess
+import sys
+
+from bci_dayloop.personalization import (
+    PersonalModelRegistry,
+    create_personal_model_package,
+    decide_personalization,
+)
+
 # Reuse Stage-0.5 helpers that already implement:
 # - trial-safe 10-second window construction
 # - 50M preprocessing/tokenization
@@ -101,8 +110,11 @@ from train_50m_population_head import (
 
 from bci_dayloop.personalization import (
     ClassifierTrainingConfig,
+    PersonalModelRegistry,
     build_personal_trial_split,
     clone_frozen_module,
+    create_personal_model_package,
+    decide_personalization,
     evaluate_classifier,
     reset_module_parameters,
     resolve_head_device,
@@ -557,6 +569,69 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Controls derived-window ordering after source-trial splitting.",
+    )
+    parser.add_argument(
+        "--runtime-package-template",
+        type=str,
+        default=None,
+        help=(
+            "Runtime Model Package template matching the personal-head "
+            "input contract. Packaging is skipped when this is not provided."
+        ),
+    )
+
+    parser.add_argument(
+        "--personal-package-root",
+        type=str,
+        default="runs/stage1/users",
+        help="Root directory used to save personal model packages.",
+    )
+
+    parser.add_argument(
+        "--registry-path",
+        type=str,
+        default="runs/stage1/users/model_registry.json",
+        help="JSON registry used to manage personal model packages.",
+    )
+
+    parser.add_argument(
+        "--package-task",
+        type=str,
+        default="motor_imagery_4class",
+        help="Task key used in the personal-model registry.",
+    )
+
+    parser.add_argument(
+        "--activation-metric",
+        type=str,
+        default="balanced_accuracy",
+        choices=(
+            "accuracy",
+            "balanced_accuracy",
+            "macro_f1",
+            "loss",
+        ),
+        help=(
+            "Personal-validation metric used to decide whether to activate "
+            "the personal model."
+        ),
+    )
+
+    parser.add_argument(
+        "--min-personal-val-gain",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum personal-validation improvement required before the "
+            "personal package is set active. For example, 0.02 means two "
+            "absolute percentage points."
+        ),
+    )
+
+    parser.add_argument(
+        "--overwrite-personal-package",
+        action="store_true",
+        help="Replace an existing personal package at the same output path.",
     )
     return parser
 
@@ -1214,6 +1289,23 @@ def main() -> None:
         f"best_metric={args.metric_for_best}"
     )
 
+    print()
+    print("Evaluating population head on personal validation set...")
+
+    population_validation = evaluate_classifier(
+        head=population_head,
+        loader=validation_loader,
+        device=head_device,
+        class_names=class_names,
+    )
+
+    print(
+        "population personal-validation:",
+        f"acc={population_validation.metrics.accuracy:.4f}, "
+        f"bacc={population_validation.metrics.balanced_accuracy:.4f}, "
+        f"macro_f1={population_validation.metrics.macro_f1:.4f}",
+    )
+
     training_result = train_classifier_head(
         head=classifier.head,
         train_loader=train_loader,
@@ -1231,6 +1323,31 @@ def main() -> None:
     selected_validation = (
         training_result.selected_validation
     )
+
+    personalization_decision = decide_personalization(
+        population_validation=population_validation,
+        personal_validation=selected_validation,
+        metric_name=args.activation_metric,
+        minimum_gain=args.min_personal_val_gain,
+    )
+
+    print()
+    print("Personalization activation decision:")
+    print("  accepted:", personalization_decision.accepted)
+    print("  metric:", personalization_decision.metric_name)
+    print(
+        "  population value:",
+        f"{personalization_decision.population_value:.4f}",
+    )
+    print(
+        "  personal value:",
+        f"{personalization_decision.personal_value:.4f}",
+    )
+    print(
+        "  validation gain:",
+        f"{personalization_decision.gain:+.4f}",
+    )
+    print("  reason:", personalization_decision.reason)
 
     # ------------------------------------------------------------------
     # Only now open target 1test for final population/personal comparison.
@@ -1362,6 +1479,203 @@ def main() -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_start = time.perf_counter()
+
+    personal_package = None
+    registry_entry = None
+    active_runtime_path = None
+
+    if args.runtime_package_template is not None:
+        runtime_package_template = resolve_repo_path(
+            args.runtime_package_template
+        )
+        personal_package_root = resolve_repo_path(
+            args.personal_package_root
+        )
+        registry_path = resolve_repo_path(
+            args.registry_path
+        )
+
+        package_output = (
+                personal_package_root
+                / target_tag
+                / args.package_task
+                / (
+                    f"trials_{args.trials_per_class:02d}"
+                    f"_seed_{args.personalization_seed}"
+                )
+        )
+
+        package_metrics = {
+            "personal_validation": {
+                "population": population_validation.to_dict(),
+                "personal": selected_validation.to_dict(),
+                "decision": personalization_decision.to_dict(),
+            },
+            "final_test": {
+                "population": population_final.to_dict(),
+                "personal": personal_final.to_dict(),
+                "gain": {
+                    "accuracy": float(accuracy_gain),
+                    "balanced_accuracy": float(bacc_gain),
+                    "macro_f1": float(macro_f1_gain),
+                },
+            },
+        }
+
+        package_training = {
+            "target_subject": target_subject,
+            "user_id": target_tag,
+            "task": args.package_task,
+            "adaptation_type": "head_only",
+            "personalization_session": args.personalization_session,
+            "final_test_session": args.final_test_session,
+            "trials_per_class": int(args.trials_per_class),
+            "validation_trials_per_class": int(
+                args.validation_trials_per_class
+            ),
+            "validation_seed": int(args.validation_seed),
+            "personalization_seed": int(
+                args.personalization_seed
+            ),
+            "training_seed": int(args.seed),
+            "window_seed": int(args.window_seed),
+            "head_initialization": args.head_init,
+            "optimizer": args.optimizer,
+            "head_lr": float(args.head_lr),
+            "momentum": float(args.momentum),
+            "weight_decay": float(args.weight_decay),
+            "scheduler": args.scheduler,
+            "best_epoch": int(best_epoch),
+            "training_seconds": float(
+                personal_training_seconds
+            ),
+            "base_population_head": str(
+                population_head_path
+            ),
+            "base_population_head_sha256": (
+                population_head_sha256
+            ),
+        }
+
+        input_contract = {
+            "window_seconds": float(
+                config.window_seconds
+            ),
+            "target_sample_rate": float(
+                config.target_sample_rate
+            ),
+            "target_num_points": int(
+                config.target_num_points
+            ),
+            "patch_seconds": float(
+                config.patch_seconds
+            ),
+            "patch_stride_seconds": float(
+                config.patch_stride_seconds
+            ),
+            "num_time_patches": int(
+                config.num_time_patches
+            ),
+            "model_n_time_patches": int(
+                config.model_n_time_patches
+            ),
+            "num_tokens": int(config.num_tokens),
+            "aggregation": str(config.aggregation),
+            "classifier_input_dim": int(
+                config.classifier_input_dim
+            ),
+            "output_layer_idx": int(
+                config.output_layer_idx
+            ),
+            "window_construction": (
+                args.window_construction
+            ),
+            "preprocessing_hash": (
+                preprocessing_hash
+            ),
+            "backbone_sha256": backbone_sha256,
+        }
+
+        personal_package = create_personal_model_package(
+            output_dir=package_output,
+            user_id=target_tag,
+            task=args.package_task,
+
+            # 当前只修改分类头。
+            adaptation_type="head_only",
+
+            classifier_checkpoint=saved_path,
+            base_backbone_checkpoint=backbone_path,
+
+            # 必须是和该个人头配置一致的 4 秒 Runtime Package。
+            runtime_package_dir=runtime_package_template,
+
+            class_names=class_names,
+            input_contract=input_contract,
+            metrics=package_metrics,
+            training_metadata=package_training,
+            git_commit=git_commit,
+            notes=(
+                "Stage-1 supervised subject-specific task-head adaptation.",
+                "Backbone is shared and frozen; only the classifier head is personal.",
+                (
+                    "Activation decision uses personal validation only; "
+                    "final test is not used for model selection."
+                ),
+            ),
+            overwrite=args.overwrite_personal_package,
+        )
+
+        print()
+        print("Personal Model Package created:")
+        print("  path:", personal_package.path)
+        print("  runtime path:", personal_package.runtime_path)
+        print(
+            "  package id:",
+            personal_package.manifest.package_id,
+        )
+
+        registry = PersonalModelRegistry(
+            registry_path
+        )
+
+        registry_entry = registry.register(
+            personal_package.path,
+
+            # 接受时设为 active；拒绝时只作为 candidate 保存。
+            status="candidate",
+            set_active=personalization_decision.accepted,
+
+            # 每次运行生成新的 package_id，通常不需要 replace。
+            replace=False,
+            validate=True,
+        )
+
+        print()
+        print("Personal package registered:")
+        print("  registry:", registry_path)
+        print("  package id:", registry_entry.package_id)
+        print("  status:", registry_entry.status)
+        print(
+            "  personalization accepted:",
+            personalization_decision.accepted,
+        )
+
+        if personalization_decision.accepted:
+            active_runtime_path = (
+                registry.resolve_active_runtime(
+                    user_id=target_tag,
+                    task=args.package_task,
+                )
+            )
+
+            print("  active runtime:", active_runtime_path)
+        else:
+            print(
+                "  model remains a candidate; "
+                "the previous active model is unchanged."
+            )
+
     saved_path = save_classifier_checkpoint(
         classifier=classifier,
         checkpoint_path=output_path,
@@ -1483,6 +1797,266 @@ def main() -> None:
             "Reloaded personal head probabilities differ from the original."
         )
 
+    # ================================================================
+    # 导出、打包和注册个人模型
+    # ================================================================
+
+    personal_package = None
+    registry_entry = None
+    active_runtime_path = None
+
+    runtime_package_dir = run_dir / "runtime_package"
+
+    export_command = [
+        sys.executable,
+        str(ROOT / "scripts" / "export_50m_model_package.py"),
+        "--data",
+        str(data_path),
+        "--checkpoint",
+        str(backbone_path),
+        "--classifier",
+        str(saved_path),
+        "--output",
+        str(runtime_package_dir),
+        "--device",
+        "cpu",
+        "--session",
+        str(args.final_test_session),
+        "--step-sec",
+        "0.5",
+        "--overwrite",
+    ]
+
+    print()
+    print("Exporting personal Runtime Model Package...")
+    print(" ".join(export_command))
+
+    subprocess.run(
+        export_command,
+        cwd=ROOT,
+        check=True,
+    )
+
+    required_runtime_files = (
+        "model.yaml",
+        "preprocessing.yaml",
+        "classifier.pt",
+        "label_map.json",
+        "command_map.json",
+        "base_model.json",
+    )
+
+    missing_runtime_files = [
+        filename
+        for filename in required_runtime_files
+        if not (runtime_package_dir / filename).is_file()
+    ]
+
+    if missing_runtime_files:
+        raise RuntimeError(
+            "Runtime Model Package export is incomplete. "
+            f"Missing files: {missing_runtime_files}"
+        )
+
+    personal_package_root = resolve_repo_path(
+        args.personal_package_root
+    )
+
+    registry_path = resolve_repo_path(
+        args.registry_path
+    )
+
+    package_output = (
+            personal_package_root
+            / target_tag
+            / args.package_task
+            / (
+                f"trials_{args.trials_per_class:02d}"
+                f"_seed_{args.personalization_seed}"
+            )
+    )
+
+    package_metrics = {
+        "personal_validation": {
+            "population": population_validation.to_dict(),
+            "personal": selected_validation.to_dict(),
+            "decision": personalization_decision.to_dict(),
+        },
+        "final_test": {
+            "population": population_final.to_dict(),
+            "personal": personal_final.to_dict(),
+            "gain": {
+                "accuracy": float(accuracy_gain),
+                "balanced_accuracy": float(bacc_gain),
+                "macro_f1": float(macro_f1_gain),
+            },
+        },
+    }
+
+    package_training = {
+        "target_subject": int(target_subject),
+        "user_id": target_tag,
+        "task": args.package_task,
+        "adaptation_type": "head_only",
+        "personalization_session": args.personalization_session,
+        "final_test_session": args.final_test_session,
+        "trials_per_class": int(args.trials_per_class),
+        "validation_trials_per_class": int(
+            args.validation_trials_per_class
+        ),
+        "validation_seed": int(args.validation_seed),
+        "personalization_seed": int(
+            args.personalization_seed
+        ),
+        "training_seed": int(args.seed),
+        "window_seed": int(args.window_seed),
+        "head_initialization": args.head_init,
+        "optimizer": args.optimizer,
+        "head_lr": float(args.head_lr),
+        "momentum": float(args.momentum),
+        "weight_decay": float(args.weight_decay),
+        "scheduler": args.scheduler,
+        "best_epoch": int(best_epoch),
+        "training_seconds": float(
+            personal_training_seconds
+        ),
+        "base_population_head": str(
+            population_head_path
+        ),
+        "base_population_head_sha256": (
+            population_head_sha256
+        ),
+    }
+
+    input_contract = {
+        "window_seconds": float(
+            config.window_seconds
+        ),
+        "target_sample_rate": float(
+            config.target_sample_rate
+        ),
+        "target_num_points": int(
+            config.target_num_points
+        ),
+        "patch_seconds": float(
+            config.patch_seconds
+        ),
+        "patch_stride_seconds": float(
+            config.patch_stride_seconds
+        ),
+        "num_time_patches": int(
+            config.num_time_patches
+        ),
+        "model_n_time_patches": int(
+            config.model_n_time_patches
+        ),
+        "num_tokens": int(
+            config.num_tokens
+        ),
+        "aggregation": str(
+            config.aggregation
+        ),
+        "classifier_input_dim": int(
+            config.classifier_input_dim
+        ),
+        "output_layer_idx": int(
+            config.output_layer_idx
+        ),
+        "window_construction": (
+            args.window_construction
+        ),
+        "preprocessing_hash": (
+            preprocessing_hash
+        ),
+        "backbone_sha256": (
+            backbone_sha256
+        ),
+    }
+
+    personal_package = create_personal_model_package(
+        output_dir=package_output,
+        user_id=target_tag,
+        task=args.package_task,
+        adaptation_type="head_only",
+
+        classifier_checkpoint=saved_path,
+        base_backbone_checkpoint=backbone_path,
+
+        # 这里是刚刚根据当前个人头导出的包，
+        # 不是手工创建的公共模板。
+        runtime_package_dir=runtime_package_dir,
+
+        class_names=class_names,
+        input_contract=input_contract,
+        metrics=package_metrics,
+        training_metadata=package_training,
+        git_commit=git_commit,
+        notes=(
+            "Stage-1 supervised subject-specific task-head adaptation.",
+            (
+                "The 50M backbone is shared and frozen; "
+                "only the task classifier head is personalized."
+            ),
+            (
+                "Activation is determined from personal validation; "
+                "the final test set is not used for model selection."
+            ),
+        ),
+        overwrite=args.overwrite_personal_package,
+    )
+
+    print()
+    print("Personal Model Package created:")
+    print("  package:", personal_package.path)
+    print("  runtime:", personal_package.runtime_path)
+    print(
+        "  package id:",
+        personal_package.manifest.package_id,
+    )
+
+    registry = PersonalModelRegistry(
+        registry_path
+    )
+
+    registry_entry = registry.register(
+        personal_package.path,
+        status="candidate",
+
+        # 只有 Personal Validation 达到阈值才激活。
+        set_active=personalization_decision.accepted,
+
+        replace=False,
+        validate=True,
+    )
+
+    print()
+    print("Personal Model Package registered:")
+    print("  registry:", registry_path)
+    print("  package id:", registry_entry.package_id)
+    print("  status:", registry_entry.status)
+    print(
+        "  accepted:",
+        personalization_decision.accepted,
+    )
+
+    if personalization_decision.accepted:
+        active_runtime_path = (
+            registry.resolve_active_runtime(
+                user_id=target_tag,
+                task=args.package_task,
+            )
+        )
+
+        print(
+            "  active runtime:",
+            active_runtime_path,
+        )
+    else:
+        print(
+            "  personal model remains a candidate; "
+            "the existing active model is unchanged."
+        )
+
     metrics_csv = run_dir / "epoch_metrics.csv"
     with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
@@ -1548,6 +2122,34 @@ def main() -> None:
             )
 
     report = {
+        "personalization_activation": {
+            "population_validation": (
+                population_validation.to_dict()
+            ),
+            "personal_validation": (
+                selected_validation.to_dict()
+            ),
+            "decision": (
+                personalization_decision.to_dict()
+            ),
+        },
+        "personal_model_management": {
+            "package_id": (
+                personal_package.manifest.package_id
+                if personal_package is not None
+                else None
+            ),
+            "registry_status": (
+                registry_entry.status
+                if registry_entry is not None
+                else None
+            ),
+            "active_runtime_path": (
+                str(active_runtime_path)
+                if active_runtime_path is not None
+                else None
+            ),
+        },
         "status": "completed",
         "stage": "stage1",
         "experiment": "few_shot_personal_linear_head",
@@ -1564,6 +2166,19 @@ def main() -> None:
             "run_dir": str(run_dir),
             "epoch_metrics_csv": str(metrics_csv),
             "final_predictions_csv": str(predictions_csv),
+            "runtime_model_package": (
+                str(runtime_package_dir)
+            ),
+            "personal_model_package": (
+                str(personal_package.path)
+                if personal_package is not None
+                else None
+            ),
+            "model_registry": (
+                str(registry_path)
+                if registry_entry is not None
+                else None
+            ),
         },
         "protocol": {
             "target_subject": target_subject,
@@ -1705,12 +2320,74 @@ def main() -> None:
                 "(subject_id << 32) | file_local_trial_id"
             ),
         },
+        "personalization_activation": {
+            "population_validation": (
+                population_validation.to_dict()
+            ),
+            "personal_validation": (
+                selected_validation.to_dict()
+            ),
+            "decision": (
+                personalization_decision.to_dict()
+            ),
+        },
+        "personal_model_management": {
+            "package_created": (
+                    personal_package is not None
+            ),
+            "package_path": (
+                str(personal_package.path)
+                if personal_package is not None
+                else None
+            ),
+            "package_id": (
+                personal_package.manifest.package_id
+                if personal_package is not None
+                else None
+            ),
+            "registry_entry_created": (
+                    registry_entry is not None
+            ),
+            "registry_path": (
+                str(resolve_repo_path(args.registry_path))
+                if registry_entry is not None
+                else None
+            ),
+            "registry_status": (
+                registry_entry.status
+                if registry_entry is not None
+                else None
+            ),
+            "active_runtime_path": (
+                str(active_runtime_path)
+                if active_runtime_path is not None
+                else None
+            ),
+        },
     }
 
     report_path = run_dir / "personal_training_report.json"
     atomic_write_json(report_path, report)
 
     summary = {
+        "personalization_decision": (
+            personalization_decision.to_dict()
+        ),
+        "personal_model_package": (
+            str(personal_package.path)
+            if personal_package is not None
+            else None
+        ),
+        "registry_status": (
+            registry_entry.status
+            if registry_entry is not None
+            else None
+        ),
+        "active_runtime_path": (
+            str(active_runtime_path)
+            if active_runtime_path is not None
+            else None
+        ),
         "status": "completed",
         "target_subject": target_subject,
         "trials_per_class": int(args.trials_per_class),
@@ -1738,6 +2415,29 @@ def main() -> None:
         },
         "personal_head": str(saved_path),
         "report": str(report_path),
+        "personalization_decision": (
+            personalization_decision.to_dict()
+        ),
+        "personal_model_package": (
+            str(personal_package.path)
+            if personal_package is not None
+            else None
+        ),
+        "registry_package_id": (
+            registry_entry.package_id
+            if registry_entry is not None
+            else None
+        ),
+        "registry_status": (
+            registry_entry.status
+            if registry_entry is not None
+            else None
+        ),
+        "active_runtime_path": (
+            str(active_runtime_path)
+            if active_runtime_path is not None
+            else None
+        ),
     }
     atomic_write_json(run_dir / "summary.json", summary)
 

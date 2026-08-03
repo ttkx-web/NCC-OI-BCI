@@ -431,11 +431,7 @@ def main() -> None:
     classifier_payload = safe_torch_load(
         classifier_path
     )
-
-    classifier_metadata = classifier_payload.get(
-        "metadata",
-        {},
-    )
+    classifier_metadata = classifier_payload["metadata"]
 
     if not isinstance(classifier_metadata, dict):
         raise TypeError(

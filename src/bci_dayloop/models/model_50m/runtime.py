@@ -334,20 +334,21 @@ def build_50m_runtime_from_metadata(
     metadata: EEGMetadataLike,
     device: str = "cpu",
 
-    target_sample_rate: float = 100.0,
-    window_seconds: float = 10.0,
-    model_n_time_patches: int = 10,
-    patch_seconds: float = 1.0,
-    patch_stride_seconds: float = 1.0,
+    target_sample_rate: float,
+    window_seconds: float,
+    model_n_time_patches: int,
+    patch_seconds: float,
+    patch_stride_seconds: float,
 
     filter_enabled: bool = True,
     filter_low_hz: float = 0.1,
     filter_high_hz: float = 75.0,
     reference_mode: str = "none",
 
-    output_layer_idx: int = 8,
-    aggregation: str = "flatten",
+    output_layer_idx: int,
+    aggregation: str,
     strict_head_metadata: bool = True,
+
 ) -> Model50MRuntime:
     """
     使用 EEGHDF5 metadata 直接构建运行时。

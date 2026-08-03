@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 """
 Train a Stage-1 few-shot personal linear head for one BNCI2014_001 subject.
 
@@ -36,17 +37,17 @@ Training, validation, and final-test source-trial IDs are checked for leakage.
 import argparse
 import csv
 import json
-import random
+
 import time
-from copy import deepcopy
-from dataclasses import dataclass
+import random
+
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
-import torch.nn as nn
+
 from torch.utils.data import DataLoader, TensorDataset
 
 from _bootstrap import ROOT
@@ -69,18 +70,16 @@ from bci_dayloop.models.model_50m.config import (
 # - linear-head epoch training and checkpoint compatibility
 from train_50m_linear_head import (
     EpochMetrics,
-    WindowSet,
-    build_same_label_concat_windows,
-    class_counts,
-    extract_frozen_features,
-    feature_cache_dtype_from_name,
-    json_default,
     metric_is_better,
-    resolve_repo_path,
     run_head_epoch,
     set_seed,
-    validate_labels,
+    WindowSet,
     build_direct_trial_windows,
+    build_same_label_concat_windows,
+    extract_frozen_features,
+    feature_cache_dtype_from_name,
+    resolve_repo_path,
+    validate_labels,
 )
 
 # Reuse Stage-1 population helpers for:
@@ -90,84 +89,30 @@ from train_50m_linear_head import (
 # - extended Macro-F1 metrics
 # - collision-free source-trial IDs
 from train_50m_population_head import (
-    ExtendedMetrics,
     atomic_write_json,
     class_name_counts,
     current_git_commit,
     encode_trial_ids,
-    extend_metrics,
     resolve_subject_file,
     sha256_file,
     stable_json_hash,
     validate_loaded_session,
 )
 
+from bci_dayloop.personalization import (
+    ClassifierTrainingConfig,
+    build_personal_trial_split,
+    clone_frozen_module,
+    evaluate_classifier,
+    reset_module_parameters,
+    resolve_head_device,
+    select_rows,
+    set_seed,
+    train_classifier_head,
+    validate_disjoint_trial_ids,
+    validate_three_way_trial_split,
+)
 
-# ---------------------------------------------------------------------------
-# Data containers
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class PersonalTrialSplit:
-    """Source-trial split performed before 10-second window construction."""
-
-    train_indices: np.ndarray
-    validation_indices: np.ndarray
-    pool_indices: np.ndarray
-    train_trial_ids_by_class: dict[str, list[int]]
-    validation_trial_ids_by_class: dict[str, list[int]]
-    pool_trial_ids_by_class: dict[str, list[int]]
-
-    def __post_init__(self) -> None:
-        for name, values in (
-            ("train_indices", self.train_indices),
-            ("validation_indices", self.validation_indices),
-            ("pool_indices", self.pool_indices),
-        ):
-            if values.ndim != 1:
-                raise ValueError(f"{name} must be one-dimensional.")
-
-        train_set = set(self.train_indices.tolist())
-        validation_set = set(self.validation_indices.tolist())
-        pool_set = set(self.pool_indices.tolist())
-
-        if train_set & validation_set:
-            raise RuntimeError(
-                "Personal train and validation source indices overlap."
-            )
-        if not train_set.issubset(pool_set):
-            raise RuntimeError(
-                "Selected personal train indices are not a subset of the "
-                "personalization pool."
-            )
-        if validation_set & pool_set:
-            raise RuntimeError(
-                "Personal validation indices overlap the personalization pool."
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class EvaluationResult:
-    metrics: ExtendedMetrics
-    labels: list[int]
-    predictions: list[int]
-    confidences: list[float]
-    probabilities: list[list[float]]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            **self.metrics.to_dict(),
-            "labels": self.labels,
-            "predictions": self.predictions,
-            "confidences": self.confidences,
-            "probabilities": self.probabilities,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Generic helpers
-# ---------------------------------------------------------------------------
 
 
 def safe_load_mapping(path: Path) -> Mapping[str, Any]:
@@ -198,72 +143,6 @@ def load_checkpoint_metadata(path: Path) -> dict[str, Any]:
     return dict(metadata)
 
 
-def resolve_head_device(
-    requested: str,
-    *,
-    feature_device: torch.device,
-    classifier_input_dim: int,
-) -> torch.device:
-    """
-    Keep the very wide Flatten head off MPS by default.
-
-    The Stage-0.5 Flatten feature has 327680 dimensions. On some Apple
-    MPS/ANE paths, training Linear(327680, 4) can terminate the Python
-    process with a native bus error rather than raising a Python exception.
-    """
-    requested = str(requested).lower()
-
-    if requested == "auto":
-        if feature_device.type == "cuda":
-            device = feature_device
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(requested)
-
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "--head-device cuda was requested, but CUDA is unavailable."
-        )
-    if device.type == "mps":
-        if not hasattr(torch.backends, "mps"):
-            raise RuntimeError(
-                "--head-device mps was requested, but this PyTorch build "
-                "does not expose the MPS backend."
-            )
-        if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "--head-device mps was requested, but MPS is unavailable."
-            )
-        if classifier_input_dim > 16_384:
-            raise ValueError(
-                "Refusing to train the wide linear head on MPS. "
-                f"feature_dim={classifier_input_dim} exceeds the observed "
-                "safe MPS/ANE width. Use --head-device cpu. The 50M backbone "
-                "can still use --device mps for feature extraction."
-            )
-
-    return device
-
-
-def reset_module_parameters(module: nn.Module) -> None:
-    reset_count = 0
-    for child in module.modules():
-        if child is module:
-            continue
-        reset = getattr(child, "reset_parameters", None)
-        if callable(reset):
-            reset()
-            reset_count += 1
-    if reset_count == 0:
-        reset = getattr(module, "reset_parameters", None)
-        if callable(reset):
-            reset()
-            reset_count += 1
-    if reset_count == 0:
-        raise RuntimeError(
-            "Could not find reset_parameters() in the personal head."
-        )
 
 
 def source_trial_set(window_set: WindowSet) -> set[int]:
@@ -289,14 +168,6 @@ def assert_no_window_source_leakage(
         )
 
 
-def select_session_rows(
-    session: Mapping[str, np.ndarray],
-    indices: np.ndarray,
-) -> dict[str, np.ndarray]:
-    return {
-        key: np.asarray(value)[indices]
-        for key, value in session.items()
-    }
 
 
 def class_index_counts(
@@ -308,147 +179,6 @@ def class_index_counts(
         for class_index in range(num_classes)
     }
 
-
-# ---------------------------------------------------------------------------
-# Trial split
-# ---------------------------------------------------------------------------
-
-
-def build_personal_trial_split(
-    *,
-    labels: np.ndarray,
-    trial_ids: np.ndarray,
-    class_names: Sequence[str],
-    trials_per_class: int,
-    validation_trials_per_class: int,
-    validation_seed: int,
-    personalization_seed: int,
-) -> PersonalTrialSplit:
-    """
-    Build a fixed validation set and a seed-specific nested train subset.
-
-    Validation:
-        controlled only by validation_seed
-
-    Personalization pool order:
-        controlled by personalization_seed
-
-    Therefore, running 5/10/20/40 trials per class with the same seeds gives:
-
-        train_5 ⊂ train_10 ⊂ train_20 ⊂ train_40
-    """
-    labels = np.asarray(labels, dtype=np.int64)
-    trial_ids = np.asarray(trial_ids, dtype=np.int64)
-
-    if labels.ndim != 1 or trial_ids.shape != labels.shape:
-        raise ValueError(
-            f"Invalid labels/trial_ids shapes: {labels.shape}, "
-            f"{trial_ids.shape}."
-        )
-    if trials_per_class <= 0:
-        raise ValueError("--trials-per-class must be positive.")
-    if validation_trials_per_class <= 0:
-        raise ValueError(
-            "--validation-trials-per-class must be positive."
-        )
-
-    num_classes = len(class_names)
-    validate_labels(
-        labels,
-        num_classes=num_classes,
-        split_name="target personalization source session",
-    )
-
-    validation_rng = np.random.default_rng(validation_seed)
-    personalization_rng = np.random.default_rng(personalization_seed)
-
-    train_indices: list[int] = []
-    validation_indices: list[int] = []
-    pool_indices: list[int] = []
-
-    train_ids_by_class: dict[str, list[int]] = {}
-    validation_ids_by_class: dict[str, list[int]] = {}
-    pool_ids_by_class: dict[str, list[int]] = {}
-
-    for class_index, class_name in enumerate(class_names):
-        indices = np.flatnonzero(labels == class_index).astype(
-            np.int64,
-            copy=False,
-        )
-        required = validation_trials_per_class + trials_per_class
-        if len(indices) < required:
-            raise ValueError(
-                f"Class {class_index} ({class_name}) contains "
-                f"{len(indices)} source trials, but the requested split "
-                f"requires at least {required}: "
-                f"{validation_trials_per_class} validation + "
-                f"{trials_per_class} personalization."
-            )
-
-        # Validation is fixed independently of the personalization seed.
-        validation_order = indices.copy()
-        validation_rng.shuffle(validation_order)
-        class_validation = validation_order[
-            :validation_trials_per_class
-        ]
-
-        validation_set = set(class_validation.tolist())
-        class_pool = np.asarray(
-            [
-                int(index)
-                for index in indices
-                if int(index) not in validation_set
-            ],
-            dtype=np.int64,
-        )
-
-        # A single seed-specific permutation defines all nested budgets.
-        personalization_order = class_pool.copy()
-        personalization_rng.shuffle(personalization_order)
-        class_train = personalization_order[:trials_per_class]
-
-        train_indices.extend(int(index) for index in class_train)
-        validation_indices.extend(
-            int(index) for index in class_validation
-        )
-        pool_indices.extend(int(index) for index in class_pool)
-
-        train_ids_by_class[str(class_name)] = [
-            int(trial_ids[index]) for index in class_train
-        ]
-        validation_ids_by_class[str(class_name)] = [
-            int(trial_ids[index]) for index in class_validation
-        ]
-        pool_ids_by_class[str(class_name)] = [
-            int(trial_ids[index]) for index in personalization_order
-        ]
-
-    train_array = np.asarray(train_indices, dtype=np.int64)
-    validation_array = np.asarray(
-        validation_indices,
-        dtype=np.int64,
-    )
-    pool_array = np.asarray(pool_indices, dtype=np.int64)
-
-    # Shuffle only the row order; membership remains fixed.
-    row_rng = np.random.default_rng(personalization_seed + 100_003)
-    row_rng.shuffle(train_array)
-    validation_row_rng = np.random.default_rng(validation_seed + 100_003)
-    validation_row_rng.shuffle(validation_array)
-
-    return PersonalTrialSplit(
-        train_indices=train_array,
-        validation_indices=validation_array,
-        pool_indices=pool_array,
-        train_trial_ids_by_class=train_ids_by_class,
-        validation_trial_ids_by_class=validation_ids_by_class,
-        pool_trial_ids_by_class=pool_ids_by_class,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Window construction
-# ---------------------------------------------------------------------------
 
 
 def build_windows_from_selected_trials(
@@ -547,124 +277,6 @@ def build_windows_from_selected_trials(
     return limited
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def evaluate_head(
-    *,
-    head: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    class_names: Sequence[str],
-) -> EvaluationResult:
-    head.eval()
-    num_classes = len(class_names)
-
-    total_loss = 0.0
-    total_count = 0
-    labels_all: list[int] = []
-    predictions_all: list[int] = []
-    confidences_all: list[float] = []
-    probabilities_all: list[list[float]] = []
-
-    confusion = torch.zeros(
-        (num_classes, num_classes),
-        dtype=torch.long,
-    )
-
-    for features, labels in loader:
-        features = features.to(
-            device=device,
-            dtype=torch.float32,
-            non_blocking=True,
-        )
-        labels = labels.to(
-            device=device,
-            dtype=torch.long,
-            non_blocking=True,
-        )
-
-        logits = head(features)
-        loss = criterion(logits, labels)
-        probabilities = torch.softmax(logits, dim=-1)
-        confidences, predictions = probabilities.max(dim=-1)
-
-        batch_size = int(labels.numel())
-        total_loss += float(loss.item()) * batch_size
-        total_count += batch_size
-
-        labels_cpu = labels.detach().cpu()
-        predictions_cpu = predictions.detach().cpu()
-        probabilities_cpu = probabilities.detach().cpu()
-        confidences_cpu = confidences.detach().cpu()
-
-        labels_all.extend(int(value) for value in labels_cpu.tolist())
-        predictions_all.extend(
-            int(value) for value in predictions_cpu.tolist()
-        )
-        confidences_all.extend(
-            float(value) for value in confidences_cpu.tolist()
-        )
-        probabilities_all.extend(
-            [
-                [float(value) for value in row]
-                for row in probabilities_cpu.tolist()
-            ]
-        )
-
-        flat_indices = (
-            labels_cpu * num_classes + predictions_cpu
-        )
-        confusion += torch.bincount(
-            flat_indices,
-            minlength=num_classes * num_classes,
-        ).reshape(num_classes, num_classes)
-
-    if total_count <= 0:
-        raise RuntimeError("Cannot evaluate an empty loader.")
-
-    total_correct = int(confusion.diag().sum().item())
-    support = confusion.sum(dim=1)
-    recall = confusion.diag() / support.clamp_min(1)
-    valid = support > 0
-    balanced_accuracy = float(
-        recall[valid].mean().item()
-    ) if valid.any() else float("nan")
-
-    raw_metrics = EpochMetrics(
-        loss=total_loss / total_count,
-        accuracy=total_correct / total_count,
-        balanced_accuracy=balanced_accuracy,
-        confusion_matrix=confusion.tolist(),
-        per_class_recall=[
-            (
-                float(recall[index].item())
-                if support[index].item() > 0
-                else None
-            )
-            for index in range(num_classes)
-        ],
-    )
-
-    return EvaluationResult(
-        metrics=extend_metrics(
-            raw_metrics,
-            class_names=class_names,
-        ),
-        labels=labels_all,
-        predictions=predictions_all,
-        confidences=confidences_all,
-        probabilities=probabilities_all,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Feature cache
-# ---------------------------------------------------------------------------
 
 
 def save_personal_feature_cache(
@@ -729,62 +341,7 @@ def save_personal_feature_cache(
     temporary.replace(path)
 
 
-# ---------------------------------------------------------------------------
-# Optimizer and scheduler
-# ---------------------------------------------------------------------------
 
-
-def build_optimizer(
-    *,
-    name: str,
-    head: nn.Module,
-    learning_rate: float,
-    momentum: float,
-    weight_decay: float,
-) -> torch.optim.Optimizer:
-    if name == "sgd":
-        return torch.optim.SGD(
-            head.parameters(),
-            lr=learning_rate,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-    if name == "adamw":
-        return torch.optim.AdamW(
-            head.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay,
-        )
-    raise ValueError(f"Unsupported optimizer: {name!r}")
-
-
-def build_scheduler(
-    *,
-    name: str,
-    optimizer: torch.optim.Optimizer,
-    metric_for_best: str,
-    factor: float,
-    patience: int,
-    min_lr: float,
-) -> torch.optim.lr_scheduler.ReduceLROnPlateau | None:
-    if name == "none":
-        return None
-    if name != "plateau":
-        raise ValueError(f"Unsupported scheduler: {name!r}")
-
-    mode = "min" if metric_for_best == "val_loss" else "max"
-    return torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode=mode,
-        factor=factor,
-        patience=patience,
-        min_lr=min_lr,
-    )
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -1270,38 +827,37 @@ def main() -> None:
         trial_ids=source_trial_ids,
         class_names=class_names,
         trials_per_class=args.trials_per_class,
-        validation_trials_per_class=(
-            args.validation_trials_per_class
-        ),
+        validation_trials_per_class=args.validation_trials_per_class,
         validation_seed=args.validation_seed,
         personalization_seed=args.personalization_seed,
     )
 
-    personal_train_source = select_session_rows(
+    personal_train_source = select_rows(
         source_session,
         personal_split.train_indices,
     )
-    personal_validation_source = select_session_rows(
+
+    personal_validation_source = select_rows(
         source_session,
         personal_split.validation_indices,
     )
 
-    train_trial_id_set = set(
-        np.asarray(
-            personal_train_source["trial_ids"],
-            dtype=np.int64,
-        ).tolist()
+    train_trial_ids = np.asarray(
+        personal_train_source["trial_ids"],
+        dtype=np.int64,
     )
-    validation_trial_id_set = set(
-        np.asarray(
-            personal_validation_source["trial_ids"],
-            dtype=np.int64,
-        ).tolist()
+
+    validation_trial_ids = np.asarray(
+        personal_validation_source["trial_ids"],
+        dtype=np.int64,
     )
-    if train_trial_id_set & validation_trial_id_set:
-        raise RuntimeError(
-            "Personal train and validation raw trial IDs overlap."
-        )
+
+    validate_disjoint_trial_ids(
+        left_trial_ids=train_trial_ids,
+        right_trial_ids=validation_trial_ids,
+        left_name="personal train",
+        right_name="personal validation",
+    )
 
     expected_train_count = args.trials_per_class
     expected_validation_count = args.validation_trials_per_class
@@ -1511,10 +1067,10 @@ def main() -> None:
     )
 
     # Preserve the population baseline before any personal optimization.
-    population_head = deepcopy(classifier.head).to(head_device)
-    population_head.eval()
-    for parameter in population_head.parameters():
-        parameter.requires_grad = False
+    population_head = clone_frozen_module(
+        classifier.head,
+        device=head_device,
+    )
 
     classifier.head.to(head_device)
     if args.head_init == "random":
@@ -1629,166 +1185,51 @@ def main() -> None:
     # Train only the personal linear head.
     # ------------------------------------------------------------------
 
-    optimizer = build_optimizer(
-        name=args.optimizer,
-        head=classifier.head,
+    training_config = ClassifierTrainingConfig(
+        num_classes=num_classes,
+        epochs=args.epochs,
         learning_rate=args.head_lr,
+        optimizer=args.optimizer,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
-    )
-    scheduler = build_scheduler(
-        name=args.scheduler,
-        optimizer=optimizer,
+        patience=args.patience,
         metric_for_best=args.metric_for_best,
-        factor=args.scheduler_factor,
-        patience=args.scheduler_patience,
-        min_lr=args.scheduler_min_lr,
+        scheduler=args.scheduler,
+        scheduler_factor=args.scheduler_factor,
+        scheduler_patience=args.scheduler_patience,
+        scheduler_min_lr=args.scheduler_min_lr,
+        device=str(head_device),
+        seed=args.seed,
     )
-    criterion = nn.CrossEntropyLoss()
-
-    best_value = (
-        float("inf")
-        if args.metric_for_best == "val_loss"
-        else -float("inf")
-    )
-    best_epoch = -1
-    best_head_state: dict[str, torch.Tensor] | None = None
-    best_validation_raw: EpochMetrics | None = None
-    epochs_without_improvement = 0
-    epoch_rows: list[dict[str, Any]] = []
-
-    training_start = time.perf_counter()
 
     print("Training personal linear head")
     print(
-        f"init={args.head_init}, optimizer={args.optimizer}, "
-        f"epochs={args.epochs}, lr={args.head_lr}, "
+        f"init={args.head_init}, "
+        f"optimizer={args.optimizer}, "
+        f"epochs={args.epochs}, "
+        f"lr={args.head_lr}, "
         f"momentum={args.momentum}, "
         f"weight_decay={args.weight_decay}, "
         f"scheduler={args.scheduler}, "
         f"best_metric={args.metric_for_best}"
     )
 
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.perf_counter()
-
-        train_metrics_raw = run_head_epoch(
-            head=classifier.head,
-            loader=train_loader,
-            criterion=criterion,
-            device=head_device,
-            num_classes=num_classes,
-            optimizer=optimizer,
-        )
-        with torch.no_grad():
-            validation_metrics_raw = run_head_epoch(
-                head=classifier.head,
-                loader=validation_loader,
-                criterion=criterion,
-                device=head_device,
-                num_classes=num_classes,
-                optimizer=None,
-            )
-
-        train_metrics = extend_metrics(
-            train_metrics_raw,
-            class_names=class_names,
-        )
-        validation_metrics = extend_metrics(
-            validation_metrics_raw,
-            class_names=class_names,
-        )
-
-        improved, current_value = metric_is_better(
-            metric_name=args.metric_for_best,
-            current=validation_metrics_raw,
-            best_value=best_value,
-        )
-        if improved:
-            best_value = current_value
-            best_epoch = epoch
-            best_head_state = deepcopy(
-                {
-                    key: value.detach().cpu()
-                    for key, value in classifier.head.state_dict().items()
-                }
-            )
-            best_validation_raw = validation_metrics_raw
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-
-        if scheduler is not None:
-            scheduler_value = (
-                validation_metrics.loss
-                if args.metric_for_best == "val_loss"
-                else (
-                    validation_metrics.accuracy
-                    if args.metric_for_best == "val_acc"
-                    else validation_metrics.balanced_accuracy
-                )
-            )
-            scheduler.step(scheduler_value)
-
-        current_lr = float(optimizer.param_groups[0]["lr"])
-        row = {
-            "epoch": epoch,
-            "learning_rate": current_lr,
-            "train_loss": train_metrics.loss,
-            "train_acc": train_metrics.accuracy,
-            "train_bacc": train_metrics.balanced_accuracy,
-            "train_macro_f1": train_metrics.macro_f1,
-            "val_loss": validation_metrics.loss,
-            "val_acc": validation_metrics.accuracy,
-            "val_bacc": validation_metrics.balanced_accuracy,
-            "val_macro_f1": validation_metrics.macro_f1,
-            "is_best": improved,
-            "epoch_seconds": time.perf_counter() - epoch_start,
-        }
-        epoch_rows.append(row)
-
-        print(
-            f"epoch={epoch:03d} "
-            f"lr={current_lr:.6g} "
-            f"train_loss={train_metrics.loss:.4f} "
-            f"train_acc={train_metrics.accuracy:.4f} "
-            f"train_bacc={train_metrics.balanced_accuracy:.4f} "
-            f"train_f1={train_metrics.macro_f1:.4f} "
-            f"val_loss={validation_metrics.loss:.4f} "
-            f"val_acc={validation_metrics.accuracy:.4f} "
-            f"val_bacc={validation_metrics.balanced_accuracy:.4f} "
-            f"val_f1={validation_metrics.macro_f1:.4f} "
-            f"{'*' if improved else ''}",
-            flush=True,
-        )
-
-        if (
-            args.patience > 0
-            and epochs_without_improvement >= args.patience
-        ):
-            print(
-                "Early stopping: no validation improvement for "
-                f"{args.patience} epoch(s)."
-            )
-            break
-
-    personal_training_seconds = time.perf_counter() - training_start
-
-    if best_head_state is None or best_validation_raw is None:
-        raise RuntimeError(
-            "No best personal-head checkpoint was selected."
-        )
-
-    classifier.head.load_state_dict(best_head_state, strict=True)
-    classifier.head.to(head_device)
-    classifier.head.eval()
-
-    selected_validation = evaluate_head(
+    training_result = train_classifier_head(
         head=classifier.head,
-        loader=validation_loader,
-        criterion=criterion,
-        device=head_device,
+        train_loader=train_loader,
+        validation_loader=validation_loader,
         class_names=class_names,
+        config=training_config,
+        verbose=True,
+    )
+
+    best_epoch = training_result.best_epoch
+    epoch_rows = training_result.history
+    personal_training_seconds = (
+        training_result.training_seconds
+    )
+    selected_validation = (
+        training_result.selected_validation
     )
 
     # ------------------------------------------------------------------
@@ -1814,14 +1255,12 @@ def main() -> None:
         final_test_session["trial_ids"],
         dtype=np.int64,
     )
-    if train_trial_id_set & set(final_test_raw_ids.tolist()):
-        raise RuntimeError(
-            "Raw trial IDs overlap between personal train and final test."
-        )
-    if validation_trial_id_set & set(final_test_raw_ids.tolist()):
-        raise RuntimeError(
-            "Raw trial IDs overlap between personal validation and final test."
-        )
+
+    validate_three_way_trial_split(
+        train_trial_ids=train_trial_ids,
+        validation_trial_ids=validation_trial_ids,
+        test_trial_ids=final_test_raw_ids,
+    )
 
     final_test_windows = build_windows_from_selected_trials(
         selected=final_test_session,
@@ -1885,17 +1324,16 @@ def main() -> None:
         drop_last=False,
     )
 
-    population_final = evaluate_head(
+    population_final = evaluate_classifier(
         head=population_head,
         loader=final_test_loader,
-        criterion=criterion,
         device=head_device,
         class_names=class_names,
     )
-    personal_final = evaluate_head(
+
+    personal_final = evaluate_classifier(
         head=classifier.head,
         loader=final_test_loader,
-        criterion=criterion,
         device=head_device,
         class_names=class_names,
     )
@@ -2018,11 +1456,14 @@ def main() -> None:
         checkpoint_path=saved_path,
         strict_metadata=True,
     )
-    reloaded_head = deepcopy(reload_classifier.head).to(head_device)
-    reloaded_final = evaluate_head(
+    reloaded_head = clone_frozen_module(
+        reload_classifier.head,
+        device=head_device,
+    )
+
+    reloaded_final = evaluate_classifier(
         head=reloaded_head,
         loader=final_test_loader,
-        criterion=criterion,
         device=head_device,
         class_names=class_names,
     )

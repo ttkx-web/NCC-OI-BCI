@@ -36,6 +36,35 @@ from .trainer import (
     train_classifier_head,
 )
 
+from .metrics import (
+    PersonalizationDecision,
+    PersonalizationGain,
+    PersonalizationRunRecord,
+    aggregate_run_records,
+    build_run_record,
+    compare_evaluations,
+    compute_personalization_gain,
+    decide_personalization,
+    save_aggregate_json,
+    save_run_records_csv,
+    save_run_records_json,
+)
+
+from .package import (
+    LoadedPersonalModelPackage,
+    PackageValidationResult,
+    PersonalModelManifest,
+    create_personal_model_package,
+    load_personal_model_package,
+    resolve_runtime_package_path,
+    validate_personal_model_package,
+)
+
+from .registry import (
+    PersonalModelRegistry,
+    RegistryEntry,
+)
+
 __all__ = [
     "ClassifierMetrics",
     "ClassifierTrainingConfig",
@@ -63,4 +92,24 @@ __all__ = [
     "validate_disjoint_trial_ids",
     "validate_nested_budgets",
     "validate_three_way_trial_split",
+    "LoadedPersonalModelPackage",
+    "PackageValidationResult",
+    "PersonalModelManifest",
+    "PersonalModelRegistry",
+    "PersonalizationDecision",
+    "PersonalizationGain",
+    "PersonalizationRunRecord",
+    "RegistryEntry",
+    "aggregate_run_records",
+    "build_run_record",
+    "compare_evaluations",
+    "compute_personalization_gain",
+    "create_personal_model_package",
+    "decide_personalization",
+    "load_personal_model_package",
+    "resolve_runtime_package_path",
+    "save_aggregate_json",
+    "save_run_records_csv",
+    "save_run_records_json",
+    "validate_personal_model_package",
 ]

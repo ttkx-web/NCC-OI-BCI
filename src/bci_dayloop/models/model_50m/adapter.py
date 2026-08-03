@@ -610,6 +610,12 @@ class Model50MAdapter(BaseModelAdapter):
             "mlp_ratio": float(self.config.mlp_ratio),
             "dropout": float(self.config.dropout),
             "class_names": list(self.class_names),
+            "num_time_patches": int(
+                self.config.num_time_patches
+            ),
+            "model_n_time_patches": int(
+                self.config.model_n_time_patches
+            ),
         }
         preprocessing_payload = {
             "filter_enabled": bool(self.config.filter_enabled),
@@ -714,6 +720,9 @@ class Model50MAdapter(BaseModelAdapter):
             output_layer_idx=int(model["output_layer_idx"]),
             aggregation=model["aggregation"],
             num_classes=int(model["num_classes"]),
+            model_n_time_patches=int(
+                model.get("model_n_time_patches", 10)
+            ),
         )
         return cls(config=config, class_names=class_names, strict_head_metadata=True)
 

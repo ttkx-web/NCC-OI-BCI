@@ -556,7 +556,89 @@ def run_head_epoch(
         confusion_matrix=confusion.tolist(),
         per_class_recall=per_class_recall,
     )
+def build_direct_trial_windows(
+    *,
+    trials: np.ndarray,
+    labels: np.ndarray,
+    trial_ids: np.ndarray,
+    sample_rate: float,
+    window_seconds: float,
+    num_classes: int,
+    seed: int,
+    split_name: str,
+) -> WindowSet:
+    """
+    将每个原始 Trial 直接作为一个模型窗口。
 
+    适用于：
+        BNCI 4 秒 Trial
+        + 4 秒模型输入
+
+    不执行拼接、补零或跨 Trial 切片。
+    """
+    trials = np.asarray(trials, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int64)
+    trial_ids = np.asarray(trial_ids, dtype=np.int64)
+
+    if trials.ndim != 3:
+        raise ValueError(
+            f"{split_name}: expected trials [N,C,T], "
+            f"got {trials.shape}."
+        )
+
+    if labels.shape != (len(trials),):
+        raise ValueError(
+            f"{split_name}: labels shape mismatch: {labels.shape}."
+        )
+
+    if trial_ids.shape != (len(trials),):
+        raise ValueError(
+            f"{split_name}: trial_ids shape mismatch: "
+            f"{trial_ids.shape}."
+        )
+
+    if not np.isfinite(trials).all():
+        raise ValueError(
+            f"{split_name}: trials contain NaN or Inf."
+        )
+
+    if sample_rate <= 0:
+        raise ValueError(
+            f"{split_name}: invalid sample_rate={sample_rate}."
+        )
+
+    expected_samples = int(
+        round(window_seconds * sample_rate)
+    )
+    actual_samples = int(trials.shape[-1])
+
+    if actual_samples != expected_samples:
+        raise ValueError(
+            f"{split_name}: direct-trial mode requires exactly "
+            f"{window_seconds:.3f}s per source trial. "
+            f"Expected {expected_samples} samples at "
+            f"{sample_rate:.3f} Hz, got {actual_samples} "
+            f"({actual_samples / sample_rate:.3f}s)."
+        )
+
+    validate_labels(
+        labels,
+        num_classes=num_classes,
+        split_name=split_name,
+    )
+
+    rng = np.random.default_rng(seed)
+    permutation = rng.permutation(len(trials))
+
+    return WindowSet(
+        windows=trials[permutation].copy(),
+        labels=labels[permutation].copy(),
+        source_trial_ids=tuple(
+            (int(trial_ids[index]),)
+            for index in permutation
+        ),
+        construction="direct_source_trial",
+    )
 
 def metric_is_better(
     *,

@@ -228,6 +228,7 @@ def build_50m_runtime(
 
     strict_window_duration: bool = True,
     strict_head_metadata: bool = True,
+    model_n_time_patches: int = 10,
 ) -> Model50MRuntime:
     """
     构建 50M Pipeline 运行时。
@@ -302,6 +303,7 @@ def build_50m_runtime(
         output_layer_idx=output_layer_idx,
         aggregation=aggregation,
         num_classes=len(normalized_class_names),
+        model_n_time_patches=model_n_time_patches,
     )
 
     adapter = Model50MAdapter(
@@ -331,10 +333,20 @@ def build_50m_runtime_from_metadata(
     classifier_path: str | Path,
     metadata: EEGMetadataLike,
     device: str = "cpu",
+
+    target_sample_rate: float = 100.0,
+    window_seconds: float = 10.0,
+    model_n_time_patches: int = 10,
+    patch_seconds: float = 1.0,
+    patch_stride_seconds: float = 1.0,
+
     filter_enabled: bool = True,
     filter_low_hz: float = 0.1,
     filter_high_hz: float = 75.0,
     reference_mode: str = "none",
+
+    output_layer_idx: int = 8,
+    aggregation: str = "flatten",
     strict_head_metadata: bool = True,
 ) -> Model50MRuntime:
     """
@@ -366,27 +378,27 @@ def build_50m_runtime_from_metadata(
         )
 
     return build_50m_runtime(
-        checkpoint_path=checkpoint_path,
-        classifier_path=classifier_path,
-        channel_names=metadata.channel_names,
-        sample_rate=float(metadata.sample_rate),
-        input_unit=str(metadata.unit),
-        class_names=metadata.class_names,
-        device=device,
+    checkpoint_path=checkpoint_path,
+    classifier_path=classifier_path,
+    channel_names=metadata.channel_names,
+    sample_rate=float(metadata.sample_rate),
+    input_unit=str(metadata.unit),
+    class_names=metadata.class_names,
+    device=device,
 
-        # 当前阶段固定使用原始 10 秒配置。
-        target_sample_rate=100.0,
-        window_seconds=10.0,
-        patch_seconds=1.0,
-        patch_stride_seconds=1.0,
+    target_sample_rate=target_sample_rate,
+    window_seconds=window_seconds,
+    model_n_time_patches=model_n_time_patches,
+    patch_seconds=patch_seconds,
+    patch_stride_seconds=patch_stride_seconds,
 
-        filter_enabled=filter_enabled,
-        filter_low_hz=filter_low_hz,
-        filter_high_hz=filter_high_hz,
-        reference_mode=reference_mode,
+    filter_enabled=filter_enabled,
+    filter_low_hz=filter_low_hz,
+    filter_high_hz=filter_high_hz,
+    reference_mode=reference_mode,
 
-        output_layer_idx=8,
-        aggregation="flatten",
-        strict_window_duration=True,
-        strict_head_metadata=strict_head_metadata,
-    )
+    output_layer_idx=output_layer_idx,
+    aggregation=aggregation,
+    strict_window_duration=True,
+    strict_head_metadata=strict_head_metadata,
+)

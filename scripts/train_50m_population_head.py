@@ -75,6 +75,7 @@ from train_50m_linear_head import (
     run_head_epoch,
     set_seed,
     validate_labels,
+    build_direct_trial_windows,
 )
 
 
@@ -428,6 +429,7 @@ def build_subject_window_bundle(
     seed: int,
     shuffle_trials_within_class: bool,
     max_windows_per_class: int | None,
+        window_construction: str,
 ) -> tuple[WindowBundle, HDF5Metadata, dict[str, Any]]:
     dataset = EEGHDF5(path)
     metadata = dataset.metadata
@@ -453,18 +455,52 @@ def build_subject_window_bundle(
     raw_trial_ids = np.asarray(session_data["trial_ids"], dtype=np.int64)
     global_trial_ids = encode_trial_ids(subject_id, raw_trial_ids)
 
-    window_set = build_same_label_concat_windows(
-        trials=np.asarray(session_data["data"], dtype=np.float32),
-        labels=np.asarray(session_data["labels"], dtype=np.int64),
-        trial_ids=global_trial_ids,
-        sample_rate=metadata.sample_rate,
-        window_seconds=window_seconds,
-        stride_seconds=stride_seconds,
-        num_classes=num_classes,
-        seed=seed,
-        shuffle_trials_within_class=shuffle_trials_within_class,
-        split_name=f"subject_{subject_id:02d}/{session_name}",
+    trials = np.asarray(
+        session_data["data"],
+        dtype=np.float32,
     )
+    labels = np.asarray(
+        session_data["labels"],
+        dtype=np.int64,
+    )
+
+    if window_construction == "direct_trial":
+        window_set = build_direct_trial_windows(
+            trials=trials,
+            labels=labels,
+            trial_ids=global_trial_ids,
+            sample_rate=metadata.sample_rate,
+            window_seconds=window_seconds,
+            num_classes=num_classes,
+            seed=seed,
+            split_name=(
+                f"subject_{subject_id:02d}/{session_name}"
+            ),
+        )
+
+    elif window_construction == "same_label_concat":
+        window_set = build_same_label_concat_windows(
+            trials=trials,
+            labels=labels,
+            trial_ids=global_trial_ids,
+            sample_rate=metadata.sample_rate,
+            window_seconds=window_seconds,
+            stride_seconds=stride_seconds,
+            num_classes=num_classes,
+            seed=seed,
+            shuffle_trials_within_class=(
+                shuffle_trials_within_class
+            ),
+            split_name=(
+                f"subject_{subject_id:02d}/{session_name}"
+            ),
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported window_construction="
+            f"{window_construction!r}."
+        )
 
     window_set = limit_windows_per_class(
         window_set,
@@ -560,6 +596,7 @@ def build_population_split(
     shuffle_trials_within_class: bool,
     max_windows_per_class_per_subject: int | None,
     reference_metadata: HDF5Metadata | None = None,
+    window_construction: str,
 ) -> SplitBuildResult:
     bundles: list[WindowBundle] = []
     summaries: dict[str, Any] = {}
@@ -584,6 +621,7 @@ def build_population_split(
             seed=base_seed + offset * 100,
             shuffle_trials_within_class=shuffle_trials_within_class,
             max_windows_per_class=max_windows_per_class_per_subject,
+            window_construction=window_construction,
         )
         if common_metadata is None:
             common_metadata = metadata
@@ -801,8 +839,37 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="cpu",
         choices=("cpu", "cuda", "mps", "auto"),
     )
-    parser.add_argument("--window-sec", type=float, default=10.0)
-    parser.add_argument("--window-stride-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--window-sec",
+        type=float,
+        default=4.0,
+    )
+
+    parser.add_argument(
+        "--window-stride-sec",
+        type=float,
+        default=4.0,
+        help=(
+            "Only used by same_label_concat mode. "
+            "Direct-trial mode uses one source trial per sample."
+        ),
+    )
+
+    parser.add_argument(
+        "--window-construction",
+        choices=("direct_trial", "same_label_concat"),
+        default="direct_trial",
+    )
+
+    parser.add_argument(
+        "--model-n-time-patches",
+        type=int,
+        default=10,
+        help=(
+            "Number of time embeddings in the pretrained backbone. "
+            "Keep 10 when using the 10-second pretrained checkpoint."
+        ),
+    )
     parser.add_argument("--target-sample-rate", type=float, default=100.0)
     parser.add_argument("--patch-sec", type=float, default=1.0)
     parser.add_argument("--patch-stride-sec", type=float, default=1.0)
@@ -873,10 +940,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argument_parser().parse_args()
 
-    if abs(args.window_sec - 10.0) > 1e-6:
+    if args.window_sec <= 0:
+        raise ValueError("--window-sec must be positive.")
+
+    if args.model_n_time_patches <= 0:
         raise ValueError(
-            "The current Stage-1 baseline reuses the original 50M "
-            "10-second input contract. Use --window-sec 10.0."
+            "--model-n-time-patches must be positive."
         )
     if args.window_stride_sec <= 0:
         raise ValueError("--window-stride-sec must be positive.")
@@ -1030,6 +1099,7 @@ def main() -> None:
         max_windows_per_class_per_subject=(
             args.max_windows_per_class_per_subject
         ),
+        window_construction=args.window_construction,
     )
 
     print("Building population validation windows...")
@@ -1046,6 +1116,7 @@ def main() -> None:
             args.max_windows_per_class_per_subject
         ),
         reference_metadata=train_build.metadata,
+        window_construction=args.window_construction,
     )
 
     metadata = train_build.metadata
@@ -1130,6 +1201,7 @@ def main() -> None:
         output_layer_idx=args.output_layer_idx,
         aggregation=args.aggregation,
         num_classes=num_classes,
+        model_n_time_patches=args.model_n_time_patches,
     )
 
     preprocessing_contract = {
@@ -1149,6 +1221,10 @@ def main() -> None:
         "output_layer_idx": int(config.output_layer_idx),
         "aggregation": str(config.aggregation),
         "num_classes": int(config.num_classes),
+        "model_n_time_patches": int(
+            config.model_n_time_patches
+        ),
+        "window_construction": args.window_construction,
     }
     preprocessing_hash = stable_json_hash(preprocessing_contract)
 
@@ -1428,6 +1504,7 @@ def main() -> None:
             args.max_windows_per_class_per_subject
         ),
         reference_metadata=metadata,
+        window_construction=args.window_construction,
     )
 
     target_subject_values = set(
@@ -1539,13 +1616,18 @@ def main() -> None:
             "best_validation": selected_val_metrics.to_dict(),
             "target_final_test": target_metrics.to_dict(),
             "window_construction": (
-                "same_label_trial_concatenation_per_subject_and_session"
+                train_build.bundle.window_set.construction
             ),
-            "window_stride_seconds": float(args.window_stride_sec),
+            "model_n_time_patches": int(
+                config.model_n_time_patches
+            ),
             "warning": (
-                "Temporary Stage-1 baseline: 10-second samples are built "
-                "from 4-second source trials, but never across subjects, "
-                "sessions, or labels."
+                None
+                if args.window_construction == "direct_trial"
+                else (
+                    "Samples were constructed by concatenating "
+                    "same-label source trials."
+                )
             ),
             "git_commit": git_commit,
         },

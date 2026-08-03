@@ -428,6 +428,19 @@ def main() -> None:
         raise FileNotFoundError(
             f"Command-map JSON was not found: {command_map_path}"
         )
+    classifier_payload = safe_torch_load(
+        classifier_path
+    )
+
+    classifier_metadata = classifier_payload.get(
+        "metadata",
+        {},
+    )
+
+    if not isinstance(classifier_metadata, dict):
+        raise TypeError(
+            "Classifier metadata must be a dictionary."
+        )
 
     dataset = EEGHDF5(data_path)
     metadata = dataset.metadata
@@ -463,6 +476,31 @@ def main() -> None:
             classifier_path=classifier_path,
             metadata=metadata,
             device=args.device,
+
+            target_sample_rate=float(
+                classifier_metadata["target_sample_rate"]
+            ),
+            window_seconds=float(
+                classifier_metadata["window_seconds"]
+            ),
+            model_n_time_patches=int(
+                classifier_metadata.get(
+                    "model_n_time_patches",
+                    10,
+                )
+            ),
+            patch_seconds=float(
+                classifier_metadata["patch_seconds"]
+            ),
+            patch_stride_seconds=float(
+                classifier_metadata["patch_stride_seconds"]
+            ),
+            output_layer_idx=int(
+                classifier_metadata["output_layer_idx"]
+            ),
+            aggregation=str(
+                classifier_metadata["aggregation"]
+            ),
         )
 
         saved_package = runtime.adapter.save(

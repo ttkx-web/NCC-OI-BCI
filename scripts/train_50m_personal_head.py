@@ -80,6 +80,7 @@ from train_50m_linear_head import (
     run_head_epoch,
     set_seed,
     validate_labels,
+    build_direct_trial_windows,
 )
 
 # Reuse Stage-1 population helpers for:
@@ -461,22 +462,53 @@ def build_windows_from_selected_trials(
     seed: int,
     shuffle_trials_within_class: bool,
     max_windows_per_class: int | None,
+    window_construction: str,
 ) -> WindowSet:
     raw_trial_ids = np.asarray(selected["trial_ids"], dtype=np.int64)
     encoded_ids = encode_trial_ids(subject_id, raw_trial_ids)
 
-    window_set = build_same_label_concat_windows(
-        trials=np.asarray(selected["data"], dtype=np.float32),
-        labels=np.asarray(selected["labels"], dtype=np.int64),
-        trial_ids=encoded_ids,
-        sample_rate=metadata.sample_rate,
-        window_seconds=window_seconds,
-        stride_seconds=stride_seconds,
-        num_classes=len(metadata.class_names),
-        seed=seed,
-        shuffle_trials_within_class=shuffle_trials_within_class,
-        split_name=split_name,
+    trials = np.asarray(
+        selected["data"],
+        dtype=np.float32,
     )
+    labels = np.asarray(
+        selected["labels"],
+        dtype=np.int64,
+    )
+
+    if window_construction == "direct_trial":
+        window_set = build_direct_trial_windows(
+            trials=trials,
+            labels=labels,
+            trial_ids=encoded_ids,
+            sample_rate=metadata.sample_rate,
+            window_seconds=window_seconds,
+            num_classes=len(metadata.class_names),
+            seed=seed,
+            split_name=split_name,
+        )
+
+    elif window_construction == "same_label_concat":
+        window_set = build_same_label_concat_windows(
+            trials=trials,
+            labels=labels,
+            trial_ids=encoded_ids,
+            sample_rate=metadata.sample_rate,
+            window_seconds=window_seconds,
+            stride_seconds=stride_seconds,
+            num_classes=len(metadata.class_names),
+            seed=seed,
+            shuffle_trials_within_class=(
+                shuffle_trials_within_class
+            ),
+            split_name=split_name,
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported window_construction="
+            f"{window_construction!r}."
+        )
 
     if max_windows_per_class is None:
         return window_set
@@ -880,8 +912,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Flatten-head MPS crash."
         ),
     )
-    parser.add_argument("--window-sec", type=float, default=10.0)
-    parser.add_argument("--window-stride-sec", type=float, default=10.0)
+    parser.add_argument("--window-sec", type=float, default=4.0)
+    parser.add_argument("--window-stride-sec", type=float, default=4.0)
+    parser.add_argument(
+        "--window-construction",
+        choices=("direct_trial", "same_label_concat"),
+        default="direct_trial",
+    )
+
+    parser.add_argument(
+        "--model-n-time-patches",
+        type=int,
+        default=10,
+    )
     parser.add_argument("--target-sample-rate", type=float, default=100.0)
     parser.add_argument("--patch-sec", type=float, default=1.0)
     parser.add_argument("--patch-stride-sec", type=float, default=1.0)
@@ -969,10 +1012,41 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argument_parser().parse_args()
 
-    if abs(args.window_sec - 10.0) > 1e-6:
+    if args.window_sec <= 0:
         raise ValueError(
-            "Stage 1 currently reuses the Stage-0.5 10-second input "
-            "contract. Use --window-sec 10.0."
+            f"--window-sec must be positive, got {args.window_sec}."
+        )
+
+    if args.window_stride_sec <= 0:
+        raise ValueError(
+            "--window-stride-sec must be positive, "
+            f"got {args.window_stride_sec}."
+        )
+
+    if args.model_n_time_patches <= 0:
+        raise ValueError(
+            "--model-n-time-patches must be positive, "
+            f"got {args.model_n_time_patches}."
+        )
+
+    input_num_time_patches = (
+            int(
+                np.floor(
+                    (
+                            args.window_sec * args.target_sample_rate
+                            - args.patch_sec * args.target_sample_rate
+                    )
+                    / (args.patch_stride_sec * args.target_sample_rate)
+                )
+            )
+            + 1
+    )
+
+    if args.model_n_time_patches < input_num_time_patches:
+        raise ValueError(
+            "--model-n-time-patches cannot be smaller than the number "
+            "of input time patches: "
+            f"{args.model_n_time_patches} < {input_num_time_patches}."
         )
     if args.target_subject <= 0:
         raise ValueError("--target-subject must be positive.")
@@ -1301,6 +1375,7 @@ def main() -> None:
         seed=args.window_seed + 1_000,
         shuffle_trials_within_class=False,
         max_windows_per_class=args.max_windows_per_class,
+        window_construction=args.window_construction,
     )
     personal_validation_windows = build_windows_from_selected_trials(
         selected=personal_validation_source,
@@ -1312,6 +1387,7 @@ def main() -> None:
         seed=args.window_seed + 2_000,
         shuffle_trials_within_class=False,
         max_windows_per_class=args.max_windows_per_class,
+        window_construction=args.window_construction,
     )
 
     assert_no_window_source_leakage(
@@ -1321,7 +1397,9 @@ def main() -> None:
         right_name="personal validation",
     )
 
-    print("Derived 10-second windows:")
+    print(
+        f"Derived {args.window_sec:.1f}-second samples:"
+    )
     print(
         "  personal train:",
         len(personal_train_windows.windows),
@@ -1360,6 +1438,7 @@ def main() -> None:
         output_layer_idx=args.output_layer_idx,
         aggregation=args.aggregation,
         num_classes=num_classes,
+        model_n_time_patches=args.model_n_time_patches,
     )
 
     preprocessing_contract = {
@@ -1379,6 +1458,10 @@ def main() -> None:
         "output_layer_idx": int(config.output_layer_idx),
         "aggregation": str(config.aggregation),
         "num_classes": int(config.num_classes),
+        "model_n_time_patches": int(
+            config.model_n_time_patches
+        ),
+        "window_construction": args.window_construction,
     }
     preprocessing_hash = stable_json_hash(preprocessing_contract)
 
@@ -1750,6 +1833,7 @@ def main() -> None:
         seed=args.window_seed + 3_000,
         shuffle_trials_within_class=False,
         max_windows_per_class=args.max_windows_per_class,
+        window_construction=args.window_construction,
     )
 
     assert_no_window_source_leakage(

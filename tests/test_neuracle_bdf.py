@@ -99,6 +99,41 @@ def test_load_uses_lazy_read_and_returns_only_usable_eeg(
     assert record.metadata["eeg_channel_count"] == 2
     assert record.metadata["source_format"] == "BDF"
     assert record.metadata["reader_name"] == "neuracle-bdf"
+    assert record.metadata["reader_version"] == "1"
+    assert record.metadata["unit_evidence_level"] == "vendor_confirmed"
+    assert len(record.source_sha256 or "") == 64
+
+
+def test_reader_scales_mne_volts_to_uv_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ScalingRaw(FakeRaw):
+        def __init__(self) -> None:
+            super().__init__()
+            self._data = np.full((5, 5), 2.5e-6)
+
+        def get_data(
+            self, *, picks: list[int], start: int, stop: int, units: str
+        ) -> np.ndarray:
+            self.get_data_calls.append(
+                {"picks": picks, "start": start, "stop": stop, "units": units}
+            )
+            values_in_volts = self._data[picks, start:stop]
+            return values_in_volts * 1e6 if units == "uV" else values_in_volts
+
+    raw = ScalingRaw()
+    monkeypatch.setattr("bci_dayloop.data.neuracle_bdf.mne.io.read_raw_bdf", lambda *_args, **_kwargs: raw)
+    path = _placeholder_bdf(tmp_path)
+    path.write_bytes(b"synthetic-bdf")
+
+    record = NeuracleBDFReader(UnitEvidence("uV", "uV", "vendor_confirmed")).load(path)
+
+    mne_volts = raw._data[[0, 3], :]
+    assert np.array_equal(record.eeg, mne_volts * 1e6)
+    assert not np.array_equal(record.eeg, mne_volts * 1e12)
+    assert record.unit_evidence.raw_unit == "uV"
+    assert record.unit_evidence.normalized_unit == "uV"
+    assert record.unit_evidence.is_model_safe is True
 
 
 def test_non_numeric_annotations_are_preserved_as_custom_events(

@@ -2,7 +2,7 @@
 
 `NeuracleBDFReader` 接收一个 BDF 文件路径和已验证的 `UnitEvidence`。单位证据必须是 model-safe，且规范化单位必须为 `uV`；文件不存在、没有可用 EEG 通道、annotation 越界或 metadata 不一致时会抛出 `ValueError` 或 `FileNotFoundError`。
 
-Reader 使用 MNE 的惰性读取：`mne.io.read_raw_bdf(..., preload=False)`。读取 EEG 数值时使用 `get_data(..., units="uV")`，不再进行额外的 `1e6` 缩放。
+Reader 使用 MNE 的惰性打开：`mne.io.read_raw_bdf(..., preload=False)`。随后为离线 trial 提取会调用 `get_data(..., start=0, stop=n_times, units="uV")` 读取完整连续 EEG；这不是 metadata-only 操作。读取结果不再进行额外的 `1e6` 缩放。
 
 输出是 `RawEEGRecord`：
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,8 @@ class CollectCSV:
     rows: tuple[CollectCSVRow, ...]
     subject: str | None
     session: str | None
+    source_sha256: str
+    source_filename: str
 
     @classmethod
     def from_file(cls, path: str | Path) -> CollectCSV:
@@ -128,7 +131,17 @@ class CollectCSV:
                         raise
                     raise ValueError(f"Invalid value at CSV row {row_number}") from exc
 
-        return cls(rows=tuple(parsed_rows), subject=file_subject, session=file_session)
+        digest = hashlib.sha256()
+        with source_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return cls(
+            rows=tuple(parsed_rows),
+            subject=file_subject,
+            session=file_session,
+            source_sha256=digest.hexdigest(),
+            source_filename=source_path.name,
+        )
 
     def to_alignment_rows(self) -> tuple[Mapping[str, object], ...]:
         """Return only the CSV fields accepted by ``align_events_with_csv``."""

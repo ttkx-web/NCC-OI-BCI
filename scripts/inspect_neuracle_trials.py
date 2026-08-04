@@ -27,7 +27,7 @@ def _reader() -> NeuracleBDFReader:
         UnitEvidence(
             raw_unit="uV",
             normalized_unit="uV",
-            evidence_level="official_reader_verified",
+            evidence_level="vendor_confirmed",
             evidence_source="MNE get_data(..., units='uV')",
         )
     )
@@ -133,7 +133,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         collect_csv = CollectCSVAdapter.from_file(args.csv)
         csv_row_count = len(collect_csv.rows)
         aligned_events = align_events_with_csv(record.events, collect_csv.to_alignment_rows())
-        aligned_record = replace(record, events=aligned_events)
+        aligned_record = replace(
+            record,
+            events=aligned_events,
+            metadata={**record.metadata, "csv_sha256": collect_csv.source_sha256},
+        )
         trials = extract_imagery_trials(
             aligned_record,
             expected_duration_seconds=args.expected_duration_seconds,

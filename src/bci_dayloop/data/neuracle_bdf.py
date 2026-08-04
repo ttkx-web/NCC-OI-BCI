@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import re
+import hashlib
 
 import mne
 import numpy as np
@@ -143,6 +144,10 @@ class NeuracleBDFReader:
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
 
+        digest = hashlib.sha256()
+        with source_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
         raw = mne.io.read_raw_bdf(str(source_path), preload=False, verbose="ERROR")
         channel_names = tuple(raw.ch_names)
         channel_types = tuple(raw.get_channel_types())
@@ -170,7 +175,15 @@ class NeuracleBDFReader:
         )
         metadata = {
             "source_format": "BDF",
+            "conversion_tool": "unverified",
+            "conversion_tool_version": None,
             "reader_name": self.reader_name,
+            "reader_version": "1",
+            "unit_evidence_level": self.unit_evidence.evidence_level,
+            "window_semantics": "cue_plus_imagery_4s",
+            "eligible_for_accuracy": False,
+            "start_sample": None,
+            "end_sample": None,
             "all_channel_names": channel_names,
             "all_channel_types": channel_types,
             "excluded_channel_names": excluded_names,
@@ -191,7 +204,8 @@ class NeuracleBDFReader:
             subject_id=subject_id,
             session_id=session_id,
             device_id=device_id,
-            source_path=str(source_path),
+            source_path=source_path.name,
+            source_sha256=digest.hexdigest(),
             metadata=metadata,
         )
 

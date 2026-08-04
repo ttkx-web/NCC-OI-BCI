@@ -76,10 +76,87 @@ def test_missing_imagery_identifiers_are_rejected(field: str) -> None:
 
 
 def test_duration_outside_tolerance_is_rejected() -> None:
-    with pytest.raises(ValueError, match="duration"):
+    with pytest.raises(ValueError, match="Endpoint QC failed"):
         extract_imagery_trials(
             _record((_event(0, "imagery", code=1, label="left_hand"), _event(45, "rest", code=20)))
         )
+
+
+@pytest.mark.parametrize(("observed_rest", "expected_offset"), [(990, -10), (1005, 5)])
+def test_fixed_duration_window_uses_1000_real_samples_and_preserves_rest_offset(
+    observed_rest: int, expected_offset: int
+) -> None:
+    record = RawEEGRecord(
+        eeg=np.arange(2 * 1200).reshape(2, 1200),
+        channel_names=("C3", "C4"),
+        sampling_rate=250.0,
+        unit_evidence=UnitEvidence("uV", None, "vendor_confirmed"),
+        events=(
+            _event(0, "imagery", code=1, label="left_hand"),
+            _event(observed_rest, "rest", code=20),
+        ),
+    )
+
+    trial = extract_imagery_trials(record)[0]
+
+    assert trial.eeg.shape == (2, 1000)
+    assert np.array_equal(trial.eeg, record.eeg[:, 0:1000])
+    assert trial.canonical_end_sample == 1000
+    assert trial.observed_event_n_samples == observed_rest
+    assert trial.rest_offset_samples == expected_offset
+    assert trial.endpoint_qc_passed is True
+    assert trial.extraction_policy == "fixed_duration_from_class_marker"
+    assert trial.window_semantics == "cue_plus_imagery_4s"
+    assert trial.eligible_for_accuracy is False
+
+
+@pytest.mark.parametrize("observed_rest", [987, 1013])
+def test_endpoint_tolerance_includes_plus_or_minus_13_samples(observed_rest: int) -> None:
+    record = RawEEGRecord(
+        eeg=np.zeros((1, 1200)),
+        channel_names=("C3",),
+        sampling_rate=250.0,
+        unit_evidence=UnitEvidence("uV", None, "vendor_confirmed"),
+        events=(_event(0, "imagery", code=1, label="left_hand"), _event(observed_rest, "rest", code=20)),
+    )
+    assert extract_imagery_trials(record)[0].endpoint_qc_passed is True
+
+
+def test_endpoint_offset_beyond_13_samples_and_canonical_boundary_are_rejected() -> None:
+    record = RawEEGRecord(
+        eeg=np.zeros((1, 1200)),
+        channel_names=("C3",),
+        sampling_rate=250.0,
+        unit_evidence=UnitEvidence("uV", None, "vendor_confirmed"),
+        events=(_event(0, "imagery", code=1, label="left_hand"), _event(1014, "rest", code=20)),
+    )
+    with pytest.raises(ValueError, match="Endpoint QC failed"):
+        extract_imagery_trials(record)
+    short_record = RawEEGRecord(
+        eeg=np.zeros((1, 999)),
+        channel_names=("C3",),
+        sampling_rate=250.0,
+        unit_evidence=UnitEvidence("uV", None, "vendor_confirmed"),
+        events=(_event(0, "imagery", code=1, label="left_hand"), _event(990, "rest", code=20)),
+    )
+    with pytest.raises(ValueError, match="outside the recording"):
+        extract_imagery_trials(short_record)
+
+
+def test_boundary_inside_canonical_window_is_rejected() -> None:
+    record = RawEEGRecord(
+        eeg=np.zeros((1, 1200)),
+        channel_names=("C3",),
+        sampling_rate=250.0,
+        unit_evidence=UnitEvidence("uV", None, "vendor_confirmed"),
+        events=(
+            _event(0, "imagery", code=1, label="left_hand"),
+            EEGEvent(500, "custom", metadata={"original_description": "BAD boundary"}),
+            _event(1000, "rest", code=20),
+        ),
+    )
+    with pytest.raises(ValueError, match="boundary or gap"):
+        extract_imagery_trials(record)
 
 
 def test_duplicate_trial_identifier_is_rejected() -> None:

@@ -215,4 +215,4 @@ def test_trial_extraction_failure_writes_error_report(
     report = json.loads(output_path.read_text(encoding="utf-8"))
     assert result == 1
     assert report["extraction_passed"] is False
-    assert "duration" in report["error"]
+    assert "Endpoint QC failed" in report["error"]

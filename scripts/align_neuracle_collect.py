@@ -79,7 +79,7 @@ def _reader() -> NeuracleBDFReader:
         UnitEvidence(
             raw_unit="uV",
             normalized_unit="uV",
-            evidence_level="official_reader_verified",
+            evidence_level="vendor_confirmed",
             evidence_source="MNE get_data(..., units='uV')",
         )
     )

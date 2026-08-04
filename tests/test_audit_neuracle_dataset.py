@@ -1,6 +1,8 @@
 import csv
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -129,6 +131,24 @@ def test_audit_multiple_sessions_uses_stable_relative_order_and_metadata_only_re
     assert report["all_sessions_passed"] is True
     assert "eeg" not in report
     assert all("/" not in item["relative_directory"] for item in report["session_reports"])
+    assert (output_path.parent / "session_qc.json").is_file()
+    assert (output_path.parent / "dataset_summary.json").is_file()
+    assert (output_path.parent / "trial_inventory.csv").is_file()
+    assert (output_path.parent / "channel_metrics.csv").is_file()
+    assert (output_path.parent / "event_alignment.csv").is_file()
+    assert (output_path.parent / "export_manifest.json").is_file()
+
+
+def test_audit_cli_runs_directly_without_pythonpath() -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/audit_neuracle_dataset.py", "--help"],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "--endpoint-tolerance-seconds" in result.stdout
 
 
 def test_audit_records_discovery_and_session_failures_but_continues(
@@ -164,7 +184,7 @@ def test_audit_records_discovery_and_session_failures_but_continues(
     assert len(report["failures"]) == 5
     errors = {failure["relative_directory"]: failure["error"] for failure in report["failures"]}
     assert "Marker code mismatch" in errors["align_failure"]
-    assert "duration" in errors["trial_failure"]
+    assert "Endpoint QC failed" in errors["trial_failure"]
     assert "found 0" in errors["missing_bdf"]
     assert "found 0" in errors["missing_csv"]
     assert "found 2" in errors["multiple_csv"]

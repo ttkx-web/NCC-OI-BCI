@@ -70,7 +70,7 @@ def resolve_replay_settings(args: argparse.Namespace, config: dict[str, Any]) ->
     data_config = dict(config.get("data", {}))
     run_dir = Path(project.get("run_dir", "runs/day1_bnci_s01"))
 
-    data_value = _first_defined(args.data, data_config.get("output_hdf5"), "data/processed/bnci2014_001_s01.h5")
+    data_value = _first_defined(args.data, data_config.get("output_hdf5"), "data/processed/bnci2014_001/subject_01.h5")
     package_value = _first_defined(args.model_package, replay.get("model_package"), run_dir / "model_package")
     device = str(_first_defined(args.device, model_config.get("device"), "cuda"))
     maximum_value = _first_defined(args.max_windows, replay.get("max_windows"), 100)

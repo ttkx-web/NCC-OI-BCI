@@ -337,7 +337,7 @@ window_stride_sec
 默认 Backbone：
 
 ```text
-checkpoints/50m/model_deploy.pt
+checkpoints/backbones/50m/model_deploy.pt
 ```
 
 ### 8.2 Backbone 冻结
@@ -718,7 +718,7 @@ runs/stage1/
   "training_subjects": ["subject_02", "subject_03"],
   "population_train_sessions": ["0train"],
   "population_validation_sessions": ["1test"],
-  "backbone_checkpoint": "checkpoints/50m/model_deploy.pt",
+  "backbone_checkpoint": "checkpoints/backbones/50m/model_deploy.pt",
   "backbone_sha256": "...",
   "preprocessing_hash": "...",
   "classes": ["left_hand", "right_hand", "feet", "tongue"],

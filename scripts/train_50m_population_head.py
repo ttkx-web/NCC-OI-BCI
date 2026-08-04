@@ -78,6 +78,10 @@ from train_50m_linear_head import (
     build_direct_trial_windows,
 )
 
+from bci_dayloop.utils.paths import (
+    population_head_path,
+)
+
 
 # ---------------------------------------------------------------------------
 # Data containers
@@ -814,15 +818,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--checkpoint",
-        default="checkpoints/50m/model_deploy.pt",
-        help="Dependency-free 50M backbone checkpoint.",
+        default=(
+            "checkpoints/backbones/"
+            "50m/model_deploy.pt"
+        ),
     )
     parser.add_argument(
         "--output",
+        type=str,
         default=None,
         help=(
-            "Output population-head checkpoint. Default: "
-            "checkpoints/stage1/subject_XX/population_head.pt."
+            "Output classifier checkpoint. "
+            "When omitted, a standard Stage-1 path "
+            "is generated automatically."
         ),
     )
     parser.add_argument(
@@ -998,15 +1006,22 @@ def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args.output is None:
-        output_path = (
-            ROOT
-            / "checkpoints"
-            / "stage1"
-            / target_tag
-            / "population_head.pt"
-        ).resolve()
+        output_path = population_head_path(
+            stage="stage1",
+            dataset="bnci2014_001",
+            subject_id=args.target_subject,
+            window_seconds=args.window_sec,
+            aggregation=args.aggregation,
+        )
     else:
-        output_path = resolve_repo_path(args.output)
+        output_path = resolve_repo_path(
+            args.output
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if args.run_dir is None:
         run_dir = (

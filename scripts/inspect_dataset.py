@@ -13,7 +13,7 @@ from bci_dayloop.utils.config import resolve_path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect BCI DayLoop HDF5 metadata and splits")
-    parser.add_argument("path", nargs="?", default="data/processed/bnci2014_001_s01.h5")
+    parser.add_argument("path", nargs="?", default="data/processed/bnci2014_001/subject_01.h5")
     args = parser.parse_args()
     path = resolve_path(args.path)
     dataset = EEGHDF5(path)

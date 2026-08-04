@@ -16,7 +16,7 @@ from _bootstrap import ROOT
 def main() -> None:
     config = Model50MConfig(
         checkpoint_path=(
-            ROOT / "checkpoints/50m/model_deploy.pt"
+            ROOT / "checkpoints/backbones/50m/model_deploy.pt"
         ),
         device="cpu",
     )

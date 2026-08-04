@@ -28,7 +28,7 @@ class LaBraMLinearAdapter(BaseModelAdapter):
         self,
         channel_names: list[str],
         n_classes: int = 4,
-        checkpoint: str | Path = "checkpoints/labram-base.pth",
+        checkpoint: str | Path = "checkpoints/backbones/labram/labram_base.pth",
         device: str = "cuda",
         amp: bool = True,
         freeze_encoder: bool = True,
@@ -348,7 +348,7 @@ class LaBraMLinearAdapter(BaseModelAdapter):
             base = json.load(handle)
         checkpoint = Path(base.get("checkpoint_path_absolute", ""))
         if not checkpoint.exists():
-            checkpoint = Path(base.get("checkpoint_path", "checkpoints/labram-base.pth"))
+            checkpoint = Path(base.get("checkpoint_path", "checkpoints/backbones/labram/labram_base.pth"))
             if not checkpoint.is_absolute():
                 candidates = [package / checkpoint, project_root() / checkpoint]
                 checkpoint = next((item for item in candidates if item.exists()), candidates[-1])

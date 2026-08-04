@@ -263,7 +263,7 @@ configs\day1_bnci_s01.yaml
 
 ```yaml
 model:
-  checkpoint: checkpoints/labram-base.pth
+  checkpoint: checkpoints/backbones/labram/labram_base.pth
 ```
 
 不要用随机初始化权重做正式实验。`--random-init` 只用于检查代码线路是否接通。

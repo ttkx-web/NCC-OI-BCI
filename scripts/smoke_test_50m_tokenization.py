@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from _bootstrap import ROOT
 
 from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
@@ -12,7 +13,13 @@ from bci_dayloop.models.model_50m.tokenization import (
 
 
 config = Model50MConfig(
-    checkpoint_path=Path("checkpoints/50m/model.pt"),
+    checkpoint_path=(
+            ROOT
+            / "checkpoints"
+            / "backbones"
+            / "50m"
+            / "model_deploy.pt"
+    ),
     device="cpu",
 )
 

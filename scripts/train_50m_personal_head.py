@@ -125,6 +125,10 @@ from bci_dayloop.personalization import (
     validate_three_way_trial_split,
 )
 
+from bci_dayloop.utils.paths import (
+    population_head_path,
+    personal_head_path,
+)
 
 
 def safe_load_mapping(path: Path) -> Mapping[str, Any]:
@@ -393,24 +397,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--population-head",
+        type=str,
         default=None,
         help=(
-            "LOSO population-head checkpoint. Default: "
-            "checkpoints/stage1/subject_XX/population_head.pt."
+            "Population-head checkpoint. "
+            "When omitted, the standard path for "
+            "the target subject and input contract "
+            "is used."
         ),
     )
     parser.add_argument(
         "--checkpoint",
-        default="checkpoints/50m/model_deploy.pt",
-        help="Dependency-free 50M backbone checkpoint.",
+        default=(
+            "checkpoints/backbones/"
+            "50m/model_deploy.pt"
+        ),
     )
     parser.add_argument(
         "--output",
+        type=str,
         default=None,
         help=(
-            "Output personal-head checkpoint. Default: "
-            "checkpoints/stage1/subject_XX/personal/"
-            "trials_NN_seed_S/personal_head.pt."
+            "Personal-head checkpoint path. "
+            "When omitted, a standard Stage-1 "
+            "personal-head path is generated."
         ),
     )
     parser.add_argument(
@@ -730,28 +740,41 @@ def main() -> None:
     backbone_path = resolve_repo_path(args.checkpoint)
 
     if args.population_head is None:
-        population_head_path = (
-            ROOT
-            / "checkpoints"
-            / "stage1"
-            / target_tag
-            / "population_head.pt"
-        ).resolve()
+        population_head_checkpoint = (
+            population_head_path(
+                stage="stage1",
+                dataset="bnci2014_001",
+                subject_id=args.target_subject,
+                window_seconds=args.window_sec,
+                aggregation=args.aggregation,
+            )
+        )
     else:
-        population_head_path = resolve_repo_path(args.population_head)
+        population_head_checkpoint = (
+            resolve_repo_path(
+                args.population_head
+            )
+        )
 
     if args.output is None:
-        output_path = (
-            ROOT
-            / "checkpoints"
-            / "stage1"
-            / target_tag
-            / "personal"
-            / f"{budget_tag}_{seed_tag}"
-            / "personal_head.pt"
-        ).resolve()
+        output_path = personal_head_path(
+            stage="stage1",
+            dataset="bnci2014_001",
+            subject_id=args.target_subject,
+            window_seconds=args.window_sec,
+            aggregation=args.aggregation,
+            trials_per_class=args.trials_per_class,
+            seed=args.personalization_seed,
+        )
     else:
-        output_path = resolve_repo_path(args.output)
+        output_path = resolve_repo_path(
+            args.output
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if args.run_dir is None:
         run_dir = (
@@ -769,16 +792,16 @@ def main() -> None:
     for name, path in (
         ("target HDF5", data_path),
         ("50M backbone", backbone_path),
-        ("population head", population_head_path),
+        ("population head", population_head_checkpoint),
     ):
         if not path.is_file():
             raise FileNotFoundError(f"{name} was not found: {path}")
 
     git_commit = current_git_commit()
     backbone_sha256 = sha256_file(backbone_path)
-    population_head_sha256 = sha256_file(population_head_path)
+    population_head_sha256 = sha256_file(population_head_checkpoint)
     population_metadata = load_checkpoint_metadata(
-        population_head_path
+        population_head_checkpoint
     )
 
     # Protocol-level population-head checks.
@@ -839,7 +862,7 @@ def main() -> None:
     )
     print("validation seed:", args.validation_seed)
     print("personalization seed:", args.personalization_seed)
-    print("population head:", population_head_path)
+    print("population head:", population_head_checkpoint)
     print("personal head init:", args.head_init)
     print("backbone:", backbone_path)
     print("output:", output_path)
@@ -863,7 +886,7 @@ def main() -> None:
         "data_path": str(data_path),
         "backbone_path": str(backbone_path),
         "backbone_sha256": backbone_sha256,
-        "population_head_path": str(population_head_path),
+        "population_head_path": str(population_head_checkpoint),
         "population_head_sha256": population_head_sha256,
         "output_path": str(output_path),
         "arguments": vars(args),
@@ -1055,7 +1078,7 @@ def main() -> None:
 
     config = Model50MConfig(
         checkpoint_path=backbone_path,
-        classifier_path=population_head_path,
+        classifier_path=population_head_checkpoint,
         device=args.device,
         target_sample_rate=args.target_sample_rate,
         window_seconds=args.window_sec,
@@ -1123,7 +1146,7 @@ def main() -> None:
     )
     load_report = load_classifier_checkpoint(
         classifier=classifier,
-        checkpoint_path=population_head_path,
+        checkpoint_path=population_head_checkpoint,
         strict_metadata=True,
     )
     model_load_seconds = time.perf_counter() - load_start
@@ -1550,7 +1573,7 @@ def main() -> None:
                 personal_training_seconds
             ),
             "base_population_head": str(
-                population_head_path
+                population_head_checkpoint
             ),
             "base_population_head_sha256": (
                 population_head_sha256
@@ -1700,7 +1723,7 @@ def main() -> None:
             "training_seed": int(args.seed),
             "window_seed": int(args.window_seed),
             "head_initialization": args.head_init,
-            "base_population_model": str(population_head_path),
+            "base_population_model": str(population_head_checkpoint),
             "base_population_sha256": population_head_sha256,
             "population_training_subjects": sorted(
                 population_training_subjects
@@ -1921,7 +1944,7 @@ def main() -> None:
             personal_training_seconds
         ),
         "base_population_head": str(
-            population_head_path
+            population_head_checkpoint
         ),
         "base_population_head_sha256": (
             population_head_sha256
@@ -2161,7 +2184,7 @@ def main() -> None:
         "files": {
             "target_data": str(data_path),
             "backbone_checkpoint": str(backbone_path),
-            "population_head": str(population_head_path),
+            "population_head": str(population_head_checkpoint),
             "personal_head": str(saved_path),
             "run_dir": str(run_dir),
             "epoch_metrics_csv": str(metrics_csv),

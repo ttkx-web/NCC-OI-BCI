@@ -131,7 +131,10 @@ class Model50MAdapter(BaseModelAdapter):
             raise ValueError(
                 "Model50MAdapter requires config.classifier_path. "
                 "For the current flow test, set it to "
-                "'checkpoints/50m/test_linear_head.pt'."
+
+                "'checkpoints/heads/stage05/"
+                "bnci2014_001/subject_01/"
+                "10s_flatten/head.pt'."
             )
 
         self.config = config

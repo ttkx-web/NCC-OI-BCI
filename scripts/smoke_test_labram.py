@@ -18,7 +18,7 @@ DEFAULT_CHANNELS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one LaBraM Base forward-pass smoke test")
-    parser.add_argument("--checkpoint", default="checkpoints/labram-base.pth")
+    parser.add_argument("--checkpoint", default="checkpoints/backbones/labram/labram_base.pth")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--random-init", action="store_true")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)

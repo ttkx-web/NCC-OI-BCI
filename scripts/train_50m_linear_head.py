@@ -667,7 +667,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data",
-        default="data/processed/bnci2014_001_s01.h5",
+        default="data/processed/bnci2014_001/subject_01.h5",
     )
     parser.add_argument("--train-session", default="0train")
     parser.add_argument("--test-session", default="1test")
@@ -678,7 +678,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output",
-        default="checkpoints/50m_bnci2014_001_s01_linear_head.pt",
+        default="checkpoints/heads/stage05/bnci2014_001/subject_01/10s_flatten/head.pt",
         help="Output linear-head checkpoint.",
     )
     parser.add_argument(

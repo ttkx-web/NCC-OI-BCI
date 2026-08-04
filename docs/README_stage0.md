@@ -64,7 +64,7 @@ The project intentionally uses two environments:
 - `bci-dayloop-data`: optional data-download environment containing MOABB.
 
 The main runtime does not depend on MOABB. It reads the already generated
-`data/processed/bnci2014_001_s01.h5` directly.
+`data/processed/bnci2014_001/subject_01.h5` directly.
 
 ### Main training/replay environment
 
@@ -180,7 +180,7 @@ base_model.json
 
 `base_model.json` records the checkpoint path, SHA-256 digest, architecture and
 load report. The Base weights are intentionally not duplicated into each run;
-keep `checkpoints/labram-base.pth` available when moving or reloading a package.
+keep `checkpoints/backbones/labram/labram_base.pth` available when moving or reloading a package.
 
 ## Intentionally out of scope
 

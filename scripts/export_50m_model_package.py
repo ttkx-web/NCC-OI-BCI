@@ -344,17 +344,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data",
-        default="data/processed/bnci2014_001_s01.h5",
+        default="data/processed/bnci2014_001/subject_01.h5",
         help="HDF5 data used to resolve channels, units and class order.",
     )
     parser.add_argument(
         "--checkpoint",
-        default="checkpoints/50m/model_deploy.pt",
+        default="checkpoints/backbones/50m/model_deploy.pt",
         help="Dependency-free 50M backbone checkpoint.",
     )
     parser.add_argument(
         "--classifier",
-        default="checkpoints/50m_bnci2014_001_s01_linear_head.pt",
+        default="checkpoints/heads/stage05/bnci2014_001/subject_01/10s_flatten/head.pt",
         help="Formally trained linear-head checkpoint.",
     )
     parser.add_argument(

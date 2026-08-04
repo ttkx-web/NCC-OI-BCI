@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -50,14 +52,43 @@ def describe_session(path: str, session: str) -> tuple[int, int]:
 
 
 def discover_hdf5() -> list[str]:
-    return [str(path) for path in sorted((ROOT / "data" / "processed").glob("*.h5"))]
+    """Recursively discover processed HDF5 datasets."""
+    data_root = ROOT / "data" / "processed"
+
+    if not data_root.is_dir():
+        return []
+
+    files = {
+        str(path.resolve())
+        for pattern in ("*.h5", "*.hdf5")
+        for path in data_root.rglob(pattern)
+        if path.is_file()
+    }
+
+    return sorted(files)
 
 
 def discover_packages() -> list[str]:
-    packages = {
-        str(model_yaml.parent.resolve())
-        for model_yaml in (ROOT / "runs").rglob("model.yaml")
-    }
+    search_roots = (
+        ROOT / "model_packages",
+        ROOT / "runs",  # 暂时兼容未迁移的旧包
+    )
+
+    packages: set[str] = set()
+
+    for search_root in search_roots:
+        if not search_root.is_dir():
+            continue
+
+        for model_yaml in search_root.rglob("model.yaml"):
+            package_dir = model_yaml.parent
+
+            if (
+                package_dir / "preprocessing.yaml"
+            ).is_file():
+                packages.add(
+                    str(package_dir.resolve())
+                )
 
     return sorted(packages)
 
@@ -116,7 +147,7 @@ with st.sidebar:
         st.warning("No HDF5 file found under data/processed.")
         data_path = st.text_input(
             "Data file",
-            str(ROOT / "data" / "processed" / "bnci2014_001_s01.h5"),
+            str(ROOT / "data/processed/bnci2014_001/subject_01.h5"),
             disabled=not availability.configuration_enabled,
         )
     else:

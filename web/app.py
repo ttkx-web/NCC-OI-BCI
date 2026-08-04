@@ -54,7 +54,12 @@ def discover_hdf5() -> list[str]:
 
 
 def discover_packages() -> list[str]:
-    return [str(path.parent) for path in sorted((ROOT / "runs").glob("*/model_package/model.yaml"))]
+    packages = {
+        str(model_yaml.parent.resolve())
+        for model_yaml in (ROOT / "runs").rglob("model.yaml")
+    }
+
+    return sorted(packages)
 
 
 def controller_snapshot() -> object | None:
@@ -72,6 +77,15 @@ def clear_run_display() -> None:
     st.session_state.last_result = None
     st.session_state.runtime_error = None
 
+def format_package_path(path_value: str | Path) -> str:
+    """Display a package path relative to the repository root."""
+    path = Path(path_value).expanduser().resolve()
+
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        # 路径不在仓库根目录下时，保留完整路径。
+        return str(path)
 
 for key, value in {
     "controller": None,
@@ -115,12 +129,43 @@ with st.sidebar:
             disabled=not availability.configuration_enabled,
         )
     else:
-        package_path = st.selectbox("Model package", packages, disabled=not availability.configuration_enabled)
+        package_path = st.selectbox(
+            "Model package",
+            packages,
+            format_func=format_package_path,
+            disabled = not availability.configuration_enabled
+        )
     try:
         selected_package_name = str(load_yaml(Path(package_path) / "model.yaml").get("name"))
     except Exception:  # noqa: BLE001
         selected_package_name = None
-    package_window_default = 10.0 if selected_package_name == "50m-linear" else 4.0
+    try:
+        package_model_config = load_yaml(
+            Path(package_path) / "model.yaml"
+        )
+
+        selected_package_name = str(
+            package_model_config.get("name")
+        )
+
+        package_window_default = float(
+            package_model_config.get(
+                "window_seconds",
+                10.0,
+            )
+        )
+
+        package_step_default = float(
+            package_model_config.get(
+                "step_sec",
+                0.5,
+            )
+        )
+
+    except Exception:
+        selected_package_name = None
+        package_window_default = 4.0
+        package_step_default = 0.5
     package_step_default = 0.5
     if selected_package_name:
         st.caption(f"Package model: {selected_package_name}")
@@ -201,23 +246,66 @@ with st.sidebar.container(horizontal=True):
 
 if start_clicked:
     try:
-        if session is None or expected_windows is None or trial_count is None or samples_per_trial is None:
-            raise ValueError("Choose a readable data file and session before starting")
-        if window_sec <= 0:
-            raise ValueError("Window seconds must be greater than zero")
-        if step_sec <= 0 or step_sec > window_sec:
-            raise ValueError("Step seconds must be greater than zero and no greater than Window seconds")
-        package = Path(package_path)
-        runtime_package = ModelFactory.load_runtime_package(package, EEGHDF5(data_path).metadata, device=str(device))
-        validate_runtime_request(runtime_package, window_sec=window_sec, step_sec=step_sec)
-        if runtime_package.is_test_head:
-            st.warning(runtime_package.warning_message or "仅用于链路验证，预测和置信度无准确率意义")
+        if (
+            session is None
+            or expected_windows is None
+            or trial_count is None
+            or samples_per_trial is None
+        ):
+            raise ValueError(
+                "Choose a readable data file and session before starting"
+            )
 
-        target_windows = target_window_count(expected_windows, max_windows)
+        if window_sec <= 0:
+            raise ValueError(
+                "Window seconds must be greater than zero"
+            )
+
+        if step_sec <= 0 or step_sec > window_sec:
+            raise ValueError(
+                "Step seconds must be greater than zero "
+                "and no greater than Window seconds"
+            )
+
+        package = Path(package_path)
+
+        runtime_package = ModelFactory.load_runtime_package(
+            package,
+            EEGHDF5(data_path).metadata,
+            device=str(device),
+        )
+
+        validate_runtime_request(
+            runtime_package,
+            window_sec=window_sec,
+            step_sec=step_sec,
+        )
+
+        if runtime_package.is_test_head:
+            st.warning(
+                runtime_package.warning_message
+                or (
+                    "仅用于链路验证，预测和置信度"
+                    "无准确率意义"
+                )
+            )
+
+        target_windows = target_window_count(
+            expected_windows,
+            max_windows,
+        )
+
         stats = PipelineRunStats()
         stats.set_expected_windows(target_windows)
+
         event_queue = UiEventQueue()
-        logger = JsonlWindowLogger(jsonl_path) if enable_jsonl else None
+
+        logger = (
+            JsonlWindowLogger(jsonl_path)
+            if enable_jsonl
+            else None
+        )
+
         decoder = SlidingWindowDecoder(
             runtime_package.model,
             runtime_package.preprocessor,
@@ -231,6 +319,7 @@ if start_clicked:
             run_stats=stats,
             jsonl_logger=logger,
         )
+
         acquirer_factory = lambda: AcquirerFactory.create(
             acquirer_name,
             data_path=data_path,
@@ -240,16 +329,24 @@ if start_clicked:
             window_sec=window_sec,
             step_sec=step_sec,
         )
+
         controller = PipelineController(
             decoder,
             acquirer_factory,
             max_windows=max_windows,
-            on_result_with_samples=event_queue.publish_result,
-            on_state_change=event_queue.publish_state,
+            on_result_with_samples=(
+                event_queue.publish_result
+            ),
+            on_state_change=(
+                event_queue.publish_state
+            ),
         )
+
         clear_run_display()
+
         st.session_state.controller = controller
         st.session_state.ui_event_queue = event_queue
+
         st.session_state.active_configuration = {
             "data_path": data_path,
             "session": session,
@@ -262,28 +359,93 @@ if start_clicked:
             "channel_names": channel_names,
             "input_unit": input_unit,
             "jsonl_logging": enable_jsonl,
-            "jsonl_path": jsonl_path if enable_jsonl else None,
-            "model_warning": runtime_package.warning_message,
+            "jsonl_path": (
+                jsonl_path
+                if enable_jsonl
+                else None
+            ),
+            "model_warning": (
+                runtime_package.warning_message
+            ),
         }
+
         controller.start()
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.runtime_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
 
-if stop_clicked and st.session_state.controller is not None:
-    try:
-        st.session_state.controller.stop(wait=False)
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.runtime_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
+        # 关键：重新渲染整页。
+        # 此时 Controller 已经是 RUNNING，
+        # Stop 按钮会从 disabled 变成 enabled。
+        st.rerun()
 
-if restart_clicked and st.session_state.controller is not None:
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.runtime_error = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+
+
+if (
+    stop_clicked
+    and st.session_state.controller is not None
+):
     try:
-        st.session_state.controller.stop(wait=True, timeout=5.0)
-        if st.session_state.ui_event_queue is not None:
-            st.session_state.ui_event_queue.drain()
+        controller = st.session_state.controller
+
+        # 等待工作线程真正停止。
+        controller.stop(
+            wait=True,
+            timeout=5.0,
+        )
+
+        # 处理工作线程最后提交的状态和结果事件。
+        event_queue = st.session_state.ui_event_queue
+        if event_queue is not None:
+            apply_events(
+                st.session_state,
+                event_queue.drain(),
+                history_limit=500,
+            )
+
+        # 关键：重新渲染整页。
+        # Controller 变为 STOPPED 后，
+        # Start 和配置项会重新启用。
+        st.rerun()
+
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.runtime_error = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+
+if (
+    restart_clicked
+    and st.session_state.controller is not None
+):
+    try:
+        controller = st.session_state.controller
+
+        controller.stop(
+            wait=True,
+            timeout=5.0,
+        )
+
+        event_queue = st.session_state.ui_event_queue
+        if event_queue is not None:
+            event_queue.drain()
+
         clear_run_display()
-        st.session_state.controller.restart(timeout=5.0)
+
+        controller.restart(
+            timeout=5.0,
+        )
+
+        # Restart 后重新显示 RUNNING 状态和按钮。
+        st.rerun()
+
     except Exception as exc:  # noqa: BLE001
-        st.session_state.runtime_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
+        st.session_state.runtime_error = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
 
 
 @st.fragment(run_every=0.2)

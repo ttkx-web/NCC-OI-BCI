@@ -15,7 +15,16 @@ from bci_dayloop.data.collect_csv import CollectCSV as CollectCSVAdapter
 from bci_dayloop.data.event_alignment import align_events_with_csv
 from bci_dayloop.data.neuracle_bdf import NeuracleBDFReader
 from bci_dayloop.data.records import RawEEGRecord, UnitEvidence
-from bci_dayloop.data.trial_extraction import EEGTrial, extract_imagery_trials
+from bci_dayloop.data.trial_extraction import (
+    ACCURACY_SCOPE,
+    ELIGIBLE_FOR_ACCURACY,
+    ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
+    VISUAL_CUE_DURATION_SECONDS,
+    VISUAL_CUE_PRESENT,
+    WINDOW_SEMANTICS,
+    EEGTrial,
+    extract_imagery_trials,
+)
 
 
 _IMAGERY_LABELS = ("left_hand", "right_hand", "feet", "tongue")
@@ -59,6 +68,12 @@ def build_trial_report(
     label_counter = Counter(trial.label for trial in trials)
     block_counter = Counter(str(trial.block_id) for trial in trials)
     return {
+        "window_semantics": WINDOW_SEMANTICS,
+        "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+        "accuracy_scope": ACCURACY_SCOPE,
+        "visual_cue_present": VISUAL_CUE_PRESENT,
+        "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+        "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
         "bdf_event_count": len(record.events),
         "csv_row_count": csv_row_count,
         "aligned_event_count": len(record.events),
@@ -96,6 +111,12 @@ def _failure_report(
     error: Exception,
 ) -> dict[str, object]:
     return {
+        "window_semantics": WINDOW_SEMANTICS,
+        "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+        "accuracy_scope": ACCURACY_SCOPE,
+        "visual_cue_present": VISUAL_CUE_PRESENT,
+        "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+        "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
         "bdf_event_count": len(record.events) if record is not None else None,
         "csv_row_count": csv_row_count,
         "aligned_event_count": 0,

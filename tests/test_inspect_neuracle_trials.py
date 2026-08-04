@@ -120,6 +120,12 @@ def test_cli_writes_trial_qc_report_and_creates_output_directory(
 
     report = json.loads(output_path.read_text(encoding="utf-8"))
     assert result == 0
+    assert report["window_semantics"] == "cue_plus_imagery_4s"
+    assert report["eligible_for_accuracy"] is True
+    assert report["accuracy_scope"] == "cue_plus_imagery_task_classification"
+    assert report["visual_cue_present"] is True
+    assert report["visual_cue_duration_seconds"] == 0.8
+    assert report["eligible_for_pure_imagery_accuracy"] is False
     assert report["bdf_event_count"] == 8
     assert report["csv_row_count"] == 8
     assert report["aligned_event_count"] == 8

@@ -11,6 +11,14 @@ import mne
 import numpy as np
 
 from bci_dayloop.data.records import EEGEvent, RawEEGRecord, UnitEvidence
+from bci_dayloop.data.trial_extraction import (
+    ACCURACY_SCOPE,
+    ELIGIBLE_FOR_ACCURACY,
+    ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
+    VISUAL_CUE_DURATION_SECONDS,
+    VISUAL_CUE_PRESENT,
+    WINDOW_SEMANTICS,
+)
 
 
 _EXCLUDED_EEG_NAMES = frozenset({"ecg", "heor", "heol", "veou", "veol"})
@@ -180,8 +188,12 @@ class NeuracleBDFReader:
             "reader_name": self.reader_name,
             "reader_version": "1",
             "unit_evidence_level": self.unit_evidence.evidence_level,
-            "window_semantics": "cue_plus_imagery_4s",
-            "eligible_for_accuracy": False,
+            "window_semantics": WINDOW_SEMANTICS,
+            "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+            "accuracy_scope": ACCURACY_SCOPE,
+            "visual_cue_present": VISUAL_CUE_PRESENT,
+            "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+            "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
             "start_sample": None,
             "end_sample": None,
             "all_channel_names": channel_names,

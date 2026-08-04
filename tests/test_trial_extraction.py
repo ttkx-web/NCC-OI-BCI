@@ -107,7 +107,11 @@ def test_fixed_duration_window_uses_1000_real_samples_and_preserves_rest_offset(
     assert trial.endpoint_qc_passed is True
     assert trial.extraction_policy == "fixed_duration_from_class_marker"
     assert trial.window_semantics == "cue_plus_imagery_4s"
-    assert trial.eligible_for_accuracy is False
+    assert trial.eligible_for_accuracy is True
+    assert trial.accuracy_scope == "cue_plus_imagery_task_classification"
+    assert trial.visual_cue_present is True
+    assert trial.visual_cue_duration_seconds == 0.8
+    assert trial.eligible_for_pure_imagery_accuracy is False
 
 
 @pytest.mark.parametrize("observed_rest", [987, 1013])

@@ -9,11 +9,17 @@ from typing import Iterable
 import h5py
 import numpy as np
 
-from bci_dayloop.data.trial_extraction import EEGTrial
+from bci_dayloop.data.trial_extraction import (
+    ACCURACY_SCOPE,
+    ELIGIBLE_FOR_ACCURACY,
+    ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
+    VISUAL_CUE_DURATION_SECONDS,
+    VISUAL_CUE_PRESENT,
+    WINDOW_SEMANTICS,
+    EEGTrial,
+)
 
 
-WINDOW_SEMANTICS = "cue_plus_imagery_4s"
-ELIGIBLE_FOR_ACCURACY = False
 _LABELS = ("left_hand", "right_hand", "feet", "tongue")
 
 
@@ -65,6 +71,18 @@ def export_stage2a_trials_hdf5(
         handle.create_dataset("endpoint_qc_passed", data=np.asarray([trial.endpoint_qc_passed for trial in trials], dtype=bool))
         handle.create_dataset("window_semantics", data=_strings(trial.window_semantics for trial in trials))
         handle.create_dataset("eligible_for_accuracy", data=np.asarray([trial.eligible_for_accuracy for trial in trials], dtype=bool))
+        handle.create_dataset("accuracy_scope", data=_strings(trial.accuracy_scope for trial in trials))
+        handle.create_dataset("visual_cue_present", data=np.asarray([trial.visual_cue_present for trial in trials], dtype=bool))
+        handle.create_dataset(
+            "visual_cue_duration_seconds",
+            data=np.asarray([trial.visual_cue_duration_seconds for trial in trials], dtype=np.float64),
+        )
+        handle.create_dataset(
+            "eligible_for_pure_imagery_accuracy",
+            data=np.asarray(
+                [trial.eligible_for_pure_imagery_accuracy for trial in trials], dtype=bool
+            ),
+        )
         handle.create_dataset("extraction_policy", data=_strings(trial.extraction_policy for trial in trials))
         handle.create_dataset("start_sample", data=np.asarray([trial.start_sample for trial in trials], dtype=np.int64))
         handle.create_dataset("end_sample", data=np.asarray([trial.end_sample for trial in trials], dtype=np.int64))
@@ -86,7 +104,11 @@ def export_stage2a_trials_hdf5(
         handle.attrs["subject_id"] = subject_id or ""
         handle.attrs["session_id"] = session_id or ""
         handle.attrs["window_semantics"] = WINDOW_SEMANTICS
-        handle.attrs["eligible_for_accuracy"] = False
+        handle.attrs["eligible_for_accuracy"] = ELIGIBLE_FOR_ACCURACY
+        handle.attrs["accuracy_scope"] = ACCURACY_SCOPE
+        handle.attrs["visual_cue_present"] = VISUAL_CUE_PRESENT
+        handle.attrs["visual_cue_duration_seconds"] = VISUAL_CUE_DURATION_SECONDS
+        handle.attrs["eligible_for_pure_imagery_accuracy"] = ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY
     return {
         "filename": target.name,
         "trial_count": len(trials),
@@ -96,6 +118,10 @@ def export_stage2a_trials_hdf5(
         "unit": "uV",
         "window_semantics": WINDOW_SEMANTICS,
         "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+        "accuracy_scope": ACCURACY_SCOPE,
+        "visual_cue_present": VISUAL_CUE_PRESENT,
+        "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+        "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
         "bdf_sha256": trials[0].source_metadata["bdf_sha256"],
         "csv_sha256": trials[0].source_metadata["csv_sha256"],
     }
@@ -118,6 +144,14 @@ def read_stage2a_trials_hdf5(path: str | Path) -> dict[str, object]:
             "endpoint_qc_passed": handle["endpoint_qc_passed"][:],
             "window_semantics_per_trial": handle["window_semantics"].asstr()[:],
             "eligible_for_accuracy_per_trial": handle["eligible_for_accuracy"][:],
+            "accuracy_scope_per_trial": handle["accuracy_scope"].asstr()[:],
+            "visual_cue_present_per_trial": handle["visual_cue_present"][:],
+            "visual_cue_duration_seconds_per_trial": handle[
+                "visual_cue_duration_seconds"
+            ][:],
+            "eligible_for_pure_imagery_accuracy_per_trial": handle[
+                "eligible_for_pure_imagery_accuracy"
+            ][:],
             "extraction_policy": handle["extraction_policy"].asstr()[:],
             "start_sample": handle["start_sample"][:],
             "end_sample": handle["end_sample"][:],
@@ -129,6 +163,12 @@ def read_stage2a_trials_hdf5(path: str | Path) -> dict[str, object]:
             "unit": str(handle.attrs["unit"]),
             "window_semantics": str(handle.attrs["window_semantics"]),
             "eligible_for_accuracy": bool(handle.attrs["eligible_for_accuracy"]),
+            "accuracy_scope": str(handle.attrs["accuracy_scope"]),
+            "visual_cue_present": bool(handle.attrs["visual_cue_present"]),
+            "visual_cue_duration_seconds": float(handle.attrs["visual_cue_duration_seconds"]),
+            "eligible_for_pure_imagery_accuracy": bool(
+                handle.attrs["eligible_for_pure_imagery_accuracy"]
+            ),
         }
         for field in (
             "bdf_sha256",

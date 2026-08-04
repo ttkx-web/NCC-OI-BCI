@@ -101,6 +101,12 @@ def test_load_uses_lazy_read_and_returns_only_usable_eeg(
     assert record.metadata["reader_name"] == "neuracle-bdf"
     assert record.metadata["reader_version"] == "1"
     assert record.metadata["unit_evidence_level"] == "vendor_confirmed"
+    assert record.metadata["window_semantics"] == "cue_plus_imagery_4s"
+    assert record.metadata["eligible_for_accuracy"] is True
+    assert record.metadata["accuracy_scope"] == "cue_plus_imagery_task_classification"
+    assert record.metadata["visual_cue_present"] is True
+    assert record.metadata["visual_cue_duration_seconds"] == 0.8
+    assert record.metadata["eligible_for_pure_imagery_accuracy"] is False
     assert len(record.source_sha256 or "") == 64
 
 

@@ -21,14 +21,20 @@ from bci_dayloop.data.collect_csv import CollectCSV as CollectCSVAdapter
 from bci_dayloop.data.event_alignment import align_events_with_csv
 from bci_dayloop.data.neuracle_bdf import NeuracleBDFReader
 from bci_dayloop.data.records import RawEEGRecord, UnitEvidence
-from bci_dayloop.data.trial_extraction import EEGTrial, extract_imagery_trials
+from bci_dayloop.data.trial_extraction import (
+    ACCURACY_SCOPE,
+    ELIGIBLE_FOR_ACCURACY,
+    ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
+    EXTRACTION_POLICY,
+    VISUAL_CUE_DURATION_SECONDS,
+    VISUAL_CUE_PRESENT,
+    WINDOW_SEMANTICS,
+    EEGTrial,
+    extract_imagery_trials,
+)
 
 
 _IMAGERY_LABELS = ("left_hand", "right_hand", "feet", "tongue")
-_WINDOW_SEMANTICS = "cue_plus_imagery_4s"
-_EXTRACTION_POLICY = "fixed_duration_from_class_marker"
-
-
 def _reader() -> NeuracleBDFReader:
     return NeuracleBDFReader(
         UnitEvidence(
@@ -53,7 +59,13 @@ def _summary_metrics(
         math.ceil(endpoint_tolerance_seconds * record.sampling_rate) if record is not None else None
     )
     return {
-        "extraction_policy": _EXTRACTION_POLICY,
+        "extraction_policy": EXTRACTION_POLICY,
+        "window_semantics": WINDOW_SEMANTICS,
+        "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+        "accuracy_scope": ACCURACY_SCOPE,
+        "visual_cue_present": VISUAL_CUE_PRESENT,
+        "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+        "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
         "endpoint_tolerance_seconds": endpoint_tolerance_seconds,
         "endpoint_tolerance_samples": endpoint_samples,
         "canonical_trial_samples": round(expected_duration_seconds * record.sampling_rate) if record is not None else None,
@@ -171,8 +183,12 @@ def _session_report(
                 "rest_offset_samples": trial.rest_offset_samples,
                 "rest_offset_seconds": trial.rest_offset_seconds,
                 "endpoint_qc_passed": trial.endpoint_qc_passed,
-                "window_semantics": _WINDOW_SEMANTICS,
-                "eligible_for_accuracy": False,
+                "window_semantics": trial.window_semantics,
+                "eligible_for_accuracy": trial.eligible_for_accuracy,
+                "accuracy_scope": trial.accuracy_scope,
+                "visual_cue_present": trial.visual_cue_present,
+                "visual_cue_duration_seconds": trial.visual_cue_duration_seconds,
+                "eligible_for_pure_imagery_accuracy": trial.eligible_for_pure_imagery_accuracy,
                 "bdf_sha256": trial.source_metadata.get("bdf_sha256"),
                 "csv_sha256": trial.source_metadata.get("csv_sha256"),
             }
@@ -342,7 +358,7 @@ def write_qc_outputs(output_path: Path, report: dict[str, object]) -> None:
     _write_csv(
         output_path.parent / "trial_inventory.csv",
         trial_inventory,
-        ["relative_directory", "label", "block_id", "trial_id", "start_sample", "end_sample", "duration_seconds", "observed_event_n_samples", "canonical_n_samples", "rest_offset_samples", "rest_offset_seconds", "endpoint_qc_passed", "window_semantics", "eligible_for_accuracy", "bdf_sha256", "csv_sha256"],
+        ["relative_directory", "label", "block_id", "trial_id", "start_sample", "end_sample", "duration_seconds", "observed_event_n_samples", "canonical_n_samples", "rest_offset_samples", "rest_offset_seconds", "endpoint_qc_passed", "window_semantics", "eligible_for_accuracy", "accuracy_scope", "visual_cue_present", "visual_cue_duration_seconds", "eligible_for_pure_imagery_accuracy", "bdf_sha256", "csv_sha256"],
     )
     _write_csv(
         output_path.parent / "channel_metrics.csv",
@@ -355,9 +371,13 @@ def write_qc_outputs(output_path: Path, report: dict[str, object]) -> None:
         ["relative_directory", "index", "sample_index", "bdf_code", "csv_event_code", "event_type", "block_id", "trial_id"],
     )
     manifest = {
-        "window_semantics": _WINDOW_SEMANTICS,
-        "eligible_for_accuracy": False,
-        "extraction_policy": _EXTRACTION_POLICY,
+        "window_semantics": WINDOW_SEMANTICS,
+        "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+        "accuracy_scope": ACCURACY_SCOPE,
+        "visual_cue_present": VISUAL_CUE_PRESENT,
+        "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+        "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
+        "extraction_policy": EXTRACTION_POLICY,
         "sessions": [
             {
                 key: session.get(key)

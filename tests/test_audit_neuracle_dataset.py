@@ -129,6 +129,12 @@ def test_audit_multiple_sessions_uses_stable_relative_order_and_metadata_only_re
     assert report["subjects"] == ["sub-001"]
     assert report["sessions"] == ["ses-01"]
     assert report["all_sessions_passed"] is True
+    assert report["session_reports"][0]["window_semantics"] == "cue_plus_imagery_4s"
+    assert report["session_reports"][0]["eligible_for_accuracy"] is True
+    assert report["session_reports"][0]["accuracy_scope"] == "cue_plus_imagery_task_classification"
+    assert report["session_reports"][0]["visual_cue_present"] is True
+    assert report["session_reports"][0]["visual_cue_duration_seconds"] == 0.8
+    assert report["session_reports"][0]["eligible_for_pure_imagery_accuracy"] is False
     assert "eeg" not in report
     assert all("/" not in item["relative_directory"] for item in report["session_reports"])
     assert (output_path.parent / "session_qc.json").is_file()
@@ -137,6 +143,9 @@ def test_audit_multiple_sessions_uses_stable_relative_order_and_metadata_only_re
     assert (output_path.parent / "channel_metrics.csv").is_file()
     assert (output_path.parent / "event_alignment.csv").is_file()
     assert (output_path.parent / "export_manifest.json").is_file()
+    manifest = json.loads((output_path.parent / "export_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["eligible_for_accuracy"] is True
+    assert manifest["accuracy_scope"] == "cue_plus_imagery_task_classification"
 
 
 def test_audit_cli_runs_directly_without_pythonpath() -> None:

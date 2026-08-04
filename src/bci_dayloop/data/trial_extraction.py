@@ -15,7 +15,11 @@ from bci_dayloop.data.records import EEGEvent, RawEEGRecord
 _IMAGERY_LABELS = frozenset({"left_hand", "right_hand", "feet", "tongue"})
 EXTRACTION_POLICY = "fixed_duration_from_class_marker"
 WINDOW_SEMANTICS = "cue_plus_imagery_4s"
-ELIGIBLE_FOR_ACCURACY = False
+ELIGIBLE_FOR_ACCURACY = True
+ACCURACY_SCOPE = "cue_plus_imagery_task_classification"
+VISUAL_CUE_PRESENT = True
+VISUAL_CUE_DURATION_SECONDS = 0.8
+ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY = False
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,10 @@ class EEGTrial:
     extraction_policy: str = EXTRACTION_POLICY
     window_semantics: str = WINDOW_SEMANTICS
     eligible_for_accuracy: bool = ELIGIBLE_FOR_ACCURACY
+    accuracy_scope: str = ACCURACY_SCOPE
+    visual_cue_present: bool = VISUAL_CUE_PRESENT
+    visual_cue_duration_seconds: float = VISUAL_CUE_DURATION_SECONDS
+    eligible_for_pure_imagery_accuracy: bool = ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY
     source_metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -64,7 +72,14 @@ class EEGTrial:
             raise ValueError("rest_offset_samples does not match canonical end")
         if self.extraction_policy != EXTRACTION_POLICY:
             raise ValueError("unexpected extraction_policy")
-        if self.window_semantics != WINDOW_SEMANTICS or self.eligible_for_accuracy is not False:
+        if (
+            self.window_semantics != WINDOW_SEMANTICS
+            or self.eligible_for_accuracy is not True
+            or self.accuracy_scope != ACCURACY_SCOPE
+            or self.visual_cue_present is not True
+            or self.visual_cue_duration_seconds != VISUAL_CUE_DURATION_SECONDS
+            or self.eligible_for_pure_imagery_accuracy is not False
+        ):
             raise ValueError("legacy 4 s trial semantics must remain cue_plus_imagery_4s")
         if self.duration_seconds <= 0:
             raise ValueError("trial duration_seconds must be positive")
@@ -179,8 +194,12 @@ def extract_imagery_trials(
                     "reader_name": record.metadata.get("reader_name"),
                     "reader_version": record.metadata.get("reader_version"),
                     "unit_evidence_level": record.unit_evidence.evidence_level,
-                    "window_semantics": record.metadata.get("window_semantics"),
-                    "eligible_for_accuracy": record.metadata.get("eligible_for_accuracy"),
+                    "window_semantics": WINDOW_SEMANTICS,
+                    "eligible_for_accuracy": ELIGIBLE_FOR_ACCURACY,
+                    "accuracy_scope": ACCURACY_SCOPE,
+                    "visual_cue_present": VISUAL_CUE_PRESENT,
+                    "visual_cue_duration_seconds": VISUAL_CUE_DURATION_SECONDS,
+                    "eligible_for_pure_imagery_accuracy": ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
                     "start_sample": start_sample,
                     "end_sample": end_sample,
                 },

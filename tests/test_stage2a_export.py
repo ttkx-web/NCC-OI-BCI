@@ -5,7 +5,11 @@ import pytest
 
 from bci_dayloop.data.records import EEGEvent
 from bci_dayloop.data.stage2a_export import (
+    ACCURACY_SCOPE,
     ELIGIBLE_FOR_ACCURACY,
+    ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY,
+    VISUAL_CUE_DURATION_SECONDS,
+    VISUAL_CUE_PRESENT,
     WINDOW_SEMANTICS,
     export_stage2a_trials_hdf5,
     read_stage2a_trials_hdf5,
@@ -61,9 +65,17 @@ def test_stage2a_export_round_trips_every_required_field(tmp_path) -> None:
     restored = read_stage2a_trials_hdf5(path)
 
     assert manifest["window_semantics"] == "cue_plus_imagery_4s"
-    assert manifest["eligible_for_accuracy"] is False
+    assert manifest["eligible_for_accuracy"] is True
+    assert manifest["accuracy_scope"] == "cue_plus_imagery_task_classification"
+    assert manifest["visual_cue_present"] is True
+    assert manifest["visual_cue_duration_seconds"] == 0.8
+    assert manifest["eligible_for_pure_imagery_accuracy"] is False
     assert WINDOW_SEMANTICS == "cue_plus_imagery_4s"
-    assert ELIGIBLE_FOR_ACCURACY is False
+    assert ELIGIBLE_FOR_ACCURACY is True
+    assert ACCURACY_SCOPE == "cue_plus_imagery_task_classification"
+    assert VISUAL_CUE_PRESENT is True
+    assert VISUAL_CUE_DURATION_SECONDS == 0.8
+    assert ELIGIBLE_FOR_PURE_IMAGERY_ACCURACY is False
     assert restored["eeg"].shape == (1, 59, 1000)
     assert restored["eeg"].dtype == np.float32
     assert restored["sampling_rate"] == 250.0
@@ -71,7 +83,11 @@ def test_stage2a_export_round_trips_every_required_field(tmp_path) -> None:
     assert restored["subject_id"] == "sub-anon"
     assert restored["session_id"] == "ses-01"
     assert restored["window_semantics"] == "cue_plus_imagery_4s"
-    assert restored["eligible_for_accuracy"] is False
+    assert restored["eligible_for_accuracy"] is True
+    assert restored["accuracy_scope"] == "cue_plus_imagery_task_classification"
+    assert restored["visual_cue_present"] is True
+    assert restored["visual_cue_duration_seconds"] == 0.8
+    assert restored["eligible_for_pure_imagery_accuracy"] is False
     assert restored["canonical_start_samples"].tolist() == [0]
     assert restored["canonical_end_samples"].tolist() == [1000]
     assert restored["observed_rest_samples"].tolist() == [1000]
@@ -79,7 +95,11 @@ def test_stage2a_export_round_trips_every_required_field(tmp_path) -> None:
     assert restored["rest_offset_samples"].tolist() == [0]
     assert restored["endpoint_qc_passed"].tolist() == [True]
     assert restored["window_semantics_per_trial"].tolist() == ["cue_plus_imagery_4s"]
-    assert restored["eligible_for_accuracy_per_trial"].tolist() == [False]
+    assert restored["eligible_for_accuracy_per_trial"].tolist() == [True]
+    assert restored["accuracy_scope_per_trial"].tolist() == ["cue_plus_imagery_task_classification"]
+    assert restored["visual_cue_present_per_trial"].tolist() == [True]
+    assert restored["visual_cue_duration_seconds_per_trial"].tolist() == [0.8]
+    assert restored["eligible_for_pure_imagery_accuracy_per_trial"].tolist() == [False]
     assert restored["extraction_policy"].tolist() == ["fixed_duration_from_class_marker"]
     assert restored["labels"].tolist() == ["left_hand"]
     assert restored["block_ids"].tolist() == ["1"]

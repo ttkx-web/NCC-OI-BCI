@@ -6,6 +6,11 @@ from typing import Any, Protocol, TypeAlias
 
 import numpy as np
 
+import torch
+
+from bci_dayloop.runtime.types import ModelOutput
+
+
 ModelInput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
 
@@ -67,3 +72,27 @@ class BaseModelAdapter(ABC):
     def update(self, X: np.ndarray, y: np.ndarray, **kwargs: Any) -> dict[str, Any]:
         """Update the trainable portion from newly labelled windows."""
 
+
+
+class ModelBackend(ABC):
+    @abstractmethod
+    def predict_tensor(
+        self,
+        model_input: torch.Tensor,
+        return_features: bool = False,
+    ) -> ModelOutput:
+        """只执行模型前向，不处理原始 EEG。"""
+
+    @abstractmethod
+    def encode_tensor(
+        self,
+        model_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """返回 backbone 特征。"""
+
+    @abstractmethod
+    def get_trainable_parameters(
+        self,
+        scope: str,
+    ) -> list[torch.nn.Parameter]:
+        """供个体化、Rest-Tune 和 NeuroOnline 使用。"""

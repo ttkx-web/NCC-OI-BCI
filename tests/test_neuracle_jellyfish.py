@@ -19,6 +19,7 @@ class FakeBackend:
         self.wait_error = wait_error
         self.connect_error = connect_error
         self.closed = False
+        self.stop_calls = 0
         self.started = False
         self.connect_calls = 0
 
@@ -39,6 +40,7 @@ class FakeBackend:
         return self.packets.popleft() if self.packets else None
 
     def stop(self) -> None:
+        self.stop_calls += 1
         self.closed = True
 
     def metadata(self) -> dict[str, object] | None:
@@ -268,6 +270,18 @@ def test_finite_reconnect_disconnect_and_reconnect_clear_old_packets() -> None:
     assert after_reconnect is not None
     assert after_reconnect.sequence_id == 1
     assert source.health()["reconnect_count"] == 1
+
+
+def test_disconnect_is_idempotent_and_leaves_the_source_stopped() -> None:
+    source, backend = _source((_packet(1, 1000),))
+    source.connect()
+
+    source.disconnect()
+    source.disconnect()
+
+    assert backend.stop_calls == 1
+    assert source.health()["state"] == "stopped"
+    assert source.health()["connected"] is False
 
 
 def test_bulk_and_per_module_triggers_become_event_markers_and_unit_is_blocked() -> None:

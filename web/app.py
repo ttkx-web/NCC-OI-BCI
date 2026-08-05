@@ -166,10 +166,7 @@ with st.sidebar:
             format_func=format_package_path,
             disabled = not availability.configuration_enabled
         )
-    try:
-        selected_package_name = str(load_yaml(Path(package_path) / "model.yaml").get("name"))
-    except Exception:  # noqa: BLE001
-        selected_package_name = None
+
     try:
         package_model_config = load_yaml(
             Path(package_path) / "model.yaml"
@@ -197,7 +194,7 @@ with st.sidebar:
         selected_package_name = None
         package_window_default = 4.0
         package_step_default = 0.5
-    package_step_default = 0.5
+
     if selected_package_name:
         st.caption(f"Package model: {selected_package_name}")
     acquirer_name = st.selectbox(

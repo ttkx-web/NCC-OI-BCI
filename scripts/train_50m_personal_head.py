@@ -126,10 +126,12 @@ from bci_dayloop.personalization import (
 )
 
 from bci_dayloop.utils.paths import (
-    population_head_path,
     personal_head_path,
+    population_head_path,
+    personal_package_dir,
+    personal_registry_path,
+    timestamp_id,
 )
-
 
 def safe_load_mapping(path: Path) -> Mapping[str, Any]:
     try:
@@ -579,29 +581,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Controls derived-window ordering after source-trial splitting.",
-    )
-    parser.add_argument(
-        "--runtime-package-template",
-        type=str,
-        default=None,
-        help=(
-            "Runtime Model Package template matching the personal-head "
-            "input contract. Packaging is skipped when this is not provided."
-        ),
-    )
-
-    parser.add_argument(
-        "--personal-package-root",
-        type=str,
-        default="runs/stage1/users",
-        help="Root directory used to save personal model packages.",
-    )
-
-    parser.add_argument(
-        "--registry-path",
-        type=str,
-        default="runs/stage1/users/model_registry.json",
-        help="JSON registry used to manage personal model packages.",
     )
 
     parser.add_argument(
@@ -1507,197 +1486,6 @@ def main() -> None:
     registry_entry = None
     active_runtime_path = None
 
-    if args.runtime_package_template is not None:
-        runtime_package_template = resolve_repo_path(
-            args.runtime_package_template
-        )
-        personal_package_root = resolve_repo_path(
-            args.personal_package_root
-        )
-        registry_path = resolve_repo_path(
-            args.registry_path
-        )
-
-        package_output = (
-                personal_package_root
-                / target_tag
-                / args.package_task
-                / (
-                    f"trials_{args.trials_per_class:02d}"
-                    f"_seed_{args.personalization_seed}"
-                )
-        )
-
-        package_metrics = {
-            "personal_validation": {
-                "population": population_validation.to_dict(),
-                "personal": selected_validation.to_dict(),
-                "decision": personalization_decision.to_dict(),
-            },
-            "final_test": {
-                "population": population_final.to_dict(),
-                "personal": personal_final.to_dict(),
-                "gain": {
-                    "accuracy": float(accuracy_gain),
-                    "balanced_accuracy": float(bacc_gain),
-                    "macro_f1": float(macro_f1_gain),
-                },
-            },
-        }
-
-        package_training = {
-            "target_subject": target_subject,
-            "user_id": target_tag,
-            "task": args.package_task,
-            "adaptation_type": "head_only",
-            "personalization_session": args.personalization_session,
-            "final_test_session": args.final_test_session,
-            "trials_per_class": int(args.trials_per_class),
-            "validation_trials_per_class": int(
-                args.validation_trials_per_class
-            ),
-            "validation_seed": int(args.validation_seed),
-            "personalization_seed": int(
-                args.personalization_seed
-            ),
-            "training_seed": int(args.seed),
-            "window_seed": int(args.window_seed),
-            "head_initialization": args.head_init,
-            "optimizer": args.optimizer,
-            "head_lr": float(args.head_lr),
-            "momentum": float(args.momentum),
-            "weight_decay": float(args.weight_decay),
-            "scheduler": args.scheduler,
-            "best_epoch": int(best_epoch),
-            "training_seconds": float(
-                personal_training_seconds
-            ),
-            "base_population_head": str(
-                population_head_checkpoint
-            ),
-            "base_population_head_sha256": (
-                population_head_sha256
-            ),
-        }
-
-        input_contract = {
-            "window_seconds": float(
-                config.window_seconds
-            ),
-            "target_sample_rate": float(
-                config.target_sample_rate
-            ),
-            "target_num_points": int(
-                config.target_num_points
-            ),
-            "patch_seconds": float(
-                config.patch_seconds
-            ),
-            "patch_stride_seconds": float(
-                config.patch_stride_seconds
-            ),
-            "num_time_patches": int(
-                config.num_time_patches
-            ),
-            "model_n_time_patches": int(
-                config.model_n_time_patches
-            ),
-            "num_tokens": int(config.num_tokens),
-            "aggregation": str(config.aggregation),
-            "classifier_input_dim": int(
-                config.classifier_input_dim
-            ),
-            "output_layer_idx": int(
-                config.output_layer_idx
-            ),
-            "window_construction": (
-                args.window_construction
-            ),
-            "preprocessing_hash": (
-                preprocessing_hash
-            ),
-            "backbone_sha256": backbone_sha256,
-        }
-
-        personal_package = create_personal_model_package(
-            output_dir=package_output,
-            user_id=target_tag,
-            task=args.package_task,
-
-            # 当前只修改分类头。
-            adaptation_type="head_only",
-
-            classifier_checkpoint=saved_path,
-            base_backbone_checkpoint=backbone_path,
-
-            # 必须是和该个人头配置一致的 4 秒 Runtime Package。
-            runtime_package_dir=runtime_package_template,
-
-            class_names=class_names,
-            input_contract=input_contract,
-            metrics=package_metrics,
-            training_metadata=package_training,
-            git_commit=git_commit,
-            notes=(
-                "Stage-1 supervised subject-specific task-head adaptation.",
-                "Backbone is shared and frozen; only the classifier head is personal.",
-                (
-                    "Activation decision uses personal validation only; "
-                    "final test is not used for model selection."
-                ),
-            ),
-            overwrite=args.overwrite_personal_package,
-        )
-
-        print()
-        print("Personal Model Package created:")
-        print("  path:", personal_package.path)
-        print("  runtime path:", personal_package.runtime_path)
-        print(
-            "  package id:",
-            personal_package.manifest.package_id,
-        )
-
-        registry = PersonalModelRegistry(
-            registry_path
-        )
-
-        registry_entry = registry.register(
-            personal_package.path,
-
-            # 接受时设为 active；拒绝时只作为 candidate 保存。
-            status="candidate",
-            set_active=personalization_decision.accepted,
-
-            # 每次运行生成新的 package_id，通常不需要 replace。
-            replace=False,
-            validate=True,
-        )
-
-        print()
-        print("Personal package registered:")
-        print("  registry:", registry_path)
-        print("  package id:", registry_entry.package_id)
-        print("  status:", registry_entry.status)
-        print(
-            "  personalization accepted:",
-            personalization_decision.accepted,
-        )
-
-        if personalization_decision.accepted:
-            active_runtime_path = (
-                registry.resolve_active_runtime(
-                    user_id=target_tag,
-                    task=args.package_task,
-                )
-            )
-
-            print("  active runtime:", active_runtime_path)
-        else:
-            print(
-                "  model remains a candidate; "
-                "the previous active model is unchanged."
-            )
 
     saved_path = save_classifier_checkpoint(
         classifier=classifier,
@@ -1764,13 +1552,14 @@ def main() -> None:
             "personal_training_seconds": float(
                 personal_training_seconds
             ),
-            "window_construction": (
-                "same_label_trial_concatenation_within_split"
-            ),
+            "window_construction": args.window_construction,
             "warning": (
-                "Temporary Stage-1 baseline: 10-second samples are built "
-                "from 4-second source trials, but never across train/val/test "
-                "splits, sessions, subjects, or labels."
+                None
+                if args.window_construction == "direct_trial"
+                else (
+                    "Samples were constructed by same-label trial "
+                    "concatenation within each split."
+                )
             ),
             "git_commit": git_commit,
         },
@@ -1881,22 +1670,22 @@ def main() -> None:
             f"Missing files: {missing_runtime_files}"
         )
 
-    personal_package_root = resolve_repo_path(
-        args.personal_package_root
+
+    registry_path = personal_registry_path(
+        stage="stage1",
     )
 
-    registry_path = resolve_repo_path(
-        args.registry_path
-    )
+    version = timestamp_id()
 
-    package_output = (
-            personal_package_root
-            / target_tag
-            / args.package_task
-            / (
-                f"trials_{args.trials_per_class:02d}"
-                f"_seed_{args.personalization_seed}"
-            )
+    package_output = personal_package_dir(
+        stage="stage1",
+        dataset="bnci2014_001",
+        subject_id=target_subject,
+        window_seconds=args.window_sec,
+        aggregation=args.aggregation,
+        trials_per_class=args.trials_per_class,
+        seed=args.personalization_seed,
+        version=version,
     )
 
     package_metrics = {
@@ -2372,7 +2161,7 @@ def main() -> None:
                     registry_entry is not None
             ),
             "registry_path": (
-                str(resolve_repo_path(args.registry_path))
+                str(registry_path)
                 if registry_entry is not None
                 else None
             ),

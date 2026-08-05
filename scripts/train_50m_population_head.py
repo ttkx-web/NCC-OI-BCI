@@ -80,6 +80,7 @@ from train_50m_linear_head import (
 
 from bci_dayloop.utils.paths import (
     population_head_path,
+    population_run_dir,
 )
 
 
@@ -637,9 +638,7 @@ def build_population_split(
     combined = combine_window_bundles(
         bundles,
         seed=base_seed + 99_999,
-        construction=(
-            "same_label_trial_concatenation_per_subject_and_session"
-        ),
+        construction=window_construction,
     )
 
     return SplitBuildResult(
@@ -837,8 +836,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--run-dir",
         default=None,
         help=(
-            "Run directory. Default: "
-            "runs/stage1/subject_XX/population_<timestamp>."
+            "Optional run-directory override. "
+            "When omitted, the standard Stage-1 path is generated: "
+            "runs/stage1/<dataset>/<subject>/population/"
+            "<contract>/<timestamp>/."
         ),
     )
 
@@ -1024,16 +1025,23 @@ def main() -> None:
     )
 
     if args.run_dir is None:
-        run_dir = (
-            ROOT
-            / "runs"
-            / "stage1"
-            / target_tag
-            / f"population_{timestamp}"
-        ).resolve()
+        run_dir = population_run_dir(
+            stage="stage1",
+            dataset="bnci2014_001",
+            subject_id=target_subject,
+            window_seconds=args.window_sec,
+            aggregation=args.aggregation,
+            run_id=timestamp,
+        )
     else:
-        run_dir = resolve_repo_path(args.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = resolve_repo_path(
+            args.run_dir
+        )
+
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
 
     git_commit = current_git_commit()
     backbone_sha256 = sha256_file(checkpoint_path)

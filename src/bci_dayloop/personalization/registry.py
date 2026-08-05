@@ -208,9 +208,18 @@ class PersonalModelRegistry:
         temporary.replace(destination)
 
     def _stored_path(self, package_path: Path) -> str:
+        """Store package paths relative to the registry when possible."""
+        package_path = package_path.expanduser().resolve()
+        registry_parent = self.path.parent.resolve()
+
         try:
-            return str(package_path.relative_to(self.path.parent))
+            return os.path.relpath(
+                package_path,
+                start=registry_parent,
+            )
         except ValueError:
+            # Mainly for platforms where two paths may be on
+            # different drives. Fall back to an absolute path.
             return str(package_path)
 
     def _resolved_path(self, stored_path: str) -> Path:

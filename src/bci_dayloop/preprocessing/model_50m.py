@@ -1,7 +1,11 @@
-from base import ModelInputTransform
-from base import InputContract
-from bci_dayloop.runtime.types import CanonicalEEGWindow
-from bci_dayloop.runtime.types import PreparedModelInput
+from bci_dayloop.preprocessing.base import (
+    ModelInputTransform,
+)
+from bci_dayloop.runtime.types import (
+    CanonicalEEGWindow,
+    InputContract,
+    PreparedModelInput,
+)
 
 class Model50MInputTransform(ModelInputTransform):
     def __init__(self, config: dict) -> None:

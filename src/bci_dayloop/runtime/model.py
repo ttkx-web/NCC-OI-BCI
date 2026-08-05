@@ -44,7 +44,7 @@ class RuntimeModel:
         return_features: bool = False,
     ) -> ModelOutput:
         return self.backend.predict_tensor(
-            model_input=prepared.tensor,
+            model_input=prepared.model_input,
             return_features=return_features,
         )
 

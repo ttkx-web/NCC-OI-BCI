@@ -28,6 +28,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=ROOT / "runs" / "stage2b" / "neuracle_probe", type=Path)
     parser.add_argument("--expected-sfreq", type=float)
     parser.add_argument("--no-save-waveform", action="store_true")
+    parser.add_argument("--metadata-only", action="store_true")
     args = parser.parse_args(argv)
     if args.duration_sec <= 0:
         parser.error("--duration-sec must be positive")
@@ -41,7 +42,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     summary: dict[str, object] = {
         "connection_state": None,
+        "metadata_ready": False,
+        "module_name": None,
         "module_type": None,
+        "anonymized_serial_hash": None,
         "channel_count": None,
         "channel_names": [],
         "channel_types": [],
@@ -54,6 +58,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "reconnect_count": 0,
         "unit_status": {"raw_unit": "unknown", "unit_evidence_level": "realtime_unverified", "model_safe": False},
         "waveforms_saved": False,
+        "last_error": None,
     }
     exit_code = 0
     try:
@@ -61,44 +66,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         metadata = source.metadata or {}
         summary.update(
             {
+                "metadata_ready": True,
+                "module_name": metadata.get("module_name"),
                 "module_type": metadata.get("module_type"),
+                "anonymized_serial_hash": metadata.get("serial_number_hash"),
                 "channel_count": metadata.get("forwarded_channel_count"),
                 "channel_names": list(metadata.get("channel_names", ())),
                 "channel_types": list(metadata.get("channel_types", ())),
                 "sample_rates": list(metadata.get("sample_rates", ())),
             }
         )
-        deadline = time.monotonic() + args.duration_sec
-        timestamps: list[int] = []
-        while time.monotonic() < deadline:
-            chunk = source.read_chunk()
-            if chunk is None:
-                time.sleep(0.01)
-                continue
-            summary["packet_count"] = int(summary["packet_count"]) + 1
-            summary["sample_count"] = int(summary["sample_count"]) + chunk.samples.shape[1]
-            timestamps.extend(
-                [
-                    int(chunk.metadata["raw_start_timestamp"]),
-                    int(chunk.metadata["raw_start_timestamp"]) + int(chunk.metadata["raw_timestamp_length"]),
-                ]
-            )
-            while source.read_event() is not None:
-                summary["trigger_count"] = int(summary["trigger_count"]) + 1
-        if timestamps:
-            summary["raw_timestamp_range"] = [min(timestamps), max(timestamps)]
+        if not args.metadata_only:
+            deadline = time.monotonic() + args.duration_sec
+            timestamps: list[int] = []
+            while time.monotonic() < deadline:
+                chunk = source.read_chunk()
+                if chunk is None:
+                    time.sleep(0.01)
+                    continue
+                summary["packet_count"] = int(summary["packet_count"]) + 1
+                summary["sample_count"] = int(summary["sample_count"]) + chunk.samples.shape[1]
+                timestamps.extend(
+                    [
+                        int(chunk.metadata["raw_start_timestamp"]),
+                        int(chunk.metadata["raw_start_timestamp"]) + int(chunk.metadata["raw_timestamp_length"]),
+                    ]
+                )
+                while source.read_event() is not None:
+                    summary["trigger_count"] = int(summary["trigger_count"]) + 1
+            if timestamps:
+                summary["raw_timestamp_range"] = [min(timestamps), max(timestamps)]
     except NeuracleSourceError as exc:
         exit_code = 2
         summary["error"] = str(exc)
     finally:
         health = source.health()
         summary["connection_state"] = health["state"]
+        summary["metadata_ready"] = health["metadata_ready"]
         summary["timestamp_continuity"] = {
             "gaps": health["missing_packets"],
             "duplicate": health["duplicate_packets"],
             "out_of_order": health["out_of_order_packets"],
         }
         summary["reconnect_count"] = health["reconnect_count"]
+        summary["last_error"] = health["last_error"]
+        summary["final_health"] = dict(health)
         summary["unit_status"] = {
             "raw_unit": source.config.raw_unit,
             "unit_evidence_level": health["unit_evidence_level"],

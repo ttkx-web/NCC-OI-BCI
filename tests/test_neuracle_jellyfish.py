@@ -14,11 +14,12 @@ from bci_dayloop.realtime.neuracle_jellyfish import (
 
 class FakeBackend:
     def __init__(self, metadata: dict[str, object], packets: tuple[dict[str, object], ...] = (), *, wait_error: Exception | None = None, connect_error: Exception | None = None) -> None:
-        self.metadata = metadata
+        self._metadata = metadata
         self.packets = deque(packets)
         self.wait_error = wait_error
         self.connect_error = connect_error
         self.closed = False
+        self.started = False
         self.connect_calls = 0
 
     def connect(self, _host: str, _port: int, _timeout: float) -> None:
@@ -26,16 +27,25 @@ class FakeBackend:
         if self.connect_error is not None:
             raise self.connect_error
 
-    def wait_for_metadata(self, _timeout: float) -> dict[str, object]:
+    def wait_metadata(self, _timeout: float) -> dict[str, object]:
         if self.wait_error is not None:
             raise self.wait_error
-        return self.metadata
+        return self._metadata
 
-    def read_packet(self) -> dict[str, object] | None:
+    def start(self) -> None:
+        self.started = True
+
+    def read_packet_or_update(self) -> dict[str, object] | None:
         return self.packets.popleft() if self.packets else None
 
-    def close(self) -> None:
+    def stop(self) -> None:
         self.closed = True
+
+    def metadata(self) -> dict[str, object] | None:
+        return self._metadata
+
+    def health(self) -> dict[str, object]:
+        return {"started": self.started}
 
 
 def _metadata(*, channel_count: int = 4, sampling_rate: float = 250.0) -> dict[str, object]:

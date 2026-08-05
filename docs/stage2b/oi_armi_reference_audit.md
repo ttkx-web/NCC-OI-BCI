@@ -27,6 +27,8 @@
 
 本项目的 Adapter 改为：保留完整 META 通道、以原始设备时间戳生成跨 chunk 时间轴、记录 raw timestamp 与匿名诊断、通过有限指数退避重连、并将 `raw_unit="unknown"` 固定为 `realtime_unverified` / 非 model-safe，直到可验证的实时–BDF 比例证据存在。
 
-## 许可证阻断
+## 内部复用许可与隔离
 
-`oi-mi/collect/neuracle_api.py` 的原始头部写明 `Copyright (c) 2022 Neuracle, Inc. All Rights Reserved.`；参考仓库未发现可确认的内部复用许可证。因此 NCC-OI-BCI 未复制其 TCP 或二进制协议解析代码。`src/bci_dayloop/vendor/neuracle/` 仅保留来源与边界说明；真实连接需要厂商授权的 backend 或许可确认后再实现。
+`oi-mi/collect/neuracle_api.py` 的原始头部写明 `Copyright (c) 2022 Neuracle, Inc. All Rights Reserved.`。公司内部复用许可现已确认，因此该文件原样置于 `src/bci_dayloop/vendor/neuracle/neuracle_api.py`，保留原作者与版权头。
+
+仅为严格关联增量样本与原始设备时间戳，vendor 文件新增有界 packet/update 队列和线程退出 join；每项见 `vendor/neuracle/README.md`。NCC-OI-BCI 的合同、时间轴、匿名日志与单位阻断仍位于 Adapter 层；未导入参考仓库 GUI、模型或旧实验代码。

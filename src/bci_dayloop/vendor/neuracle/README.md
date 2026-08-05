@@ -1,15 +1,31 @@
 # Neuracle JellyFish vendor boundary
 
-本目录不包含任何 Neuracle JellyFish 协议解析主体。
+Source repository: `https://github.com/ttkx-web/oi-armi`
+Source commit: `61b7b855376814c1c427871d6d3d623e8e49e9e1`
+Source path: `oi-mi/collect/neuracle_api.py`
 
-参考来源：`ttkx-web/oi-armi`，commit `61b7b855376814c1c427871d6d3d623e8e49e9e1`。
+Internal permission to reuse this source has been confirmed. The copied
+`neuracle_api.py` retains the original Neuracle copyright header and author
+information. Its protocol constants, binary parsing, and field meanings are
+preserved.
 
-审计的来源文件：
+## NCC-OI-BCI minimal changes
 
-- `oi-mi/collect/neuracle_api.py`
-- `oi-mi/acquisition/neuracle_acquirer.py`
+Only the following wrapper-support changes were made to the vendor file:
 
-`neuracle_api.py` 带有 `Copyright (c) 2022 Neuracle, Inc. All Rights Reserved.`
-版权头，参考仓库中没有可确认的内部复用许可证。因此该文件及其协议解析代码没有被复制、改写或导入本项目。
+1. Added a bounded `updateQueue`, `appendUpdatePacket()`, and
+   `getUpdatePacket()`. Each item keeps `samples`, `startTimeStamp`,
+   `timeStampLength`, packet range, and `hostReceivedAtMonotonic`. A full queue
+   raises an explicit `RuntimeError`; it never silently overwrites an
+   unconsumed packet.
+2. Enqueued updates after the original bulk and per-module assembly paths have
+   emitted data to their existing buffers. The original `RingBuffer`,
+   `DoubleBuffer`, and protocol parsing remain in place.
+3. Retained read/resolve thread references. `stop()` clears the update queue
+   and boundedly joins non-current receiver threads so an upper-layer
+   disconnect can release them.
 
-`bci_dayloop.realtime.neuracle_jellyfish` 只定义 Adapter 合同：经授权的厂商 backend 负责 TCP/二进制协议和 META/Data 包解析；本项目负责实时合同校验、连续时间轴、匿名日志、单位阻断和有限重连。
+`backend.py` is the only project wrapper that accesses `DataServerThread`. It
+exposes anonymized META and timestamp-associated packets to
+`realtime/neuracle_jellyfish.py`. No reference GUI, model, logging, or legacy
+experiment business logic was imported.

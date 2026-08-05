@@ -1,10 +1,4 @@
-"""License-safe Adapter for an authorized Neuracle JellyFish packet backend.
-
-This module deliberately does not implement the proprietary TCP framing or binary
-packet parser.  A separately authorized backend supplies decoded META and packet
-objects; the Adapter owns NCC-OI-BCI's contracts, validation, timestamps, and
-anonymous diagnostics.
-"""
+"""Adapter for the authorized Neuracle JellyFish backend."""
 
 from __future__ import annotations
 
@@ -57,6 +51,7 @@ class NeuracleJellyFishConfig:
     expected_sampling_rate: float | None = None
     expected_channel_names: tuple[str, ...] | None = None
     raw_unit: str = "unknown"
+    vendor_sample_rate: int = 1000
 
     def __post_init__(self) -> None:
         if not self.host.strip() or not (1 <= self.port <= 65535):
@@ -77,6 +72,8 @@ class NeuracleJellyFishConfig:
             raise ValueError("expected_sampling_rate must be positive and finite")
         if not self.raw_unit.strip():
             raise ValueError("raw_unit must be explicitly declared")
+        if isinstance(self.vendor_sample_rate, bool) or self.vendor_sample_rate <= 0:
+            raise ValueError("vendor_sample_rate must be a positive integer")
 
 
 @runtime_checkable
@@ -85,21 +82,26 @@ class JellyFishBackend(Protocol):
 
     def connect(self, host: str, port: int, socket_timeout_sec: float) -> None: ...
 
-    def wait_for_metadata(self, timeout_sec: float) -> Mapping[str, object]: ...
+    def wait_metadata(self, timeout_sec: float) -> Mapping[str, object]: ...
 
-    def read_packet(self) -> Mapping[str, object] | None: ...
+    def start(self) -> None: ...
 
-    def close(self) -> None: ...
+    def read_packet_or_update(self) -> Mapping[str, object] | None: ...
+
+    def stop(self) -> None: ...
+
+    def metadata(self) -> Mapping[str, object] | None: ...
+
+    def health(self) -> Mapping[str, object]: ...
 
 
 BackendFactory = Callable[[], JellyFishBackend]
 
 
-def _unavailable_backend() -> JellyFishBackend:
-    raise NeuracleProtocolUnavailableError(
-        "No authorized Neuracle JellyFish protocol backend is installed; "
-        "the proprietary parser was intentionally not copied."
-    )
+def _default_backend(config: NeuracleJellyFishConfig) -> JellyFishBackend:
+    from bci_dayloop.vendor.neuracle.backend import NeuracleJellyFishBackend
+
+    return NeuracleJellyFishBackend(vendor_sample_rate=config.vendor_sample_rate)
 
 
 class NeuracleJellyFishSource:
@@ -109,12 +111,12 @@ class NeuracleJellyFishSource:
         self,
         config: NeuracleJellyFishConfig = NeuracleJellyFishConfig(),
         *,
-        backend_factory: BackendFactory = _unavailable_backend,
+        backend_factory: BackendFactory | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
-        self._backend_factory = backend_factory
+        self._backend_factory = backend_factory or (lambda: _default_backend(config))
         self._sleep = sleep
         self._monotonic = monotonic
         self._backend: JellyFishBackend | None = None
@@ -146,7 +148,7 @@ class NeuracleJellyFishSource:
         backend, self._backend = self._backend, None
         if backend is not None:
             try:
-                backend.close()
+                backend.stop()
             except Exception as exc:  # pragma: no cover - defensive vendor boundary
                 self._last_error = f"backend close failed: {exc}"
         self._metadata = None
@@ -157,11 +159,21 @@ class NeuracleJellyFishSource:
         self._last_packet_monotonic = None
         self._state = NeuracleConnectionState.STOPPED
 
+    def start(self) -> None:
+        """Start packet consumption only after META has been accepted."""
+        if self._backend is None or self._metadata is None:
+            raise NeuracleSourceError("JellyFish source is not ready")
+        if self._state == NeuracleConnectionState.READY:
+            self._backend.start()
+            self._state = NeuracleConnectionState.STREAMING
+
     def read_chunk(self) -> EEGChunk | None:
         if self._backend is None or self._metadata is None:
             raise NeuracleSourceError("JellyFish source is not ready")
+        if self._state == NeuracleConnectionState.READY:
+            self.start()
         try:
-            packet = self._backend.read_packet()
+            packet = self._backend.read_packet_or_update()
         except Exception as exc:
             self._fail(f"packet receive failed: {exc}")
             raise NeuracleSourceError(self._last_error) from exc
@@ -224,7 +236,7 @@ class NeuracleJellyFishSource:
                 self._backend = backend
                 self._state = NeuracleConnectionState.AWAITING_METADATA
                 self._metadata = self._normalize_metadata(
-                    backend.wait_for_metadata(self.config.ready_timeout_sec)
+                    backend.wait_metadata(self.config.ready_timeout_sec)
                 )
                 self._state = NeuracleConnectionState.READY
                 return
@@ -233,7 +245,7 @@ class NeuracleJellyFishSource:
                 self._backend = None
                 if backend is not None:
                     try:
-                        backend.close()
+                        backend.stop()
                     except Exception:
                         pass
                 if attempt == self.config.reconnect_attempts:
@@ -270,6 +282,9 @@ class NeuracleJellyFishSource:
             and channel_names != self.config.expected_channel_names
         ):
             raise NeuracleSourceError("META channel_names do not exactly match expected_channel_names")
+        serial_hash = _value(raw, "anonymized_serial_hash", "serial_number_hash")
+        if serial_hash is None:
+            serial_hash = _hash_if_present(_value(raw, "serial_number", "serialNumber"))
         return {
             "module_name": str(_value(raw, "module_name", "moduleName", default="unknown")),
             "module_type": str(_value(raw, "module_type", "moduleType", default="unknown")),
@@ -280,13 +295,13 @@ class NeuracleJellyFishSource:
             "data_count_per_channel": tuple(
                 _required_sequence(raw, "data_count_per_channel", "dataCountPerChannel")
             ),
-            "max_digital": tuple(_required_sequence(raw, "max_digital", "maxDigital")),
-            "min_digital": tuple(_required_sequence(raw, "min_digital", "minDigital")),
-            "max_physical": tuple(_required_sequence(raw, "max_physical", "maxPhysical")),
-            "min_physical": tuple(_required_sequence(raw, "min_physical", "minPhysical")),
+            "max_digital": tuple(_required_sequence(raw, "max_digital", "maxDigital", "digital_max")),
+            "min_digital": tuple(_required_sequence(raw, "min_digital", "minDigital", "digital_min")),
+            "max_physical": tuple(_required_sequence(raw, "max_physical", "maxPhysical", "physical_max")),
+            "min_physical": tuple(_required_sequence(raw, "min_physical", "minPhysical", "physical_min")),
             "gain": tuple(_required_sequence(raw, "gain")),
             "forwarded_channel_count": count,
-            "serial_number_hash": _hash_if_present(_value(raw, "serial_number", "serialNumber")),
+            "serial_number_hash": serial_hash,
         }
 
     def _packet_to_chunk(self, packet: Mapping[str, object]) -> EEGChunk:
@@ -325,7 +340,11 @@ class NeuracleJellyFishSource:
         if self._last_raw_end is not None and raw_timestamps[0] < self._last_raw_end:
             self._out_of_order_packets += 1
             raise NeuraclePacketError("JellyFish device timestamps moved backwards")
-        host_received_at = self._monotonic()
+        host_received_at = float(
+            _value(packet, "host_received_at_monotonic", default=self._monotonic())
+        )
+        if not math.isfinite(host_received_at):
+            raise NeuraclePacketError("packet host_received_at_monotonic must be finite")
         self._emit_triggers(packet, host_received_at)
         sequence_id = self._next_sequence_id
         self._next_sequence_id += 1
@@ -351,8 +370,8 @@ class NeuracleJellyFishSource:
                 "raw_module_count": _value(packet, "module_count", "moduleCount", default=1),
                 "host_received_at_monotonic": host_received_at,
                 "packet_count": self._received_packets + 1,
-                "source_packet_start": packet_key,
-                "source_packet_end": packet_key,
+                "source_packet_start": _value(packet, "source_packet_start", default=packet_key),
+                "source_packet_end": _value(packet, "source_packet_end", default=packet_key),
                 "serial_number_hash": self._metadata["serial_number_hash"],
                 "unit_evidence_level": "realtime_unverified",
                 "model_safe": False,

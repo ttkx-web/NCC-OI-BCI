@@ -14,7 +14,7 @@ data:
 model:
   name: 50m-linear
   checkpoint: checkpoints/backbones/50m/model_deploy.pt
-  classifier: checkpoints/heads/stage1/bnci2014_001/subject_01/personal/4s_flatten/head.pt
+  classifier: checkpoints/heads/stage1/bnci2014_001/subject_01/personal/4s_flatten/trials_20/seed_42/head.pt
   device: cpu
   freeze_encoder: true
 
@@ -30,7 +30,7 @@ model_50m:
   filter_hz: [0.1, 75.0]
 
 replay:
-  model_package: model_packages/stage1/bnci2014_001/subject_01/personal/trials_20/seed_42/4s_flatten/v1
+  model_package: model_packages/stage1/bnci2014_001/subject_01/personal/4s_flatten/trials_20/seed_42/v1
   acquirer: replay
   session: 1test
   speed: 1.0

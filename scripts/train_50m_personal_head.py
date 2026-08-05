@@ -126,11 +126,12 @@ from bci_dayloop.personalization import (
 )
 
 from bci_dayloop.utils.paths import (
+    timestamp_id,
     personal_head_path,
-    population_head_path,
     personal_package_dir,
     personal_registry_path,
-    timestamp_id,
+    population_head_path,
+    personal_run_dir
 )
 
 def safe_load_mapping(path: Path) -> Mapping[str, Any]:
@@ -756,14 +757,16 @@ def main() -> None:
     )
 
     if args.run_dir is None:
-        run_dir = (
-            ROOT
-            / "runs"
-            / "stage1"
-            / target_tag
-            / "personal"
-            / f"{budget_tag}_{seed_tag}_{timestamp}"
-        ).resolve()
+        run_dir = personal_run_dir(
+            stage="stage1",
+            dataset="bnci2014_001",
+            subject_id=target_subject,
+            window_seconds=args.window_sec,
+            aggregation=args.aggregation,
+            trials_per_class=args.trials_per_class,
+            seed=args.personalization_seed,
+            run_id=timestamp,
+        )
     else:
         run_dir = resolve_repo_path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1966,9 +1969,12 @@ def main() -> None:
         "stage": "stage1",
         "experiment": "few_shot_personal_linear_head",
         "warning": (
-            "Temporary 10-second baseline: derived windows may cross "
-            "original 4-second trial boundaries, but never cross source "
-            "split, session, subject, or label boundaries."
+            None
+            if args.window_construction == "direct_trial"
+            else (
+                "Samples were constructed by same-label trial "
+                "concatenation within each split."
+            )
         ),
         "files": {
             "target_data": str(data_path),

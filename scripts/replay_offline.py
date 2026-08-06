@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import numpy as np
 from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,10 @@ from bci_dayloop.models.factory import ModelFactory
 from bci_dayloop.models.runtime_package import ModelRuntimePackage, validate_runtime_request
 from bci_dayloop.utils.config import load_yaml, resolve_path
 
+from bci_dayloop.packages.loader import (
+    LoadedRuntimePackage,
+    load_runtime_package,
+)
 
 @dataclass(frozen=True, slots=True)
 class ReplaySettings:
@@ -196,25 +201,45 @@ def build_report(
 def build_pipeline_controller(
     settings: ReplaySettings,
     *,
-    model: Any,
-    preprocessor: Any,
+    runtime_package: LoadedRuntimePackage,
     metadata: HDF5Metadata,
-    command_map: dict[str, str],
-    class_names: list[str] | tuple[str, ...] | None = None,
     stats: PipelineRunStats,
     target_windows: int,
 ) -> PipelineController:
-    logger = JsonlWindowLogger(settings.jsonl_log_path) if settings.jsonl_log_path is not None else None
+    logger = (
+        JsonlWindowLogger(
+            settings.jsonl_log_path
+        )
+        if settings.jsonl_log_path
+        is not None
+        else None
+    )
+
     decoder = SlidingWindowDecoder(
-        model,
-        preprocessor,
-        list(class_names or metadata.class_names),
+        runtime_model=(
+            runtime_package.runtime_model
+        ),
+        class_names=(
+            runtime_package.class_names
+        ),
+        channel_names=(
+            metadata.channel_names
+        ),
         sample_rate=metadata.sample_rate,
         input_unit=metadata.unit,
-        window_sec=settings.window_sec,
-        step_sec=settings.step_sec,
-        confidence_threshold=settings.confidence_threshold,
-        command_map=command_map,
+        window_sec=(
+            runtime_package.window_sec
+        ),
+        step_sec=(
+            runtime_package.step_sec
+        ),
+        confidence_threshold=(
+            runtime_package
+            .confidence_threshold
+        ),
+        command_map=(
+            runtime_package.command_map
+        ),
         run_stats=stats,
         jsonl_logger=logger,
     )
@@ -230,7 +255,11 @@ def build_pipeline_controller(
             step_sec=settings.step_sec,
         )
 
-    return PipelineController(decoder, acquirer_factory, max_windows=target_windows)
+    return PipelineController(
+        decoder,
+        acquirer_factory,
+        max_windows=target_windows,
+    )
 
 
 def stop_after_keyboard_interrupt(controller: PipelineController | None) -> Exception | None:
@@ -279,17 +308,91 @@ def main(argv: list[str] | None = None) -> int:
         dataset = EEGHDF5(settings.data_path)
         metadata = dataset.metadata
         trials = dataset.load(settings.session)["data"]
-        runtime_package = ModelFactory.load_runtime_package(settings.model_package, metadata, device=settings.device)
+        runtime_package = load_runtime_package(
+            settings.model_package,
+            device=settings.device,
+            verify_hashes=True,
+        )
+        dataset_classes = tuple(
+            str(name)
+            for name in metadata.class_names
+        )
+
+        if dataset_classes != (
+                runtime_package.class_names
+        ):
+            raise ValueError(
+                "Dataset class order does not match "
+                "Runtime Model Package: "
+                f"dataset={dataset_classes}, "
+                f"package="
+                f"{runtime_package.class_names}."
+            )
         package_window = runtime_package.window_sec
         package_step = runtime_package.step_sec
         explicit_window = args.window_sec is not None
         explicit_step = args.step_sec is not None
-        if runtime_package.model_name == "50m-linear":
-            if explicit_window or "window_sec" in config.get("replay", {}):
-                validate_runtime_request(runtime_package, window_sec=settings.window_sec, step_sec=package_step)
-            if explicit_step or "step_sec" in config.get("replay", {}):
-                validate_runtime_request(runtime_package, window_sec=package_window, step_sec=settings.step_sec)
-            settings = dataclass_replace(settings, window_sec=package_window, step_sec=package_step)
+        package_window = (
+            runtime_package.window_sec
+        )
+
+        package_step = (
+            runtime_package.step_sec
+        )
+
+        explicit_window = (
+                args.window_sec is not None
+                or "window_sec"
+                in config.get("replay", {})
+        )
+
+        explicit_step = (
+                args.step_sec is not None
+                or "step_sec"
+                in config.get("replay", {})
+        )
+
+        if (
+                explicit_window
+                and not np.isclose(
+            settings.window_sec,
+            package_window,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested window_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.window_sec}, "
+                f"package={package_window}."
+            )
+
+        if (
+                explicit_step
+                and not np.isclose(
+            settings.step_sec,
+            package_step,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested step_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.step_sec}, "
+                f"package={package_step}."
+            )
+
+        settings = dataclass_replace(
+            settings,
+            window_sec=package_window,
+            step_sec=package_step,
+            confidence_threshold=(
+                runtime_package
+                .confidence_threshold
+            ),
+        )
         expected_windows, target_windows = expected_and_target_windows(
             trial_count=int(trials.shape[0]),
             samples_per_trial=int(trials.shape[-1]),
@@ -305,11 +408,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"WARNING: {runtime_package.warning_message}", file=sys.stderr)
         controller = build_pipeline_controller(
             settings,
-            model=runtime_package.model,
-            preprocessor=runtime_package.preprocessor,
+            runtime_package=runtime_package,
             metadata=metadata,
-            command_map=runtime_package.command_map,
-            class_names=runtime_package.class_names,
             stats=stats,
             target_windows=target_windows,
         )

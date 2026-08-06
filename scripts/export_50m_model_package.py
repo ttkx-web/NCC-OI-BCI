@@ -16,15 +16,17 @@ import torch
 from _bootstrap import ROOT
 
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
-from bci_dayloop.models.base import add_batch_dimension
 from bci_dayloop.models.model_50m.runtime import (
     build_50m_runtime_from_metadata,
 )
-from bci_dayloop.models.runtime_package import (
-    load_50m_runtime_package,
-)
 from bci_dayloop.utils.config import dump_json, dump_yaml, load_yaml
-
+from bci_dayloop.packages.exporter import (
+    export_50m_runtime_package,
+)
+from bci_dayloop.packages.loader import (
+    load_runtime_package,
+)
+from bci_dayloop.runtime.types import RawEEGWindow
 
 DEFAULT_COMMANDS = {
     "left_hand": "LEFT",
@@ -33,6 +35,154 @@ DEFAULT_COMMANDS = {
     "tongue": "STOP",
 }
 
+def verify_package(
+    *,
+    package_path: Path,
+    dataset: EEGHDF5,
+    device: str,
+    session_name: str,
+) -> dict[str, Any]:
+    """
+    使用新版统一 Runtime Package Loader 加载模型包，
+    并使用一个真实 EEG 窗口完成 smoke test。
+    """
+
+    loaded = load_runtime_package(
+        package_path,
+        device=device,
+        verify_hashes=True,
+    )
+
+    if loaded.is_test_head:
+        raise RuntimeError(
+            "The exported runtime package is still "
+            "marked as a test head."
+        )
+
+    raw_data = extract_first_real_window(
+        dataset=dataset,
+        session_name=session_name,
+        window_seconds=loaded.window_sec,
+    )
+
+    metadata = dataset.metadata
+
+    if not metadata.channel_names:
+        raise ValueError(
+            "Dataset metadata does not contain channel_names."
+        )
+
+    raw_window = RawEEGWindow(
+        data=raw_data,
+        channel_names=[
+            str(name)
+            for name in metadata.channel_names
+        ],
+        sample_rate=float(metadata.sample_rate),
+        unit=str(metadata.unit),
+        layout="CT",
+        window_id="export_smoke_test",
+        metadata={
+            "session": session_name,
+            "source": "export_50m_model_package",
+        },
+    )
+
+    output = loaded.runtime_model.predict(
+        raw_window,
+        return_features=False,
+    )
+
+    probabilities = (
+        output.probabilities
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    expected_shape = (
+        1,
+        len(loaded.class_names),
+    )
+
+    if probabilities.shape != expected_shape:
+        raise RuntimeError(
+            "Unexpected probability shape: "
+            f"expected {expected_shape}, "
+            f"got {probabilities.shape}."
+        )
+
+    if not np.isfinite(probabilities).all():
+        raise RuntimeError(
+            "Package inference produced NaN or Inf."
+        )
+
+    probability_sums = probabilities.sum(
+        axis=-1
+    )
+
+    if not np.allclose(
+        probability_sums,
+        1.0,
+        atol=1e-5,
+    ):
+        raise RuntimeError(
+            "Package probabilities do not sum to 1: "
+            f"{probability_sums.tolist()}."
+        )
+
+    predicted_class = int(
+        output.predicted_class
+    )
+
+    if not 0 <= predicted_class < len(
+        loaded.class_names
+    ):
+        raise RuntimeError(
+            "Predicted class is outside class_names: "
+            f"class_id={predicted_class}, "
+            f"num_classes={len(loaded.class_names)}."
+        )
+
+    return {
+        "status": "passed",
+        "model_name": loaded.model_name,
+        "class_names": list(
+            loaded.class_names
+        ),
+        "window_sec": float(
+            loaded.window_sec
+        ),
+        "step_sec": float(
+            loaded.step_sec
+        ),
+        "target_sample_rate": float(
+            loaded.target_sample_rate
+        ),
+        "is_test_head": bool(
+            loaded.is_test_head
+        ),
+        "probability_shape": list(
+            probabilities.shape
+        ),
+        "prediction": predicted_class,
+        "prediction_name": (
+            loaded.class_names[
+                predicted_class
+            ]
+        ),
+        "confidence": float(
+            output.confidence
+        ),
+        "probabilities": (
+            probabilities[0].tolist()
+        ),
+        "warning": (
+            "The smoke-test window may cross original "
+            "trial labels; this verifies package loading "
+            "and inference integrity, not accuracy."
+        ),
+    }
 
 def resolve_repo_path(value: str | Path) -> Path:
     """Resolve a relative path from the repository root."""
@@ -243,66 +393,6 @@ def extract_first_real_window(
     return stream[:, :window_samples].copy()
 
 
-def verify_package(
-    *,
-    package_path: Path,
-    dataset: EEGHDF5,
-    device: str,
-    session_name: str,
-) -> dict[str, Any]:
-    runtime = load_50m_runtime_package(
-        package_path,
-        dataset.metadata,
-        device=device,
-    )
-
-    if runtime.is_test_head:
-        raise RuntimeError(
-            "The exported runtime package is still marked as a test head."
-        )
-
-    raw_window = extract_first_real_window(
-        dataset=dataset,
-        session_name=session_name,
-        window_seconds=runtime.window_sec,
-    )
-
-    model_input = runtime.preprocessor.transform(
-        raw_window,
-        dataset.metadata.sample_rate,
-        dataset.metadata.unit,
-    )
-    probabilities = runtime.model.predict_proba(
-        add_batch_dimension(model_input)
-    )
-
-    expected_shape = (1, len(runtime.class_names))
-    if probabilities.shape != expected_shape:
-        raise RuntimeError(
-            f"Unexpected probability shape: expected {expected_shape}, "
-            f"got {probabilities.shape}."
-        )
-    if not np.isfinite(probabilities).all():
-        raise RuntimeError("Package inference produced NaN or Inf.")
-    if not np.allclose(probabilities.sum(axis=-1), 1.0, atol=1e-5):
-        raise RuntimeError("Package probabilities do not sum to 1.")
-
-    return {
-        "model_name": runtime.model_name,
-        "class_names": list(runtime.class_names),
-        "window_sec": float(runtime.window_sec),
-        "step_sec": float(runtime.step_sec),
-        "target_sample_rate": float(runtime.target_sample_rate),
-        "is_test_head": bool(runtime.is_test_head),
-        "probability_shape": list(probabilities.shape),
-        "prediction": int(probabilities[0].argmax()),
-        "confidence": float(probabilities[0].max()),
-        "probabilities": probabilities[0].tolist(),
-        "warning": (
-            "The smoke-test window can cross original 4-second trial labels; "
-            "this verifies runtime integrity, not accuracy."
-        ),
-    }
 
 
 def replace_directory_atomically(
@@ -499,29 +589,46 @@ def main() -> None:
             ),
         )
 
-        saved_package = runtime.adapter.save(
-            temporary_path,
-            label_map=label_map,
+        saved_package = export_50m_runtime_package(
+            output_dir=temporary_path,
+            config=runtime.config,
+            class_names=class_names,
             command_map=command_map,
-        )
-
-        preserve_classifier_metadata(
-            source_classifier=classifier_path,
-            packaged_classifier=saved_package / "classifier.pt",
-            class_names=class_names,
-            export_time=export_time,
-        )
-
-        update_package_metadata(
-            package_path=saved_package,
-            final_package_path=output_path,
-            checkpoint_path=checkpoint_path,
-            classifier_path=classifier_path,
-            class_names=class_names,
-            step_sec=args.step_sec,
             dataset_name=str(metadata.dataset_name),
-            export_time=export_time,
+            task="motor_imagery",
+            step_sec=float(args.step_sec),
+            confidence_threshold=0.55,
+            package_id=(
+                "50m_bnci2014_001_"
+                "subject_01_population_4s_flatten"
+            ),
+            package_version=output_path.name,
+            metrics={
+                "model_selection": (
+                    classifier_metadata.get(
+                        "model_selection",
+                        {},
+                    )
+                ),
+                "final_test": (
+                    classifier_metadata.get(
+                        "final_test",
+                        {},
+                    )
+                ),
+            },
+            adaptation={
+                "offline": {
+                    "type": "none",
+                    "subject_id": None,
+                    "head_type": "population",
+                },
+                "online": {
+                    "type": "none",
+                },
+            },
         )
+
 
         pre_export_verification: dict[str, Any] | None = None
         if not args.skip_smoke_test:
@@ -568,6 +675,23 @@ def main() -> None:
             "final_verification": final_verification,
         }
         dump_json(manifest, output_path / "export_manifest.json")
+
+        metrics_path = output_path / "metrics.json"
+
+        with metrics_path.open(
+                "r",
+                encoding="utf-8",
+        ) as handle:
+            metrics_payload = json.load(handle)
+
+        metrics_payload["export_smoke_test"] = (
+            final_verification
+        )
+
+        dump_json(
+            metrics_payload,
+            metrics_path,
+        )
 
     except Exception:
         if temporary_path.exists():

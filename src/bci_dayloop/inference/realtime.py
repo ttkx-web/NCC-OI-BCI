@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import (
+    asdict,
+    dataclass,
+    field,
+)
 from typing import Protocol
 
 import numpy as np
@@ -31,20 +35,28 @@ class DecodeResult:
     command: str
     class_id: int
     probabilities: list[float]
+
     trial_id: int | None = None
     expected_class_id: int | None = None
+
     preprocessing_latency_ms: float = 0.0
     model_latency_ms: float = 0.0
     total_latency_ms: float = 0.0
 
-    def __post_init__(self) -> None:
-        if self.total_latency_ms == 0.0 and self.latency_ms != 0.0:
-            object.__setattr__(self, "total_latency_ms", float(self.latency_ms))
-        if self.latency_ms != self.total_latency_ms:
-            raise ValueError("latency_ms must equal total_latency_ms")
+    preprocessing_trace: tuple[str, ...] = ()
+    preprocessing_diagnostics: dict[
+        str,
+        object,
+    ] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+    model_diagnostics: dict[
+        str,
+        object,
+    ] = field(default_factory=dict)
+
+    model_revision: str = "base"
+    online_update_step: int = 0
+    online_update_applied: bool = False
 
 
 class SlidingWindowDecoder:
@@ -261,6 +273,19 @@ class SlidingWindowDecoder:
                 )
             )
 
+            preprocessing_trace = tuple(
+                str(step)
+                for step in prepared.preprocessing_trace
+            )
+
+            preprocessing_diagnostics = dict(
+                prepared.diagnostics
+            )
+
+            model_diagnostics = dict(
+                output.diagnostics
+            )
+
             model_ms = (
                 time.perf_counter()
                 - model_started
@@ -353,14 +378,22 @@ class SlidingWindowDecoder:
                 class_id=class_id,
                 probabilities=probabilities.tolist(),
                 trial_id=trial_id,
-                expected_class_id=(
-                    expected_class_id
-                ),
+                expected_class_id=expected_class_id,
                 preprocessing_latency_ms=(
                     preprocessing_ms
                 ),
                 model_latency_ms=model_ms,
                 total_latency_ms=total_ms,
+
+                preprocessing_trace=(
+                    preprocessing_trace
+                ),
+                preprocessing_diagnostics=(
+                    preprocessing_diagnostics
+                ),
+                model_diagnostics=(
+                    model_diagnostics
+                ),
             )
 
         except Exception as error:

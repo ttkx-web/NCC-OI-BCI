@@ -61,7 +61,7 @@ class ReplaySettings:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pseudo-realtime HDF5 replay through a model package")
-    parser.add_argument("--config", default="configs/day1_bnci_s01.yaml")
+    parser.add_argument("--config", default="configs/stage0/day1_bnci_s01.yaml")
     parser.add_argument("--data")
     parser.add_argument("--model-package")
     parser.add_argument("--device", choices=["cpu", "cuda"], default=None)

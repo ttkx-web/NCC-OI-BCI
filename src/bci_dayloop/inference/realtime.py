@@ -58,6 +58,14 @@ class DecodeResult:
     online_update_step: int = 0
     online_update_applied: bool = False
 
+    def to_dict(self) -> dict[str, object]:
+        """
+        Return a plain dictionary suitable for JSONL logs,
+        UI events, pandas DataFrames, and session state.
+        """
+
+        return asdict(self)
+
 
 class SlidingWindowDecoder:
     def __init__(

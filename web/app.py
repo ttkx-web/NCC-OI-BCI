@@ -251,7 +251,17 @@ with st.sidebar:
             disabled = not availability.configuration_enabled
         )
 
-    package_summary: dict[str, object] | None = None
+    package_summary: (
+            dict[str, object] | None
+    ) = None
+
+    selected_package_name: (
+            str | None
+    ) = None
+
+    package_window_default = 4.0
+    package_step_default = 0.5
+    package_threshold_default = 0.55
 
     try:
         package_summary = describe_package(
@@ -261,12 +271,15 @@ with st.sidebar:
         selected_package_name = str(
             package_summary["model_name"]
         )
+
         package_window_default = float(
             package_summary["window_sec"]
         )
+
         package_step_default = float(
             package_summary["step_sec"]
         )
+
         package_threshold_default = float(
             package_summary[
                 "confidence_threshold"
@@ -274,26 +287,15 @@ with st.sidebar:
         )
 
     except Exception as exc:
+        package_summary = None
         selected_package_name = None
-        package_window_default = 4.0
-        package_step_default = 0.5
-        package_threshold_default = 0.55
 
+        # 保留上面初始化的安全默认值，
+        # 不再访问旧版 model.yaml 变量。
         st.warning(
-            f"Cannot read Runtime Package metadata: {exc}"
+            "Cannot read Runtime Package "
+            f"metadata: {exc}"
         )
-
-        package_step_default = float(
-            package_model_config.get(
-                "step_sec",
-                0.5,
-            )
-        )
-
-    except Exception:
-        selected_package_name = None
-        package_window_default = 4.0
-        package_step_default = 0.5
 
     if selected_package_name:
         st.caption(f"Package model: {selected_package_name}")

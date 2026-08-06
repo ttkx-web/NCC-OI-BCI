@@ -9,7 +9,12 @@ import pytest
 from bci_dayloop.acquisition.base import AbstractAcquirer, AcquirerMetadata
 from bci_dayloop.inference.realtime import SlidingWindowDecoder
 from bci_dayloop.inference.runtime_control import PipelineController, PipelineState
-from bci_dayloop.models.base import BaseModelAdapter
+from bci_dayloop.models.base import (
+    ModelBackend,
+)
+from tests.runtime_fakes import (
+    build_fixed_runtime,
+)
 
 
 class FakeAcquirer(AbstractAcquirer):
@@ -38,37 +43,36 @@ class FakeAcquirer(AbstractAcquirer):
             return np.empty((2, 0), dtype=np.float32), np.empty(0)
         return self.chunks.pop(0), np.empty(0)
 
+def make_decoder(
+    *,
+    error_message: str | None = None,
+) -> SlidingWindowDecoder:
+    runtime_model = build_fixed_runtime(
+        channel_names=("C3", "C4"),
+        sample_rate=20.0,
+        window_sec=1.0,
+        probabilities=(
+            0.05,
+            0.05,
+            0.85,
+            0.05,
+        ),
+        error_message=error_message,
+    )
 
-class FixedModel(BaseModelAdapter):
-    model_name = "fixed"
-
-    def fit(self, X, y, **kwargs):
-        return {}
-
-    def predict_proba(self, X):
-        return np.array([[0.05, 0.05, 0.85, 0.05]], dtype=np.float32)
-
-    def save(self, path, **kwargs):
-        return path
-
-    def load(self, path):
-        return self
-
-    def update(self, X, y, **kwargs):
-        return {}
-
-
-class Preprocessor:
-    def transform(self, samples, sample_rate, input_unit, *, reshape=True):
-        return samples
-
-
-def make_decoder(model=None):
     return SlidingWindowDecoder(
-        model or FixedModel(),
-        Preprocessor(),
-        ["left_hand", "right_hand", "feet", "tongue"],
-        sample_rate=20,
+        runtime_model=runtime_model,
+        class_names=(
+            "left_hand",
+            "right_hand",
+            "feet",
+            "tongue",
+        ),
+        channel_names=(
+            "C3",
+            "C4",
+        ),
+        sample_rate=20.0,
         input_unit="uV",
         window_sec=1.0,
         step_sec=0.5,
@@ -165,13 +169,18 @@ def test_restart_uses_fresh_acquirer_and_clears_decoder_buffer():
 
 
 def test_worker_failure_is_exposed_and_wait_timeout_is_bounded():
-    class FailingModel(FixedModel):
-        def predict_proba(self, X):
-            raise ValueError("model inference failed")
-
     controller = PipelineController(
-        make_decoder(FailingModel()),
-        lambda: FakeAcquirer([np.ones((2, 20), dtype=np.float32)]),
+        make_decoder(
+            error_message="model inference failed"
+        ),
+        lambda: FakeAcquirer(
+            [
+                np.ones(
+                    (2, 20),
+                    dtype=np.float32,
+                )
+            ]
+        ),
     )
     controller.start()
     assert controller.wait(timeout=1.0)

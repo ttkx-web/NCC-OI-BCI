@@ -11,13 +11,31 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import replay_offline as cli
+from scripts import replay_offline as cli
 from bci_dayloop.data.hdf5_dataset import HDF5Metadata
 from bci_dayloop.inference.observability import LatencyBreakdown, PipelineRunStats
 from bci_dayloop.inference.realtime import SlidingWindowDecoder
 from bci_dayloop.inference.runtime_control import PipelineController, PipelineControllerSnapshot, PipelineState
 from bci_dayloop.acquisition.base import AbstractAcquirer, AcquirerMetadata
-from bci_dayloop.models.base import BaseModelAdapter
+from types import SimpleNamespace
+
+import torch
+
+from bci_dayloop.models.base import ModelBackend
+from bci_dayloop.preprocessing.base import (
+    ModelInputTransform,
+)
+from bci_dayloop.preprocessing.canonical import (
+    SignalCanonicalizer,
+)
+from bci_dayloop.runtime.model import RuntimeModel
+from bci_dayloop.runtime.types import (
+    CanonicalEEGWindow,
+    InputContract,
+    ModelOutput,
+    ModelTensor,
+    PreparedModelInput,
+)
 
 
 def config() -> dict:
@@ -101,28 +119,151 @@ def test_window_targets_and_no_jsonl_log():
     assert settings.jsonl_log_path is None
 
 
-class FixedModel(BaseModelAdapter):
-    model_name = "fixed"
+class IdentityInputTransform(ModelInputTransform):
+    def __init__(
+        self,
+        *,
+        channel_names: tuple[str, ...],
+        sample_rate: float,
+        window_sec: float,
+    ) -> None:
+        self._input_contract = InputContract(
+            channel_names=channel_names,
+            sample_rate=sample_rate,
+            window_sec=window_sec,
+            num_samples=int(
+                round(sample_rate * window_sec)
+            ),
+            input_unit="uV",
+            tensor_layout="BCT",
+            strict_window_duration=True,
+            model_input_keys=("signal",),
+        )
 
-    def fit(self, X, y, **kwargs):
-        return {}
+    @property
+    def input_contract(self) -> InputContract:
+        return self._input_contract
 
-    def predict_proba(self, X):
-        return np.array([[0.05, 0.05, 0.85, 0.05]], dtype=np.float32)
+    def transform(
+        self,
+        window: CanonicalEEGWindow,
+    ) -> PreparedModelInput:
+        signal = torch.from_numpy(
+            np.ascontiguousarray(
+                window.data,
+                dtype=np.float32,
+            )
+        ).unsqueeze(0)
 
-    def save(self, path, **kwargs):
-        return path
+        return PreparedModelInput(
+            model_input={
+                "signal": signal,
+            },
+            canonical_window=window,
+            preprocessing_trace=[
+                *window.processing_history,
+                "identity_input_transform",
+            ],
+        )
 
-    def load(self, path):
-        return self
 
-    def update(self, X, y, **kwargs):
-        return {}
+class FixedBackend(ModelBackend):
+    def __init__(
+        self,
+        probabilities: tuple[float, ...] = (
+            0.05,
+            0.05,
+            0.85,
+            0.05,
+        ),
+    ) -> None:
+        self._probabilities = torch.tensor(
+            [probabilities],
+            dtype=torch.float32,
+        )
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cpu")
+
+    @property
+    def num_classes(self) -> int:
+        return int(
+            self._probabilities.shape[-1]
+        )
+
+    def predict_tensor(
+        self,
+        model_input: ModelTensor,
+        return_features: bool = False,
+    ) -> ModelOutput:
+        if not isinstance(model_input, dict):
+            raise TypeError(
+                "Expected dictionary model input."
+            )
+
+        signal = model_input["signal"]
+
+        probabilities = self._probabilities.clone()
+        logits = torch.log(
+            probabilities.clamp_min(1e-8)
+        )
+
+        confidence, prediction = probabilities.max(
+            dim=-1
+        )
+
+        return ModelOutput(
+            logits=logits,
+            probabilities=probabilities,
+            predicted_class=int(
+                prediction[0].item()
+            ),
+            confidence=float(
+                confidence[0].item()
+            ),
+            features=(
+                signal
+                if return_features
+                else None
+            ),
+        )
+
+    def encode_tensor(
+        self,
+        model_input: ModelTensor,
+    ) -> torch.Tensor:
+        if not isinstance(model_input, dict):
+            raise TypeError(
+                "Expected dictionary model input."
+            )
+
+        return model_input["signal"]
+
+    def get_trainable_parameters(
+        self,
+        scope: str,
+    ) -> list[torch.nn.Parameter]:
+        return []
 
 
-class Preprocessor:
-    def transform(self, samples, sample_rate, input_unit, *, reshape=True):
-        return samples
+def build_fixed_runtime(
+    *,
+    sample_rate: float,
+    window_sec: float,
+    channel_names: tuple[str, ...],
+) -> RuntimeModel:
+    return RuntimeModel(
+        canonicalizer=SignalCanonicalizer(
+            target_unit="uV",
+        ),
+        input_transform=IdentityInputTransform(
+            channel_names=channel_names,
+            sample_rate=sample_rate,
+            window_sec=window_sec,
+        ),
+        backend=FixedBackend(),
+    )
 
 
 def test_controller_builder_configures_jsonl_without_creating_it(tmp_path):
@@ -130,12 +271,30 @@ def test_controller_builder_configures_jsonl_without_creating_it(tmp_path):
         cli.build_parser().parse_args(["--jsonl-log", str(tmp_path / "logs" / "windows.jsonl")]), config()
     )
     metadata = HDF5Metadata(20.0, ["C3", "C4"], ["left_hand", "right_hand", "feet", "tongue"], "uV", "test")
+    runtime_model = build_fixed_runtime(
+        sample_rate=20.0,
+        window_sec=3.0,
+        channel_names=("C3", "C4"),
+    )
+
+    runtime_package = SimpleNamespace(
+        runtime_model=runtime_model,
+        class_names=(
+            "left_hand",
+            "right_hand",
+            "feet",
+            "tongue",
+        ),
+        command_map={},
+        window_sec=3.0,
+        step_sec=1.0,
+        confidence_threshold=0.6,
+    )
+
     controller = cli.build_pipeline_controller(
         settings,
-        model=FixedModel(),
-        preprocessor=Preprocessor(),
+        runtime_package=runtime_package,
         metadata=metadata,
-        command_map={},
         stats=PipelineRunStats(),
         target_windows=4,
     )
@@ -200,10 +359,24 @@ def test_keyboard_interrupt_stop_helper_does_not_record_a_failure_window():
             return np.ones((2, 10), dtype=np.float32), np.empty(0)
 
     stats = PipelineRunStats()
+    runtime_model = build_fixed_runtime(
+        sample_rate=20.0,
+        window_sec=1.0,
+        channel_names=("C3", "C4"),
+    )
+
     decoder = SlidingWindowDecoder(
-        FixedModel(),
-        Preprocessor(),
-        ["left_hand", "right_hand", "feet", "tongue"],
+        runtime_model=runtime_model,
+        class_names=(
+            "left_hand",
+            "right_hand",
+            "feet",
+            "tongue",
+        ),
+        channel_names=(
+            "C3",
+            "C4",
+        ),
         sample_rate=20.0,
         input_unit="uV",
         window_sec=1.0,

@@ -22,6 +22,9 @@ from bci_dayloop.preprocessing.canonical import SignalCanonicalizer
 from bci_dayloop.preprocessing.model_50m import Model50MInputTransform
 from bci_dayloop.runtime.model import RuntimeModel
 from bci_dayloop.runtime.types import RawEEGWindow
+from bci_dayloop.packages.loader import (
+    load_runtime_package,
+)
 
 
 def resolve_path(value: str | Path) -> Path:
@@ -116,6 +119,13 @@ def parse_args() -> argparse.Namespace:
         "--atol",
         type=float,
         default=1e-6,
+    )
+    parser.add_argument(
+        "--model-package",
+        help=(
+            "Optional schema-v2 Runtime Model Package. "
+            "When provided, also compare package-loaded inference."
+        ),
     )
 
     return parser.parse_args()
@@ -462,6 +472,9 @@ def main() -> None:
         old_probabilities.copy()
     )
 
+
+
+
     del old_adapter
     del old_preprocessor
     del old_config
@@ -580,6 +593,20 @@ def main() -> None:
     new_confidence = float(
         new_output.confidence
     )
+
+    direct_probabilities = (
+        new_probabilities.copy()
+    )
+    direct_prediction = new_prediction
+    direct_confidence = new_confidence
+
+    del new_output
+    del prepared
+    del new_runtime
+    del new_adapter
+    del new_config
+
+    release_model_memory()
 
     # ==========================================================
     # 分层比较
@@ -714,6 +741,200 @@ def main() -> None:
         )
 
     print("\nPASS: legacy and RuntimeModel predictions are consistent.")
+
+    # ==========================================================
+    # 第三层：直接构建的 RuntimeModel
+    #         vs 从 Runtime Model Package 加载的 RuntimeModel
+    # ==========================================================
+
+    if args.model_package is not None:
+        model_package_path = resolve_path(
+            args.model_package
+        )
+
+        if not model_package_path.is_dir():
+            raise FileNotFoundError(
+                "Runtime Model Package directory "
+                f"was not found: {model_package_path}"
+            )
+
+        print(
+            "\nRunning packaged RuntimeModel path..."
+        )
+        print(
+            f"Model package: {model_package_path}"
+        )
+
+        loaded_package = load_runtime_package(
+            model_package_path,
+            device=args.device,
+            verify_hashes=True,
+        )
+
+        # ------------------------------------------------------
+        # 1. 检查 Package 的实验配置
+        # ------------------------------------------------------
+
+        if not np.isclose(
+            loaded_package.window_sec,
+            args.window_sec,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "Package window_sec does not match "
+                "the direct RuntimeModel setting: "
+                f"package={loaded_package.window_sec}, "
+                f"direct={args.window_sec}."
+            )
+
+        if not np.isclose(
+            loaded_package.target_sample_rate,
+            args.target_sample_rate,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "Package target sample rate does not "
+                "match the direct RuntimeModel setting: "
+                f"package="
+                f"{loaded_package.target_sample_rate}, "
+                f"direct={args.target_sample_rate}."
+            )
+
+        if tuple(
+            loaded_package.class_names
+        ) != tuple(class_names):
+            raise ValueError(
+                "Package class order does not match "
+                "the dataset class order: "
+                f"package="
+                f"{loaded_package.class_names}, "
+                f"dataset={class_names}."
+            )
+
+        # ------------------------------------------------------
+        # 2. 使用同一个 RawEEGWindow 预测
+        #
+        # runtime_window 就是上面直接 Runtime 使用的那个窗口，
+        # 不要重新读取数据或重新构造另一个窗口。
+        # ------------------------------------------------------
+
+        package_output = (
+            loaded_package.runtime_model.predict(
+                runtime_window,
+                return_features=False,
+            )
+        )
+
+        package_probabilities = tensor_to_numpy(
+            package_output.probabilities
+        )
+
+        package_prediction = int(
+            package_output.predicted_class
+        )
+
+        package_confidence = float(
+            package_output.confidence
+        )
+
+        # ------------------------------------------------------
+        # 3. 输出对比信息
+        # ------------------------------------------------------
+
+        package_probability_max_diff = (
+            maximum_absolute_difference(
+                direct_probabilities,
+                package_probabilities,
+            )
+        )
+
+        print("\n" + "=" * 72)
+        print("Direct Runtime vs Package Runtime")
+        print("=" * 72)
+
+        print(
+            "Direct probability shape:    "
+            f"{direct_probabilities.shape}"
+        )
+        print(
+            "Package probability shape:   "
+            f"{package_probabilities.shape}"
+        )
+        print(
+            "Probability max abs diff:     "
+            f"{package_probability_max_diff:.10g}"
+        )
+
+        print(
+            "Direct prediction/confidence: "
+            f"{direct_prediction} / "
+            f"{direct_confidence:.10f}"
+        )
+        print(
+            "Package prediction/confidence:"
+            f" {package_prediction} / "
+            f"{package_confidence:.10f}"
+        )
+
+        print(
+            "Direct probabilities:         "
+            f"{direct_probabilities[0].tolist()}"
+        )
+        print(
+            "Package probabilities:        "
+            f"{package_probabilities[0].tolist()}"
+        )
+
+        # ------------------------------------------------------
+        # 4. 正式断言
+        # ------------------------------------------------------
+
+        np.testing.assert_allclose(
+            direct_probabilities,
+            package_probabilities,
+            rtol=args.rtol,
+            atol=args.atol,
+            err_msg=(
+                "Direct RuntimeModel and package-loaded "
+                "RuntimeModel probabilities are inconsistent."
+            ),
+        )
+
+        if (
+            direct_prediction
+            != package_prediction
+        ):
+            raise AssertionError(
+                "Direct and packaged predictions "
+                "are inconsistent: "
+                f"direct={direct_prediction}, "
+                f"package={package_prediction}."
+            )
+
+        if not np.isclose(
+            direct_confidence,
+            package_confidence,
+            rtol=args.rtol,
+            atol=args.atol,
+        ):
+            raise AssertionError(
+                "Direct and packaged confidence values "
+                "are inconsistent: "
+                f"direct={direct_confidence}, "
+                f"package={package_confidence}."
+            )
+
+        print(
+            "\nPASS: direct and package-loaded "
+            "RuntimeModel predictions are consistent."
+        )
+
+        del package_output
+        del loaded_package
+        release_model_memory()
+
 
 
 if __name__ == "__main__":

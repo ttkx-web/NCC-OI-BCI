@@ -10,24 +10,36 @@ from pathlib import Path
 from typing import Any
 
 from _bootstrap import ROOT  # noqa: F401
+
 from bci_dayloop.acquisition.factory import AcquirerFactory
-from bci_dayloop.data.hdf5_dataset import EEGHDF5, HDF5Metadata
+from bci_dayloop.data.hdf5_dataset import (
+    EEGHDF5,
+    HDF5Metadata,
+)
 from bci_dayloop.inference.observability import (
     JsonlWindowLogger,
     PipelineRunStats,
     PipelineStatsSnapshot,
     calculate_expected_windows,
 )
-from bci_dayloop.inference.realtime import SlidingWindowDecoder
-from bci_dayloop.inference.run_report import PipelineRunReport
-from bci_dayloop.inference.runtime_control import PipelineController, PipelineControllerSnapshot, PipelineState
-from bci_dayloop.models.factory import ModelFactory
-from bci_dayloop.models.runtime_package import ModelRuntimePackage, validate_runtime_request
-from bci_dayloop.utils.config import load_yaml, resolve_path
-
+from bci_dayloop.inference.realtime import (
+    SlidingWindowDecoder,
+)
+from bci_dayloop.inference.run_report import (
+    PipelineRunReport,
+)
+from bci_dayloop.inference.runtime_control import (
+    PipelineController,
+    PipelineControllerSnapshot,
+    PipelineState,
+)
 from bci_dayloop.packages.loader import (
     LoadedRuntimePackage,
     load_runtime_package,
+)
+from bci_dayloop.utils.config import (
+    load_yaml,
+    resolve_path,
 )
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +160,7 @@ def build_report(
     controller_snapshot: PipelineControllerSnapshot | None,
     fallback_state: PipelineState = PipelineState.IDLE,
     fallback_error: Exception | None = None,
-    runtime_package: ModelRuntimePackage | None = None,
+    runtime_package: LoadedRuntimePackage | None = None,
 ) -> PipelineRunReport:
     if controller_snapshot is None:
         state = fallback_state.value
@@ -297,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     stats = PipelineRunStats()
     metadata: HDF5Metadata | None = None
     model_name: str | None = None
-    runtime_package: ModelRuntimePackage | None = None
+    runtime_package: LoadedRuntimePackage | None = None
     expected_windows = 0
     target_windows = 0
     controller: PipelineController | None = None
@@ -318,20 +330,56 @@ def main(argv: list[str] | None = None) -> int:
             for name in metadata.class_names
         )
 
-        if dataset_classes != (
-                runtime_package.class_names
-        ):
+        if dataset_classes != runtime_package.class_names:
             raise ValueError(
                 "Dataset class order does not match "
                 "Runtime Model Package: "
                 f"dataset={dataset_classes}, "
-                f"package="
-                f"{runtime_package.class_names}."
+                f"package={runtime_package.class_names}."
             )
         package_window = runtime_package.window_sec
         package_step = runtime_package.step_sec
-        explicit_window = args.window_sec is not None
-        explicit_step = args.step_sec is not None
+
+        explicit_window = (
+                args.window_sec is not None
+                or "window_sec" in config.get("replay", {})
+        )
+
+        explicit_step = (
+                args.step_sec is not None
+                or "step_sec" in config.get("replay", {})
+        )
+        if (
+                explicit_window
+                and not np.isclose(
+            settings.window_sec,
+            package_window,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested window_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.window_sec}, "
+                f"package={package_window}."
+            )
+
+        if (
+                explicit_step
+                and not np.isclose(
+            settings.step_sec,
+            package_step,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested step_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.step_sec}, "
+                f"package={package_step}."
+            )
         package_window = (
             runtime_package.window_sec
         )
@@ -389,8 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             window_sec=package_window,
             step_sec=package_step,
             confidence_threshold=(
-                runtime_package
-                .confidence_threshold
+                runtime_package.confidence_threshold
             ),
         )
         expected_windows, target_windows = expected_and_target_windows(

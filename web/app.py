@@ -25,9 +25,10 @@ from bci_dayloop.inference.observability import (  # noqa: E402
 )
 from bci_dayloop.inference.realtime import SlidingWindowDecoder  # noqa: E402
 from bci_dayloop.inference.runtime_control import PipelineController, PipelineState  # noqa: E402
-from bci_dayloop.models.factory import ModelFactory  # noqa: E402
-from bci_dayloop.models.runtime_package import validate_runtime_request  # noqa: E402
 from bci_dayloop.utils.config import load_yaml  # noqa: E402
+from bci_dayloop.packages.loader import (
+    load_runtime_package,
+)
 from web.ui_runtime import (  # noqa: E402
     UiEventQueue,
     apply_events,
@@ -50,6 +51,79 @@ def describe_session(path: str, session: str) -> tuple[int, int]:
     trials = EEGHDF5(path).load(session)["data"]
     return int(trials.shape[0]), int(trials.shape[-1])
 
+@st.cache_data(max_entries=32)
+def describe_package(
+    path: str,
+) -> dict[str, object]:
+    package_path = (
+        Path(path).expanduser().resolve()
+    )
+
+    payload = load_yaml(
+        package_path / "package.yaml"
+    )
+
+    if int(payload.get("schema_version", -1)) != 2:
+        raise ValueError(
+            "Only Runtime Package schema version 2 "
+            "is supported."
+        )
+
+    model = payload.get("model")
+    input_contract = payload.get(
+        "input_contract"
+    )
+    runtime = payload.get("runtime")
+    package = payload.get("package")
+
+    for name, value in (
+        ("model", model),
+        ("input_contract", input_contract),
+        ("runtime", runtime),
+        ("package", package),
+    ):
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"package.yaml field {name!r} "
+                "must be a mapping."
+            )
+
+    return {
+        "model_name": str(
+            model.get("name", "unknown")
+        ),
+        "model_type": str(
+            model.get("type", "unknown")
+        ),
+        "class_names": tuple(
+            str(name)
+            for name in model.get(
+                "class_names",
+                [],
+            )
+        ),
+        "window_sec": float(
+            input_contract["window_sec"]
+        ),
+        "target_sample_rate": float(
+            input_contract["sample_rate"]
+        ),
+        "step_sec": float(
+            runtime.get("step_sec", 0.5)
+        ),
+        "confidence_threshold": float(
+            runtime.get(
+                "confidence_threshold",
+                0.55,
+            )
+        ),
+        "is_test_head": bool(
+            package.get("is_test_head", False)
+        ),
+        "warning_message": package.get(
+            "warning_message"
+        ),
+    }
 
 def discover_hdf5() -> list[str]:
     """Recursively discover processed HDF5 datasets."""
@@ -71,7 +145,7 @@ def discover_hdf5() -> list[str]:
 def discover_packages() -> list[str]:
     search_roots = (
         ROOT / "model_packages",
-        ROOT / "runs",  # 暂时兼容未迁移的旧包
+        ROOT / "runs",
     )
 
     packages: set[str] = set()
@@ -80,12 +154,22 @@ def discover_packages() -> list[str]:
         if not search_root.is_dir():
             continue
 
-        for model_yaml in search_root.rglob("model.yaml"):
-            package_dir = model_yaml.parent
+        for package_yaml in search_root.rglob(
+            "package.yaml"
+        ):
+            package_dir = package_yaml.parent
 
-            if (
-                package_dir / "preprocessing.yaml"
-            ).is_file():
+            required_files = (
+                package_dir / "backbone.pt",
+                package_dir / "classifier.pt",
+                package_dir / "preprocessing.yaml",
+                package_dir / "metrics.json",
+            )
+
+            if all(
+                path.is_file()
+                for path in required_files
+            ):
                 packages.add(
                     str(package_dir.resolve())
                 )
@@ -167,20 +251,36 @@ with st.sidebar:
             disabled = not availability.configuration_enabled
         )
 
+    package_summary: dict[str, object] | None = None
+
     try:
-        package_model_config = load_yaml(
-            Path(package_path) / "model.yaml"
+        package_summary = describe_package(
+            package_path
         )
 
         selected_package_name = str(
-            package_model_config.get("name")
+            package_summary["model_name"]
+        )
+        package_window_default = float(
+            package_summary["window_sec"]
+        )
+        package_step_default = float(
+            package_summary["step_sec"]
+        )
+        package_threshold_default = float(
+            package_summary[
+                "confidence_threshold"
+            ]
         )
 
-        package_window_default = float(
-            package_model_config.get(
-                "window_seconds",
-                10.0,
-            )
+    except Exception as exc:
+        selected_package_name = None
+        package_window_default = 4.0
+        package_step_default = 0.5
+        package_threshold_default = 0.55
+
+        st.warning(
+            f"Cannot read Runtime Package metadata: {exc}"
         )
 
         package_step_default = float(
@@ -200,12 +300,19 @@ with st.sidebar:
     acquirer_name = st.selectbox(
         "Acquirer", AcquirerFactory.list_acquirers(), disabled=not availability.configuration_enabled
     )
-    model_name = st.selectbox("Model", ModelFactory.list_models(), disabled=not availability.configuration_enabled)
+
     device = st.segmented_control(
         "Compute device", ["cuda", "cpu"], default="cuda", disabled=not availability.configuration_enabled
     )
     threshold = st.slider(
-        "Confidence threshold", 0.0, 1.0, 0.55, 0.01, disabled=not availability.configuration_enabled
+        "Confidence threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=package_threshold_default,
+        step=0.01,
+        disabled=(
+            not availability.configuration_enabled
+        ),
     )
     replay_speed = st.number_input(
         "Replay speed", min_value=0.1, max_value=100.0, value=1.0, step=0.1, disabled=not availability.configuration_enabled
@@ -215,15 +322,19 @@ with st.sidebar:
             "Maximum windows", min_value=1, max_value=10000, value=100, step=10, disabled=not availability.configuration_enabled
         )
     )
-    window_sec = float(
-        st.number_input(
-            "Window seconds", min_value=0.1, value=package_window_default, step=0.5, disabled=not availability.configuration_enabled
-        )
+    window_sec = package_window_default
+    step_sec = package_step_default
+
+    st.text_input(
+        "Window seconds",
+        value=str(window_sec),
+        disabled=True,
     )
-    step_sec = float(
-        st.number_input(
-            "Step seconds", min_value=0.1, value=package_step_default, step=0.1, disabled=not availability.configuration_enabled
-        )
+
+    st.text_input(
+        "Step seconds",
+        value=str(step_sec),
+        disabled=True,
     )
     enable_jsonl = st.checkbox("Enable JSONL logging", disabled=not availability.configuration_enabled)
     jsonl_path = st.text_input(
@@ -297,17 +408,29 @@ if start_clicked:
 
         package = Path(package_path)
 
-        runtime_package = ModelFactory.load_runtime_package(
-            package,
-            EEGHDF5(data_path).metadata,
-            device=str(device),
+        with st.spinner(
+                "Loading Runtime Model Package..."
+        ):
+            runtime_package = load_runtime_package(
+                package,
+                device=str(device),
+                verify_hashes=True,
+            )
+        dataset_classes = tuple(
+            str(name)
+            for name in class_names
         )
 
-        validate_runtime_request(
-            runtime_package,
-            window_sec=window_sec,
-            step_sec=step_sec,
-        )
+        if dataset_classes != (
+                runtime_package.class_names
+        ):
+            raise ValueError(
+                "Dataset class order does not match "
+                "Runtime Model Package: "
+                f"dataset={dataset_classes}, "
+                f"package="
+                f"{runtime_package.class_names}."
+            )
 
         if runtime_package.is_test_head:
             st.warning(
@@ -316,6 +439,27 @@ if start_clicked:
                     "仅用于链路验证，预测和置信度"
                     "无准确率意义"
                 )
+            )
+        if not np.isclose(
+                window_sec,
+                runtime_package.window_sec,
+                rtol=0.0,
+                atol=1e-6,
+        ):
+            raise ValueError(
+                "Displayed window length does not match "
+                "loaded Runtime Package."
+            )
+
+        if not np.isclose(
+                step_sec,
+                runtime_package.step_sec,
+                rtol=0.0,
+                atol=1e-6,
+        ):
+            raise ValueError(
+                "Displayed step length does not match "
+                "loaded Runtime Package."
             )
 
         target_windows = target_window_count(
@@ -335,15 +479,27 @@ if start_clicked:
         )
 
         decoder = SlidingWindowDecoder(
-            runtime_package.model,
-            runtime_package.preprocessor,
-            list(runtime_package.class_names),
+            runtime_model=(
+                runtime_package.runtime_model
+            ),
+            class_names=(
+                runtime_package.class_names
+            ),
+            channel_names=channel_names,
             sample_rate=sample_rate,
             input_unit=input_unit,
-            window_sec=window_sec,
-            step_sec=step_sec,
-            confidence_threshold=float(threshold),
-            command_map=runtime_package.command_map,
+            window_sec=(
+                runtime_package.window_sec
+            ),
+            step_sec=(
+                runtime_package.step_sec
+            ),
+            confidence_threshold=float(
+                threshold
+            ),
+            command_map=(
+                runtime_package.command_map
+            ),
             run_stats=stats,
             jsonl_logger=logger,
         )
@@ -354,8 +510,8 @@ if start_clicked:
             session=str(session),
             speed=float(replay_speed),
             loop=False,
-            window_sec=window_sec,
-            step_sec=step_sec,
+            window_sec=runtime_package.window_sec,
+            step_sec=runtime_package.step_sec,
         )
 
         controller = PipelineController(

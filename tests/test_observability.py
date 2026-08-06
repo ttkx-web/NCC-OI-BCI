@@ -11,40 +11,61 @@ from bci_dayloop.inference.observability import (
     PipelineRunStats,
     calculate_expected_windows,
 )
-from bci_dayloop.inference.realtime import SlidingWindowDecoder
-from bci_dayloop.models.base import BaseModelAdapter
+from bci_dayloop.inference.realtime import (
+    SlidingWindowDecoder,
+)
+from bci_dayloop.runtime.types import (
+    CanonicalEEGWindow,
+    PreparedModelInput,
+)
+from tests.runtime_fakes import (
+    IdentityInputTransform,
+    build_fixed_runtime,
+)
+
+class FailingInputTransform(
+    IdentityInputTransform
+):
+    def transform(
+        self,
+        window: CanonicalEEGWindow,
+    ) -> PreparedModelInput:
+        raise RuntimeError(
+            "preprocessing failed"
+        )
 
 
-class FixedModel(BaseModelAdapter):
-    model_name = "fixed"
 
-    def fit(self, X, y, **kwargs):
-        return {}
+def make_decoder(
+    *,
+    stats: PipelineRunStats | None = None,
+    logger: JsonlWindowLogger | None = None,
+) -> SlidingWindowDecoder:
+    runtime_model = build_fixed_runtime(
+        channel_names=("C3", "C4"),
+        sample_rate=20.0,
+        window_sec=1.0,
+        probabilities=(
+            0.05,
+            0.05,
+            0.85,
+            0.05,
+        ),
+    )
 
-    def predict_proba(self, X):
-        return np.array([[0.05, 0.05, 0.85, 0.05]], dtype=np.float32)
-
-    def save(self, path, **kwargs):
-        return path
-
-    def load(self, path):
-        return self
-
-    def update(self, X, y, **kwargs):
-        return {}
-
-
-class ArrayPreprocessor:
-    def transform(self, samples, sample_rate, input_unit, *, reshape=True):
-        return samples
-
-
-def make_decoder(*, stats=None, logger=None, preprocessor=None, model=None):
     return SlidingWindowDecoder(
-        model or FixedModel(),
-        preprocessor or ArrayPreprocessor(),
-        ["left_hand", "right_hand", "feet", "tongue"],
-        sample_rate=20,
+        runtime_model=runtime_model,
+        class_names=(
+            "left_hand",
+            "right_hand",
+            "feet",
+            "tongue",
+        ),
+        channel_names=(
+            "C3",
+            "C4",
+        ),
+        sample_rate=20.0,
         input_unit="uV",
         window_sec=1.0,
         step_sec=0.5,
@@ -111,29 +132,94 @@ def test_decoder_records_latency_and_success():
     assert snapshot.failed_windows == 0
 
 
-def test_decoder_records_failure_reraises_and_writes_jsonl(tmp_path):
-    class FailingPreprocessor(ArrayPreprocessor):
-        def transform(self, samples, sample_rate, input_unit, *, reshape=True):
-            raise RuntimeError("preprocessing failed")
+def test_decoder_records_failure_reraises_and_writes_jsonl(
+    tmp_path,
+):
+    log_path = (
+        tmp_path
+        / "logs"
+        / "windows.jsonl"
+    )
 
-    log_path = tmp_path / "logs" / "windows.jsonl"
     stats = PipelineRunStats()
     logger = JsonlWindowLogger(log_path)
-    decoder = make_decoder(stats=stats, logger=logger)
-    success = decoder.push(np.ones((2, 20), dtype=np.float32), trial_id=1, expected_class_id=2)
+
+    decoder = make_decoder(
+        stats=stats,
+        logger=logger,
+    )
+
+    success = decoder.push(
+        np.ones(
+            (2, 20),
+            dtype=np.float32,
+        ),
+        trial_id=1,
+        expected_class_id=2,
+    )
+
     assert success is not None
 
-    decoder.preprocessor = FailingPreprocessor()
-    with pytest.raises(RuntimeError, match="preprocessing failed"):
-        decoder.push(np.ones((2, 10), dtype=np.float32))
+    decoder.runtime_model.input_transform = (
+        FailingInputTransform(
+            channel_names=("C3", "C4"),
+            sample_rate=20.0,
+            window_sec=1.0,
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="preprocessing failed",
+    ):
+        decoder.push(
+            np.ones(
+                (2, 10),
+                dtype=np.float32,
+            )
+        )
 
     snapshot = stats.snapshot()
+
     assert snapshot.chunks_received == 2
     assert snapshot.emitted_windows == 2
     assert snapshot.successful_windows == 1
     assert snapshot.failed_windows == 1
-    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert [record["status"] for record in records] == ["success", "error"]
+
+    records = [
+        json.loads(line)
+        for line in log_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+
+    assert [
+        record["status"]
+        for record in records
+    ] == [
+        "success",
+        "error",
+    ]
+
     success_record, error_record = records
-    assert {"timestamp", "window_id", "trial_id", "expected_class_id", "prediction", "confidence", "probabilities", "command", "preprocessing_latency_ms", "model_latency_ms", "total_latency_ms"} <= success_record.keys()
-    assert {"timestamp", "window_id", "error_type", "error_message"} <= error_record.keys()
+
+    assert {
+        "timestamp",
+        "window_id",
+        "trial_id",
+        "expected_class_id",
+        "prediction",
+        "confidence",
+        "probabilities",
+        "command",
+        "preprocessing_latency_ms",
+        "model_latency_ms",
+        "total_latency_ms",
+    } <= success_record.keys()
+
+    assert {
+        "timestamp",
+        "window_id",
+        "error_type",
+        "error_message",
+    } <= error_record.keys()

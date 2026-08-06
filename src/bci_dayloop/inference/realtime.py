@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
@@ -10,11 +9,7 @@ import numpy as np
 from bci_dayloop.acquisition.base import AbstractAcquirer
 from bci_dayloop.control.commands import command_for_prediction
 from bci_dayloop.inference.observability import JsonlWindowLogger, LatencyBreakdown, PipelineRunStats
-from collections.abc import (
-    Callable,
-    Iterator,
-    Sequence,
-)
+from collections.abc import Callable, Iterator, Sequence
 
 from bci_dayloop.runtime.model import (
     RuntimeModel,
@@ -179,91 +174,98 @@ class SlidingWindowDecoder:
 
         if chunk.ndim != 2:
             raise ValueError(
-                f"Expected samples [C,T], got "
-                f"{chunk.shape}."
+                f"Expected samples [C, T], got {chunk.shape}."
             )
 
-        if chunk.shape[0] != len(
-                self.channel_names
-        ):
+        if chunk.shape[0] != len(self.channel_names):
             raise ValueError(
                 "Incoming EEG channel count does not match "
                 "channel_names: "
                 f"data={chunk.shape[0]}, "
                 f"names={len(self.channel_names)}."
             )
+
         if self.run_stats is not None:
             self.run_stats.record_chunk()
-        self._buffer = chunk.copy() if self._buffer is None else np.concatenate((self._buffer, chunk), axis=1)
-        self._buffer = self._buffer[:, -self.window_samples :]
+
+        if self._buffer is None:
+            self._buffer = chunk.copy()
+        else:
+            self._buffer = np.concatenate(
+                (self._buffer, chunk),
+                axis=1,
+            )
+
+        # 只保留生成当前窗口所需的最近数据。
+        self._buffer = self._buffer[
+                       :,
+                       -self.window_samples:,
+                       ]
+
         self._new_since_decode += chunk.shape[1]
-        if self._buffer.shape[1] < self.window_samples or self._new_since_decode < self.step_samples:
+
+        if (
+                self._buffer.shape[1] < self.window_samples
+                or self._new_since_decode < self.step_samples
+        ):
             return None
+
         self._new_since_decode %= self.step_samples
         self._window_id += 1
         window_id = self._window_id
+
         total_started = time.perf_counter()
+
         try:
-            preprocessing_started = time.perf_counter()
-            total_started = time.perf_counter()
-
-            try:
-                raw_window = RawEEGWindow(
-                    data=self._buffer.copy(),
-                    channel_names=list(
-                        self.channel_names
+            raw_window = RawEEGWindow(
+                data=self._buffer.copy(),
+                channel_names=list(
+                    self.channel_names
+                ),
+                sample_rate=self.sample_rate,
+                unit=self.input_unit,
+                layout="CT",
+                trial_id=(
+                    str(trial_id)
+                    if trial_id is not None
+                    else None
+                ),
+                window_id=str(window_id),
+                label=expected_class_id,
+                metadata={
+                    "source": (
+                        "sliding_window_decoder"
                     ),
-                    sample_rate=self.sample_rate,
-                    unit=self.input_unit,
-                    layout="CT",
-                    trial_id=(
-                        str(trial_id)
-                        if trial_id is not None
-                        else None
-                    ),
-                    window_id=str(window_id),
-                    label=expected_class_id,
-                    metadata={
-                        "source": "sliding_window_decoder",
-                    },
+                },
+            )
+
+            preprocessing_started = (
+                time.perf_counter()
+            )
+
+            prepared = self.runtime_model.prepare(
+                raw_window
+            )
+
+            preprocessing_ms = (
+                time.perf_counter()
+                - preprocessing_started
+            ) * 1000.0
+
+            model_started = time.perf_counter()
+
+            output = (
+                self.runtime_model.predict_prepared(
+                    prepared,
+                    return_features=False,
                 )
+            )
 
-                preprocessing_started = (
-                    time.perf_counter()
-                )
+            model_ms = (
+                time.perf_counter()
+                - model_started
+            ) * 1000.0
 
-                prepared = self.runtime_model.prepare(
-                    raw_window
-                )
-
-                preprocessing_ms = (time.perf_counter()- preprocessing_started) * 1000.0
-
-                model_started = time.perf_counter()
-
-                output = (
-                    self.runtime_model.predict_prepared(
-                        prepared,
-                        return_features=False,
-                    )
-                )
-
-                model_ms = (time.perf_counter() - model_started
-                           ) * 1000.0
-
-            except Exception as error:
-                if self.run_stats is not None:
-                    self.run_stats.record_failure()
-
-                if self.jsonl_logger is not None:
-                    try:
-                        self.jsonl_logger.log_error(
-                            window_id=window_id,
-                            error=error,
-                        )
-                    except Exception as logger_error:
-                        raise error from logger_error
-
-                raise
             probability_tensor = (
                 output.probabilities
                 .detach()
@@ -273,9 +275,10 @@ class SlidingWindowDecoder:
             if probability_tensor.ndim == 2:
                 if probability_tensor.shape[0] != 1:
                     raise RuntimeError(
-                        "SlidingWindowDecoder expects one "
-                        "window per prediction, got "
-                        f"batch={probability_tensor.shape[0]}."
+                        "SlidingWindowDecoder expects "
+                        "one prediction window, but got "
+                        f"batch_size="
+                        f"{probability_tensor.shape[0]}."
                     )
 
                 probability_tensor = (
@@ -284,8 +287,8 @@ class SlidingWindowDecoder:
 
             if probability_tensor.ndim != 1:
                 raise RuntimeError(
-                    "Expected one-dimensional class "
-                    "probabilities, got "
+                    "Expected class probabilities "
+                    "with shape [classes], got "
                     f"{tuple(probability_tensor.shape)}."
                 )
 
@@ -298,16 +301,28 @@ class SlidingWindowDecoder:
                 )
             )
 
+            if probabilities.shape[0] != len(
+                self.class_names
+            ):
+                raise RuntimeError(
+                    "Probability count does not match "
+                    "class_names: "
+                    f"probabilities="
+                    f"{probabilities.shape[0]}, "
+                    f"classes="
+                    f"{len(self.class_names)}."
+                )
+
             class_id = int(
                 output.predicted_class
             )
 
             if not 0 <= class_id < len(
-                    self.class_names
+                self.class_names
             ):
                 raise RuntimeError(
-                    f"Predicted class {class_id} is outside "
-                    f"class_names range."
+                    f"Predicted class {class_id} "
+                    "is outside class_names range."
                 )
 
             confidence = float(
@@ -324,41 +339,62 @@ class SlidingWindowDecoder:
                 self.confidence_threshold,
                 self.command_map,
             )
-            model_ms = (time.perf_counter() - model_started) * 1000.0
+
+            total_ms = (
+                time.perf_counter()
+                - total_started
+            ) * 1000.0
+
+            result = DecodeResult(
+                prediction=prediction,
+                confidence=confidence,
+                latency_ms=total_ms,
+                command=command,
+                class_id=class_id,
+                probabilities=probabilities.tolist(),
+                trial_id=trial_id,
+                expected_class_id=(
+                    expected_class_id
+                ),
+                preprocessing_latency_ms=(
+                    preprocessing_ms
+                ),
+                model_latency_ms=model_ms,
+                total_latency_ms=total_ms,
+            )
+
         except Exception as error:
             if self.run_stats is not None:
                 self.run_stats.record_failure()
+
             if self.jsonl_logger is not None:
                 try:
-                    self.jsonl_logger.log_error(window_id=window_id, error=error)
+                    self.jsonl_logger.log_error(
+                        window_id=window_id,
+                        error=error,
+                    )
                 except Exception as logger_error:
                     raise error from logger_error
-            raise
-        class_id = int(np.argmax(probabilities))
-        confidence = float(probabilities[class_id])
-        prediction = self.class_names[class_id]
-        command = command_for_prediction(prediction, confidence, self.confidence_threshold, self.command_map)
-        total_ms = (time.perf_counter()- total_started) * 1000.0
 
-        result = DecodeResult(
-            prediction=prediction,
-            confidence=confidence,
-            latency_ms=total_ms,
-            command=command,
-            class_id=class_id,
-            probabilities=probabilities.tolist(),
-            trial_id=trial_id,
-            expected_class_id=expected_class_id,
-            preprocessing_latency_ms=preprocessing_ms,
-            model_latency_ms=model_ms,
-            total_latency_ms=total_ms,
-        )
+            raise
+
         if self.run_stats is not None:
             self.run_stats.record_success(
-                LatencyBreakdown(preprocessing_ms, model_ms, total_ms)
+                LatencyBreakdown(
+                    preprocessing_ms=(
+                        preprocessing_ms
+                    ),
+                    model_ms=model_ms,
+                    total_ms=total_ms,
+                )
             )
+
         if self.jsonl_logger is not None:
-            self.jsonl_logger.log_success(window_id=window_id, result=result)
+            self.jsonl_logger.log_success(
+                window_id=window_id,
+                result=result,
+            )
+
         return result
 
     def run(

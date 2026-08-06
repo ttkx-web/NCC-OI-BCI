@@ -1,25 +1,45 @@
-from bci_dayloop.preprocessing.base import (
-    ModelInputTransform,
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from bci_dayloop.models.model_50m.config import Model50MConfig
+from bci_dayloop.models.model_50m.preprocessing import (
+    Model50MPreprocessor,
 )
+from bci_dayloop.preprocessing.base import ModelInputTransform
 from bci_dayloop.runtime.types import (
     CanonicalEEGWindow,
     InputContract,
     PreparedModelInput,
 )
 
+
 class Model50MInputTransform(ModelInputTransform):
-    def __init__(self, config: dict) -> None:
+    """
+    将 CanonicalEEGWindow 转换为 50M 模型输入。
+
+    复用现有 Model50MPreprocessor，避免新旧 Runtime、
+    训练脚本和 Replay 使用不同的预处理实现。
+    """
+
+    def __init__(self, config: Model50MConfig) -> None:
         self.config = config
+        self.preprocessor = Model50MPreprocessor(config)
+
         self._contract = InputContract(
-            channel_names=tuple(config["channel_names"]),
-            sample_rate=float(config["sample_rate"]),
-            window_sec=float(config["window_sec"]),
-            num_samples=int(config["num_samples"]),
-            input_unit=config["input_unit"],
-            tensor_layout=config.get("tensor_layout", "BCT"),
-            strict_window_duration=config.get(
-                "strict_window_duration",
-                True,
+            channel_names=tuple(config.standard_channels),
+            sample_rate=float(config.target_sample_rate),
+            window_sec=float(config.window_seconds),
+            num_samples=int(config.target_num_points),
+            input_unit="uV",
+            tensor_layout="BCT",
+            strict_window_duration=bool(
+                config.strict_window_duration
+            ),
+            model_input_keys=(
+                "signal",
+                "channel_valid_mask",
             ),
         )
 
@@ -31,39 +51,100 @@ class Model50MInputTransform(ModelInputTransform):
         self,
         window: CanonicalEEGWindow,
     ) -> PreparedModelInput:
+        """
+        输入：
+            window.data: [source_channels, source_time]
+
+        输出：
+            signal: [1, 64, target_time]
+            channel_valid_mask: [1, 64]
+        """
+
+        result = self.preprocessor(
+            signal=window.data,
+            channel_names=window.channel_names,
+            original_sample_rate=window.sample_rate,
+            input_unit=window.unit,
+        )
+
+        signal = torch.from_numpy(
+            np.ascontiguousarray(
+                result.signal,
+                dtype=np.float32,
+            )
+        ).unsqueeze(0)
+
+        channel_valid_mask = torch.from_numpy(
+            np.ascontiguousarray(
+                result.channel_valid_mask,
+                dtype=np.float32,
+            )
+        ).unsqueeze(0)
+
         trace = list(window.processing_history)
-        data = window.data
+        trace.append("50m:convert_to_microvolts")
+        trace.append("50m:align_to_standard_channels")
 
-        # 下面不要凭空重新设计。
-        # 把当前 50MModelAdapter 中已经验证过的预处理顺序原样迁移过来。
+        if self.config.reference_mode == "average":
+            trace.append("50m:average_reference")
 
-        data = self._resample_if_needed(data, window.sample_rate)
+        if self.config.filter_enabled:
+            trace.append(
+                "50m:bandpass_filter:"
+                f"{self.config.filter_low_hz}-"
+                f"{self.config.filter_high_hz}Hz"
+            )
+
         trace.append(
-            f"resample:{window.sample_rate}->{self._contract.sample_rate}"
+            "50m:resample:"
+            f"{window.sample_rate}->"
+            f"{self.config.target_sample_rate}Hz"
         )
 
-        data = self._select_and_reorder_channels(
-            data=data,
-            source_names=window.channel_names,
-            target_names=list(self._contract.channel_names),
-        )
-        trace.append("select_and_reorder_50m_channels")
-
-        data = self._validate_or_crop_window(data)
         trace.append(
-            f"validate_window:{self._contract.num_samples}_samples"
+            "50m:fix_window_length:"
+            f"{self.config.target_num_points}"
         )
 
-        data = self._apply_training_normalization(data)
-        trace.append("apply_50m_training_normalization")
+        if self.config.zscore_enabled:
+            trace.append("50m:channelwise_zscore")
 
-        tensor = self._to_tensor(data)
-        trace.append(
-            f"to_tensor:{self._contract.tensor_layout}"
-        )
+        trace.append("50m:add_batch_dimension")
 
         return PreparedModelInput(
-            tensor=tensor,
+            model_input={
+                "signal": signal,
+                "channel_valid_mask": channel_valid_mask,
+            },
             canonical_window=window,
             preprocessing_trace=trace,
+            diagnostics={
+                "original_channel_names": (
+                    result.original_channel_names
+                ),
+                "canonical_channel_names": (
+                    result.canonical_channel_names
+                ),
+                "unknown_channel_names": (
+                    result.unknown_channel_names
+                ),
+                "original_sample_rate": (
+                    result.original_sample_rate
+                ),
+                "target_sample_rate": (
+                    result.target_sample_rate
+                ),
+                "mapped_channel_count": (
+                    result.mapped_channel_count
+                ),
+                "missing_channel_count": (
+                    result.missing_channel_count
+                ),
+                "duplicate_channel_count": (
+                    result.duplicate_channel_count
+                ),
+                "padded_points": result.padded_points,
+                "cropped_points": result.cropped_points,
+                "notes": result.notes,
+            },
         )

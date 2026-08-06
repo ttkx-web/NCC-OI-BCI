@@ -11,7 +11,6 @@ import torch
 ArrayLayout = Literal["CT", "TC"]
 TensorLayout = Literal["BCT", "BTC", "BCTP"]
 
-ModelTensor = torch.Tensor | dict[str, torch.Tensor]
 
 ModelTensor: TypeAlias = (
     torch.Tensor

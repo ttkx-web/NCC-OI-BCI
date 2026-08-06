@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+from bci_dayloop.realtime.contracts import EventMarker
 from bci_dayloop.realtime.neuracle_jellyfish import NeuracleSourceError
 from scripts.probe_neuracle_realtime import main
 
@@ -159,7 +161,107 @@ def test_duration_probe_closes_after_streaming_without_waveform_output(
         "last_error_present": False,
     }
     assert summary["waveforms_saved"] is False
+    assert summary["trigger_events"] == []
     assert not list(tmp_path.glob("*.npy"))
+
+
+def test_duration_probe_records_trigger_code_and_raw_timestamp_in_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class TriggerSource(FakeProbeSource):
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.events = [
+                EventMarker(
+                    timestamp=1.0,
+                    event_type="trigger",
+                    code=10,
+                    metadata={
+                        "raw_device_timestamp": 1000,
+                        "received_at": 42.0,
+                        "module_name": "must-not-leak",
+                        "serial_number": "must-not-leak",
+                    },
+                ),
+                EventMarker(
+                    timestamp=1.2,
+                    event_type="trigger",
+                    code="S 20",
+                    metadata={"raw_device_timestamp": 1200, "ip": "must-not-leak"},
+                ),
+            ]
+            self.emitted_chunk = False
+
+        def read_chunk(self) -> object | None:
+            self.read_called = True
+            self.state = "streaming"
+            if self.emitted_chunk:
+                return None
+            self.emitted_chunk = True
+            return SimpleNamespace(
+                samples=SimpleNamespace(shape=(2, 1)),
+                metadata={"raw_start_timestamp": 1000, "raw_timestamp_length": 1},
+            )
+
+        def read_event(self) -> EventMarker | None:
+            return self.events.pop(0) if self.events else None
+
+    monkeypatch.setattr("scripts.probe_neuracle_realtime.NeuracleJellyFishSource", TriggerSource)
+    result = main(["--duration-sec", "0.01", "--output-dir", str(tmp_path)])
+    summary = json.loads((tmp_path / "probe_summary.json").read_text(encoding="utf-8"))
+
+    assert result == 0
+    assert summary["trigger_count"] == 2
+    assert summary["trigger_events"] == [
+        {"code": 10, "raw_timestamp": 1000},
+        {"code": "S 20", "raw_timestamp": 1200},
+    ]
+    encoded = json.dumps(summary)
+    assert "received_at" not in encoded
+    assert "serial_number" not in encoded
+    assert "must-not-leak" not in encoded
+
+
+def test_duration_probe_caps_trigger_event_summaries_at_64(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ManyTriggerSource(FakeProbeSource):
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.events = [
+                EventMarker(
+                    timestamp=float(index),
+                    event_type="trigger",
+                    code=index,
+                    metadata={"raw_device_timestamp": 1000 + index},
+                )
+                for index in range(70)
+            ]
+            self.emitted_chunk = False
+
+        def read_chunk(self) -> object | None:
+            self.read_called = True
+            self.state = "streaming"
+            if self.emitted_chunk:
+                return None
+            self.emitted_chunk = True
+            return SimpleNamespace(
+                samples=SimpleNamespace(shape=(2, 1)),
+                metadata={"raw_start_timestamp": 1000, "raw_timestamp_length": 1},
+            )
+
+        def read_event(self) -> EventMarker | None:
+            return self.events.pop(0) if self.events else None
+
+    monkeypatch.setattr("scripts.probe_neuracle_realtime.NeuracleJellyFishSource", ManyTriggerSource)
+    result = main(["--duration-sec", "0.01", "--output-dir", str(tmp_path)])
+    summary = json.loads((tmp_path / "probe_summary.json").read_text(encoding="utf-8"))
+
+    assert result == 0
+    assert summary["trigger_count"] == 70
+    assert len(summary["trigger_events"]) == 64
+    assert summary["trigger_events"][0] == {"code": 0, "raw_timestamp": 1000}
+    assert summary["trigger_events"][-1] == {"code": 63, "raw_timestamp": 1063}
 
 
 def test_ctrl_c_path_disconnects_before_writing_summary(

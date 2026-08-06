@@ -78,6 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "raw_timestamp_range": None,
         "timestamp_continuity": {"gaps": 0, "duplicate": 0, "out_of_order": 0},
         "trigger_count": 0,
+        "trigger_events": [],
         "reconnect_count": 0,
         "unit_status": {"raw_unit": "unknown", "unit_evidence_level": "realtime_unverified", "model_safe": False},
         "waveforms_saved": False,
@@ -122,8 +123,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         int(chunk.metadata["raw_start_timestamp"]) + int(chunk.metadata["raw_timestamp_length"]),
                     ]
                 )
-                while source.read_event() is not None:
+                event = source.read_event()
+                while event is not None:
                     summary["trigger_count"] = int(summary["trigger_count"]) + 1
+                    trigger_events = summary["trigger_events"]
+                    assert isinstance(trigger_events, list)
+                    if len(trigger_events) < 64:
+                        trigger_events.append(
+                            {
+                                "code": event.code,
+                                "raw_timestamp": event.metadata.get("raw_device_timestamp"),
+                            }
+                        )
+                    event = source.read_event()
             if timestamps:
                 summary["raw_timestamp_range"] = [min(timestamps), max(timestamps)]
     except KeyboardInterrupt:

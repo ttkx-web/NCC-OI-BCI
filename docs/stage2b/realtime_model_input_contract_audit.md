@@ -63,8 +63,12 @@ Comparison-only alias and case reporting uses the existing `CHANNEL_ALIASES`; it
 ### Blocked
 
 - The current 59-channel/1000 Hz/[59,4000] `RealtimeWindow` is **not model-input safe**.
-- The current window assembler does not persist `channel_types`, `channel_units`, `unit_evidence_level`, or `model_safe` into generated `RealtimeWindow.metadata`; the gate therefore also rejects an assembled live window until provenance propagation is explicitly designed and tested.
 - No preprocessing or model call is authorized until the 59-to-target mapping, channel baseline, 1000-to-100 Hz resampling contract, reference, filters, normalization, and checkpoint-specific four-second compatibility are resolved and independently validated.
+
+### Resolved since this audit
+
+- `FixedSlidingWindowGenerator` now preserves validated `channel_types`, `channel_units`, `unit_evidence_level`, `model_safe`, source sampling/unit provenance, and the Pipeline-assigned continuous segment identifier in every emitted `RealtimeWindow.metadata`.
+- A window fails closed when any composing chunk has missing or length-mismatched provenance, `model_safe=false`, or provenance differing from the other chunks. No sample, timestamp, channel ordering, or marker is changed by this propagation.
 
 ## Evidence classification
 

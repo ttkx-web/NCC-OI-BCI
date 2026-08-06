@@ -7,7 +7,24 @@ from bci_dayloop.realtime.contracts import EEGChunk, EventMarker
 from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline, RealtimePipelineError
 
 
-def _chunk(sequence_id: int, start: int, sample_count: int, *, model_safe: bool = True, unit: str = "uV") -> EEGChunk:
+def _chunk(
+    sequence_id: int,
+    start: int,
+    sample_count: int,
+    *,
+    model_safe: bool = True,
+    unit: str = "uV",
+    metadata_overrides: dict[str, object] | None = None,
+) -> EEGChunk:
+    metadata = {
+        "channel_types": ("EEG", "eeg"),
+        "channel_units": (EEG_UNIT, EEG_UNIT),
+        "unit_evidence_level": VENDOR_CONFIRMED,
+        "model_safe": model_safe,
+        "raw_start_timestamp": start,
+    }
+    if metadata_overrides is not None:
+        metadata.update(metadata_overrides)
     return EEGChunk(
         samples=np.vstack(
             (
@@ -22,13 +39,7 @@ def _chunk(sequence_id: int, start: int, sample_count: int, *, model_safe: bool 
         sequence_id=sequence_id,
         device_id=None,
         received_at=float(start) / 1000.0,
-        metadata={
-            "channel_types": ("EEG", "eeg"),
-            "channel_units": (EEG_UNIT, EEG_UNIT),
-            "unit_evidence_level": VENDOR_CONFIRMED,
-            "model_safe": model_safe,
-            "raw_start_timestamp": start,
-        },
+        metadata=metadata,
     )
 
 
@@ -66,6 +77,11 @@ def test_packet_partitioning_preserves_fixed_window_and_step_contract() -> None:
         assert [window.end_sample_index for window in windows] == [4000, 4500]
         assert np.all(np.diff(windows[0].timestamps) > 0)
         np.testing.assert_array_equal(windows[0].samples[0], np.arange(4000, dtype=np.float32))
+        assert windows[0].metadata["channel_types"] == ("EEG", "eeg")
+        assert windows[0].metadata["channel_units"] == (EEG_UNIT, EEG_UNIT)
+        assert windows[0].metadata["unit_evidence_level"] == VENDOR_CONFIRMED
+        assert windows[0].metadata["model_safe"] is True
+        assert windows[0].metadata["continuous_segment_id"] == 1
     assert whole.emitted_windows == partitioned.emitted_windows == 2
 
 
@@ -117,6 +133,22 @@ def test_duplicate_timestamps_and_overflow_are_explicit() -> None:
     with pytest.raises(BufferOverflowError):
         overflowing.process(_chunk(1, 3500, 1000))
     assert overflowing.buffer_overflow_count == 1
+
+
+@pytest.mark.parametrize(
+    ("metadata_overrides", "expected_reason"),
+    [
+        ({"channel_types": ("eeg", "EEG")}, "provenance changed"),
+        ({"channel_units": (EEG_UNIT, "unknown")}, "non-uV"),
+        ({"unit_evidence_level": "unknown"}, "vendor-confirmed"),
+    ],
+)
+def test_pipeline_rejects_changed_provenance_before_buffering(metadata_overrides, expected_reason) -> None:
+    pipeline = RealtimeEEGWindowPipeline()
+    pipeline.process(_chunk(0, 0, 10))
+
+    with pytest.raises(RealtimePipelineError, match=expected_reason):
+        pipeline.process(_chunk(1, 10, 10, metadata_overrides=metadata_overrides))
 
 
 def test_marker_boundaries_order_and_overlap_follow_half_open_windows() -> None:

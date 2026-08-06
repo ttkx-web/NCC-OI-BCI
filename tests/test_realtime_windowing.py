@@ -27,6 +27,12 @@ def _chunk(sequence_id: int, start_sample: int, *, timestamp_start: float | None
         sequence_id=sequence_id,
         device_id="device-for-hash-only",
         received_at=float(timestamps[-1]),
+        metadata={
+            "channel_types": ("eeg", "eeg"),
+            "channel_units": ("uV", "uV"),
+            "unit_evidence_level": "vendor_confirmed",
+            "model_safe": True,
+        },
     )
 
 

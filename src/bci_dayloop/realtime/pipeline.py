@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from .buffer import BufferOverflowError, TimestampedRingBuffer
 from .channel_units import EEG_UNIT, VENDOR_CONFIRMED, normalize_channel_type
 from .contracts import EEGChunk, EventMarker, WindowResult
-from .windowing import FixedSlidingWindowGenerator
+from .windowing import FixedSlidingWindowGenerator, WindowProvenance, chunk_window_provenance
 
 
 class RealtimePipelineError(ValueError):
@@ -39,6 +39,7 @@ class RealtimeEEGWindowPipeline:
         self.buffer_overflow_count = 0
         self.buffer_peak_samples = 0
         self._last_timestamp: float | None = None
+        self._segment_provenance: WindowProvenance | None = None
         self._marker_keys: set[tuple[object, ...]] = set()
         self.unique_trigger_count = 0
         self.marker_window_association_count = 0
@@ -76,9 +77,13 @@ class RealtimeEEGWindowPipeline:
         """Accept one verified EEG chunk and any same-device-clock markers."""
         try:
             _validate_eeg_chunk(chunk, expected_sampling_rate=self.sampling_rate)
+            provenance = chunk_window_provenance(chunk)
         except RealtimePipelineError as exc:
             self.last_failure_reason = str(exc)
             raise
+        except ValueError as exc:
+            self.last_failure_reason = str(exc)
+            raise RealtimePipelineError(str(exc)) from exc
         if self._last_timestamp is not None:
             expected = self._last_timestamp + (1.0 / self.sampling_rate)
             first = float(chunk.timestamps[0])
@@ -91,6 +96,12 @@ class RealtimeEEGWindowPipeline:
                 self.contiguous_segment_count += 1
         if self.contiguous_segment_count == 0:
             self.contiguous_segment_count = 1
+        if self._segment_provenance is None:
+            self._segment_provenance = provenance
+        elif self._segment_provenance != provenance:
+            self.last_failure_reason = "chunk provenance changed within one continuous segment"
+            raise RealtimePipelineError(self.last_failure_reason)
+        self._windowing.set_continuous_segment_id(self.contiguous_segment_count)
         self._add_markers(markers)
         try:
             accepted = self._buffer.append(chunk)
@@ -127,6 +138,7 @@ class RealtimeEEGWindowPipeline:
         self.buffer_overflow_count = 0
         self.buffer_peak_samples = 0
         self._last_timestamp = None
+        self._segment_provenance = None
         self._marker_keys.clear()
         self.unique_trigger_count = 0
         self.marker_window_association_count = 0
@@ -138,6 +150,7 @@ class RealtimeEEGWindowPipeline:
 
     def _new_segment(self) -> None:
         self._buffer = TimestampedRingBuffer(self.capacity_samples)
+        self._segment_provenance = None
         if hasattr(self, "_windowing"):
             self._windowing.reset_for_buffer(self._buffer)
         else:

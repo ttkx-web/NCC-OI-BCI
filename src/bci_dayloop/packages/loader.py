@@ -25,6 +25,22 @@ from bci_dayloop.preprocessing.model_50m import (
 from bci_dayloop.runtime.model import RuntimeModel
 from bci_dayloop.utils.config import load_yaml
 
+import torch
+from torch import nn
+
+from bci_dayloop.data.preprocessing import (
+    PreprocessingConfig,
+)
+from bci_dayloop.models.labram_backend import (
+    LaBraMBackend,
+)
+from bci_dayloop.models.labram_linear import (
+    LaBraMLinearAdapter,
+)
+from bci_dayloop.preprocessing.labram import (
+    LaBraMInputTransform,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LoadedRuntimePackage:
@@ -225,6 +241,325 @@ def _validate_runtime_contract(
             "Input contract model_input_keys mismatch."
         )
 
+def _load_labram_package(
+    *,
+    package_path: Path,
+    package_payload: dict[str, Any],
+    device: str,
+    verify_hashes: bool,
+) -> LoadedRuntimePackage:
+    package_yaml = package_path / "package.yaml"
+
+    model = _required_mapping(
+        package_payload,
+        "model",
+        source=package_yaml,
+    )
+
+    files = _required_mapping(
+        package_payload,
+        "files",
+        source=package_yaml,
+    )
+
+    contract = _required_mapping(
+        package_payload,
+        "input_contract",
+        source=package_yaml,
+    )
+
+    runtime_config = _required_mapping(
+        package_payload,
+        "runtime",
+        source=package_yaml,
+    )
+
+    package_metadata = _required_mapping(
+        package_payload,
+        "package",
+        source=package_yaml,
+    )
+
+    backbone_path = _resolve_package_file(
+        package_path,
+        str(files["backbone"]),
+        logical_name="backbone",
+    )
+
+    classifier_path = _resolve_package_file(
+        package_path,
+        str(files["classifier"]),
+        logical_name="classifier",
+    )
+
+    preprocessing_path = _resolve_package_file(
+        package_path,
+        str(files["preprocessing"]),
+        logical_name="preprocessing config",
+    )
+
+    metrics_path = _resolve_package_file(
+        package_path,
+        str(files["metrics"]),
+        logical_name="metrics",
+    )
+
+    hashes = files.get("sha256", {})
+
+    if not isinstance(hashes, dict):
+        raise ValueError(
+            "files.sha256 must be a mapping."
+        )
+
+    if verify_hashes:
+        _verify_sha256(
+            path=backbone_path,
+            expected=hashes.get("backbone"),
+            logical_name="backbone",
+        )
+
+        _verify_sha256(
+            path=classifier_path,
+            expected=hashes.get("classifier"),
+            logical_name="classifier",
+        )
+
+    preprocessing = load_yaml(
+        preprocessing_path
+    )
+
+    canonicalizer_config = _required_mapping(
+        preprocessing,
+        "canonicalizer",
+        source=preprocessing_path,
+    )
+
+    transform_config = _required_mapping(
+        preprocessing,
+        "transform",
+        source=preprocessing_path,
+    )
+
+    if transform_config.get("type") != "labram":
+        raise ValueError(
+            "Expected preprocessing transform "
+            f"'labram', got "
+            f"{transform_config.get('type')!r}."
+        )
+
+    bandpass = transform_config.get(
+        "bandpass_hz",
+        [0.1, 75.0],
+    )
+
+    if (
+        not isinstance(bandpass, list)
+        or len(bandpass) != 2
+    ):
+        raise ValueError(
+            "transform.bandpass_hz must contain "
+            "two values."
+        )
+
+    preprocessing_config = (
+        PreprocessingConfig(
+            bandpass_hz=(
+                float(bandpass[0]),
+                float(bandpass[1]),
+            ),
+            notch_hz=float(
+                transform_config.get(
+                    "notch_hz",
+                    50.0,
+                )
+            ),
+            target_sample_rate=float(
+                transform_config[
+                    "target_sample_rate"
+                ]
+            ),
+            output_unit="uV",
+            zscore_epsilon=float(
+                transform_config.get(
+                    "zscore_epsilon",
+                    1e-6,
+                )
+            ),
+            patch_samples=int(
+                transform_config.get(
+                    "patch_samples",
+                    200,
+                )
+            ),
+        )
+    )
+
+    class_names = tuple(
+        str(name)
+        for name in model["class_names"]
+    )
+
+    channel_names = tuple(
+        str(name)
+        for name in contract["channel_names"]
+    )
+
+    num_classes = int(
+        model["num_classes"]
+    )
+
+    n_patches = int(
+        model["n_patches"]
+    )
+
+    adapter = LaBraMLinearAdapter(
+        channel_names=list(
+            channel_names
+        ),
+        n_classes=num_classes,
+        checkpoint=backbone_path,
+        device=device,
+        amp=bool(
+            model.get("amp", True)
+        ),
+        freeze_encoder=bool(
+            model.get(
+                "freeze_encoder",
+                True,
+            )
+        ),
+        embedding_batch_size=int(
+            model.get(
+                "embedding_batch_size",
+                4,
+            )
+        ),
+        random_init=False,
+        n_patches=n_patches,
+    )
+
+    head_payload = torch.load(
+        classifier_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+
+    embedding_dim = int(
+        head_payload["embedding_dim"]
+    )
+
+    if embedding_dim != adapter.embedding_dim:
+        raise ValueError(
+            "LaBraM classifier embedding dimension "
+            "does not match the Encoder: "
+            f"classifier={embedding_dim}, "
+            f"encoder={adapter.embedding_dim}."
+        )
+
+    if int(
+        head_payload["n_classes"]
+    ) != num_classes:
+        raise ValueError(
+            "LaBraM classifier class count mismatch."
+        )
+
+    adapter.head = nn.Linear(
+        embedding_dim,
+        num_classes,
+    ).to(adapter.device)
+
+    adapter.head.load_state_dict(
+        head_payload["state_dict"]
+    )
+
+    adapter.head.eval()
+
+    input_transform = LaBraMInputTransform(
+        channel_names=channel_names,
+        preprocessing_config=(
+            preprocessing_config
+        ),
+        n_patches=n_patches,
+        strict_window_duration=bool(
+            contract.get(
+                "strict_window_duration",
+                True,
+            )
+        ),
+    )
+
+    runtime_model = RuntimeModel(
+        canonicalizer=SignalCanonicalizer(
+            target_unit=str(
+                canonicalizer_config.get(
+                    "target_unit",
+                    "uV",
+                )
+            )
+        ),
+        input_transform=input_transform,
+        backend=LaBraMBackend(adapter),
+    )
+
+    _validate_runtime_contract(
+        runtime_model=runtime_model,
+        contract=contract,
+    )
+
+    command_map = runtime_config.get(
+        "command_map",
+        {},
+    )
+
+    if not isinstance(command_map, dict):
+        raise ValueError(
+            "runtime.command_map must be a mapping."
+        )
+
+    return LoadedRuntimePackage(
+        runtime_model=runtime_model,
+        package_path=package_path,
+        model_type="labram",
+        model_name=str(
+            model.get(
+                "name",
+                "labram-linear",
+            )
+        ),
+        class_names=class_names,
+        command_map={
+            str(key): str(value)
+            for key, value
+            in command_map.items()
+        },
+        step_sec=float(
+            runtime_config.get(
+                "step_sec",
+                0.5,
+            )
+        ),
+        confidence_threshold=float(
+            runtime_config.get(
+                "confidence_threshold",
+                0.55,
+            )
+        ),
+        is_test_head=bool(
+            package_metadata.get(
+                "is_test_head",
+                False,
+            )
+        ),
+        warning_message=(
+            package_metadata.get(
+                "warning_message"
+            )
+        ),
+        metrics=_load_json(
+            metrics_path
+        ),
+        package_metadata=package_payload,
+    )
 
 def _load_50m_package(
     *,
@@ -610,7 +945,15 @@ def load_runtime_package(
             verify_hashes=verify_hashes,
         )
 
+    if model_type == "labram":
+        return _load_labram_package(
+            package_path=package,
+            package_payload=payload,
+            device=device,
+            verify_hashes=verify_hashes,
+        )
+
     raise ValueError(
         f"Unsupported model type {model_type!r}. "
-        "Currently available: model_50m."
+        "Currently available: model_50m, labram."
     )

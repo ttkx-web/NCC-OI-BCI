@@ -113,6 +113,7 @@ def test_meta_preserves_all_forwarded_channels_and_anonymizes_sensitive_fields()
     assert chunk.samples.shape == (70, 4)
     assert chunk.channel_names == tuple(metadata["channel_names"])
     assert chunk.metadata["channel_types"] == tuple(metadata["channel_types"])
+    assert chunk.metadata["channel_units"] == ("uV", "uV", "uV", "code", *["uV"] * 66)
     assert {"EEG", "ECG", "EOG", "Trigger"}.issubset(set(chunk.metadata["channel_types"]))
     assert "person_name" not in chunk.metadata
     assert "serial_number" not in chunk.metadata
@@ -301,8 +302,9 @@ def test_bulk_and_per_module_triggers_become_event_markers_and_unit_is_blocked()
     assert first is not None and first.metadata["source"] == "jellyfish_trigger"
     assert first.metadata["raw_device_timestamp"] == 1008
     assert first.metadata["received_at"] == 10.0
-    assert chunk.unit == "unknown"
-    assert chunk.metadata["unit_evidence_level"] == "realtime_unverified"
+    assert chunk.unit == "mixed"
+    assert chunk.metadata["channel_units"] == ("uV", "uV", "uV", "code")
+    assert chunk.metadata["unit_evidence_level"] == "vendor_confirmed"
     assert chunk.metadata["model_safe"] is False
 
 

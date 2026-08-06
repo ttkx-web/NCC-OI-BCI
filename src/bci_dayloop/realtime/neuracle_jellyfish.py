@@ -14,6 +14,12 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from .contracts import EEGChunk, EventMarker
+from .channel_units import (
+    MIXED_STREAM_UNIT,
+    VENDOR_CONFIRMED,
+    neuracle_channel_units,
+    unit_status_from_metadata,
+)
 
 
 class NeuracleConnectionState(str, Enum):
@@ -50,7 +56,7 @@ class NeuracleJellyFishConfig:
     reconnect_max_backoff_sec: float = 2.0
     expected_sampling_rate: float | None = None
     expected_channel_names: tuple[str, ...] | None = None
-    raw_unit: str = "unknown"
+    raw_unit: str = MIXED_STREAM_UNIT
     vendor_sample_rate: int = 1000
 
     def __post_init__(self) -> None:
@@ -70,8 +76,8 @@ class NeuracleJellyFishConfig:
             not math.isfinite(self.expected_sampling_rate) or self.expected_sampling_rate <= 0
         ):
             raise ValueError("expected_sampling_rate must be positive and finite")
-        if not self.raw_unit.strip():
-            raise ValueError("raw_unit must be explicitly declared")
+        if self.raw_unit != MIXED_STREAM_UNIT:
+            raise ValueError("verified JellyFish raw streams must use unit 'mixed'")
         if isinstance(self.vendor_sample_rate, bool) or self.vendor_sample_rate <= 0:
             raise ValueError("vendor_sample_rate must be a positive integer")
 
@@ -201,6 +207,13 @@ class NeuracleJellyFishSource:
             if self._last_packet_monotonic is None
             else max(0.0, self._monotonic() - self._last_packet_monotonic)
         )
+        unit_status = unit_status_from_metadata(metadata) if metadata else {
+            "stream_unit": MIXED_STREAM_UNIT,
+            "eeg_unit": "unknown",
+            "unit_evidence_level": VENDOR_CONFIRMED,
+            "raw_model_safe": False,
+            "eeg_model_safe": False,
+        }
         return {
             "state": self._state.value,
             "connected": self._backend is not None,
@@ -215,7 +228,11 @@ class NeuracleJellyFishSource:
             "reconnect_count": self._reconnect_count,
             "last_error": self._last_error,
             "last_packet_age_sec": age,
-            "unit_evidence_level": "realtime_unverified",
+            "stream_unit": unit_status["stream_unit"],
+            "eeg_unit": unit_status["eeg_unit"],
+            "unit_evidence_level": unit_status["unit_evidence_level"],
+            "raw_model_safe": unit_status["raw_model_safe"],
+            "eeg_model_safe": unit_status["eeg_model_safe"],
             "model_safe": False,
         }
 
@@ -290,6 +307,7 @@ class NeuracleJellyFishSource:
             "module_type": str(_value(raw, "module_type", "moduleType", default="unknown")),
             "channel_names": channel_names,
             "channel_types": channel_types,
+            "channel_units": neuracle_channel_units(channel_types),
             "sample_rates": sample_rates,
             "sampling_rate": sampling_rate,
             "data_count_per_channel": tuple(
@@ -302,6 +320,8 @@ class NeuracleJellyFishSource:
             "gain": tuple(_required_sequence(raw, "gain")),
             "forwarded_channel_count": count,
             "serial_number_hash": serial_hash,
+            "unit_evidence_level": VENDOR_CONFIRMED,
+            "model_safe": False,
         }
 
     def _packet_to_chunk(self, packet: Mapping[str, object]) -> EEGChunk:
@@ -355,13 +375,14 @@ class NeuracleJellyFishSource:
             samples=samples,
             channel_names=self._metadata["channel_names"],  # type: ignore[arg-type]
             sampling_rate=sampling_rate,
-            unit=self.config.raw_unit,
+            unit=MIXED_STREAM_UNIT,
             timestamps=raw_timestamps / 1000.0,
             sequence_id=sequence_id,
             device_id=None,
             received_at=host_received_at,
             metadata={
                 "channel_types": self._metadata["channel_types"],
+                "channel_units": self._metadata["channel_units"],
                 "module_name": self._metadata["module_name"],
                 "module_type": self._metadata["module_type"],
                 "raw_start_timestamp": raw_start,
@@ -373,7 +394,7 @@ class NeuracleJellyFishSource:
                 "source_packet_start": _value(packet, "source_packet_start", default=packet_key),
                 "source_packet_end": _value(packet, "source_packet_end", default=packet_key),
                 "serial_number_hash": self._metadata["serial_number_hash"],
-                "unit_evidence_level": "realtime_unverified",
+                "unit_evidence_level": VENDOR_CONFIRMED,
                 "model_safe": False,
                 "timestamp_gap": timestamp_gap,
             },

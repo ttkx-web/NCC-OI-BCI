@@ -24,3 +24,10 @@
 - 时间戳是否逐样本提供，还是仅提供 chunk 到达时间？
 - Marker 能否与 EEG 共享同一时间基准？
 - 重连后是否可能重复、乱序或重置 sequence ID？
+
+## 已验证的单位合同边界
+
+仅对已确认的 Neuracle Collect → JellyFish → TCP 实时路径，EEG、EOG、HECG、ECG
+模拟生理通道使用 `uV`；Trigger 使用 `code`。原始混合块必须保持 `mixed`，先经通道级
+单位合同和 EEG-only selector，才可交给后续 TimestampBuffer。该选择结果的 `model_safe`
+不表示已完成预处理、通道映射或模型输入验证。

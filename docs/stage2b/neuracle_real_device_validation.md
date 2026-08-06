@@ -22,8 +22,8 @@ IP 地址、模块名称、设备序列号（含哈希对应关系）、受试�
 
 ## 仍受安全约束的事项
 
-- 实时 TCP float 的物理单位尚未确认，因此保持
-  `raw_unit=unknown`、`unit_evidence_level=realtime_unverified`、
+- 厂商书面确认实时 TCP 生理信号单位为 µV（代码内部 `uV`）；其证据等级为
+  `vendor_confirmed`。原始混合流仍包含 Trigger，故保持 `unit=mixed`、
   `model_safe=false`。
 - TCP Trigger 的实际行为尚未验证。
 - 实时数据被安全阻断，不能进入 Preprocessor 或模型集成。

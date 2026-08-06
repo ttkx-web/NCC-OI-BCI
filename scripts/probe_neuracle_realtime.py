@@ -18,6 +18,11 @@ from bci_dayloop.realtime.neuracle_jellyfish import (
     NeuracleJellyFishSource,
     NeuracleSourceError,
 )
+from bci_dayloop.realtime.channel_units import (
+    MIXED_STREAM_UNIT,
+    UNKNOWN_UNIT,
+    unit_status_from_metadata,
+)
 
 
 _SAFE_MODULE_TYPES = frozenset({"eeg", "neuracle", "jellyfish"})
@@ -80,7 +85,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "trigger_count": 0,
         "trigger_events": [],
         "reconnect_count": 0,
-        "unit_status": {"raw_unit": "unknown", "unit_evidence_level": "realtime_unverified", "model_safe": False},
+        "unit_status": {
+            "stream_unit": MIXED_STREAM_UNIT,
+            "eeg_unit": UNKNOWN_UNIT,
+            "unit_evidence_level": None,
+            "raw_model_safe": False,
+            "eeg_model_safe": False,
+        },
         "waveforms_saved": False,
         "last_error": None,
     }
@@ -107,6 +118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "sample_rates": list(metadata.get("sample_rates", ())),
             }
         )
+        summary["unit_status"] = unit_status_from_metadata(metadata)
         if not args.metadata_only:
             deadline = time.monotonic() + args.duration_sec
             timestamps: list[int] = []
@@ -178,11 +190,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary["reconnect_count"] = pre_disconnect_health["reconnect_count"]
             summary["last_error"] = "present" if pre_disconnect_health["last_error_present"] else None
             summary["final_health"] = final_health
-            summary["unit_status"] = {
-                "raw_unit": source.config.raw_unit,
-                "unit_evidence_level": final_health["unit_evidence_level"],
-                "model_safe": final_health["model_safe"],
-            }
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "probe_summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"

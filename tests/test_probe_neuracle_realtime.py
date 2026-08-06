@@ -23,6 +23,8 @@ class FakeProbeSource:
             "forwarded_channel_count": 2,
             "channel_names": ("C3", "C4"),
             "channel_types": ("EEG", "Trigger"),
+            "channel_units": ("unknown", "code"),
+            "unit_evidence_level": "realtime_unverified",
             "sample_rates": (250.0, 250.0),
         }
         self.state = "ready"
@@ -124,9 +126,11 @@ def test_metadata_only_is_anonymized_and_disconnects(
     assert summary["final_health"]["state"] == "stopped"
     assert summary["final_health"]["connected"] is False
     assert summary["unit_status"] == {
-        "raw_unit": "unknown",
+        "stream_unit": "mixed",
+        "eeg_unit": "unknown",
         "unit_evidence_level": "realtime_unverified",
-        "model_safe": False,
+        "raw_model_safe": False,
+        "eeg_model_safe": False,
     }
     encoded = json.dumps(summary)
     assert "device-serial-123456789" not in encoded
@@ -163,6 +167,32 @@ def test_duration_probe_closes_after_streaming_without_waveform_output(
     assert summary["waveforms_saved"] is False
     assert summary["trigger_events"] == []
     assert not list(tmp_path.glob("*.npy"))
+
+
+def test_probe_reports_verified_eeg_unit_without_marking_raw_stream_model_safe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class VerifiedUnitSource(FakeProbeSource):
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.metadata = {
+                **self.metadata,
+                "channel_units": ("uV", "code"),
+                "unit_evidence_level": "vendor_confirmed",
+            }
+
+    monkeypatch.setattr("scripts.probe_neuracle_realtime.NeuracleJellyFishSource", VerifiedUnitSource)
+    result = main(["--metadata-only", "--output-dir", str(tmp_path)])
+    summary = json.loads((tmp_path / "probe_summary.json").read_text(encoding="utf-8"))
+
+    assert result == 0
+    assert summary["unit_status"] == {
+        "stream_unit": "mixed",
+        "eeg_unit": "uV",
+        "unit_evidence_level": "vendor_confirmed",
+        "raw_model_safe": False,
+        "eeg_model_safe": True,
+    }
 
 
 def test_duration_probe_records_trigger_code_and_raw_timestamp_in_order(

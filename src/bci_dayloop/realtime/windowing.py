@@ -37,8 +37,20 @@ class FixedSlidingWindowGenerator:
         self.failed_windows = 0
 
     def add_events(self, markers: Iterable[EventMarker]) -> None:
-        self._markers.extend(markers)
+        for marker in markers:
+            if marker not in self._markers:
+                self._markers.append(marker)
         self._markers.sort(key=lambda marker: marker.timestamp)
+
+    @property
+    def next_start_sample(self) -> int | None:
+        return self._next_start_sample
+
+    def reset_for_buffer(self, buffer: TimestampedRingBuffer) -> None:
+        """Start a new contiguous segment without reusing old samples or markers."""
+        self.buffer = buffer
+        self._next_start_sample = None
+        self._markers.clear()
 
     def generate(self) -> tuple[WindowResult, ...]:
         """Generate all currently decidable window attempts in stable sample order."""
@@ -80,7 +92,7 @@ class FixedSlidingWindowGenerator:
                     markers=tuple(
                         marker
                         for marker in self._markers
-                        if timestamps[0] <= marker.timestamp <= timestamps[-1]
+                        if timestamps[0] <= marker.timestamp < timestamps[0] + (window_samples / sampling_rate)
                     ),
                 )
             except ValueError as exc:

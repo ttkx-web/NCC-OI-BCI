@@ -1,0 +1,84 @@
+project:
+  seed: 42
+  run_dir: runs/stage1/cbramod
+
+data:
+  dataset: BNCI2014_001
+  subject: 1
+  output_hdf5: data/processed/bnci2014_001/subject_01.h5
+  train_session: 0train
+  test_session: 1test
+  trial_tmin_sec: 2.0
+  trial_tmax_sec: 6.0
+
+model:
+  # 需要在 ModelFactory 中以这个名字注册 package/runtime loader。
+  name: cbramod-frozen-head
+
+  # 官方 CBRaMod 预训练骨干权重。
+  checkpoint: checkpoints/backbones/cbramod/pretrained_weights.pth
+
+  # 由 train_cbramod_population_head.py 产出的最优分类头。
+  classifier: checkpoints/heads/stage1/bnci2014_001/subject_01/cbramod/4s_flatten/head.pt
+
+  device: cpu
+  freeze_encoder: true
+  head_type: official_mlp
+
+model_cbramod:
+  # 官方公开 quick-start 对应的输入形状为 [B, 22, 4, 200]。
+  target_sample_rate: 200.0
+  window_seconds: 4.0
+  n_channels: 22
+  time_segments: 4
+  points_per_patch: 200
+
+  strict_window_duration: true
+  window_tolerance_seconds: 0.02
+  input_unit: uV
+
+  # 以下两项必须通过官方 checkpoint 和数据集实现核验后再改成正式值。
+  # 初版关闭，避免未经确认地复用 50M 的处理参数。
+  filter_enabled: false
+  reference_mode: none
+  normalization: none
+
+  allow_missing_channels: false
+
+  num_classes: 4
+  backbone_output_dim: 200
+
+  # 主协议：冻结骨干 + 官方模板 MLP 分类头。
+  # 它不是 linear probe。
+  head_type: official_mlp
+  head_hidden_dim_1: 800
+  head_hidden_dim_2: 200
+  head_dropout: 0.1
+
+replay:
+  # 仅在 export_cbramod_model_package.py 成功后使用。
+  model_package: model_packages/stage1/bnci2014_001/subject_01/cbramod/4s_flatten/v1
+
+  acquirer: replay
+  session: 1test
+  speed: 1.0
+  loop: false
+
+  # 用于连续流 Runtime 验证和延迟统计，不用于正式 trial 级 bACC。
+  window_sec: 4.0
+  step_sec: 0.5
+  confidence_threshold: 0.55
+  max_windows: 100
+
+  jsonl_log: runs/stage1/bnci2014_001/subject_01/replay/cbramod/4s_flatten/pipeline_windows.jsonl
+  summary_json: runs/stage1/bnci2014_001/subject_01/replay/cbramod/4s_flatten/replay_summary.json
+
+labels:
+  class_names:
+    [left_hand, right_hand, feet, tongue]
+
+  command_map:
+    left_hand: LEFT
+    right_hand: RIGHT
+    feet: FORWARD
+    tongue: STOP

@@ -1365,10 +1365,9 @@ def main() -> None:
     # Train only the linear head.
     # ------------------------------------------------------------------
 
-    optimizer = torch.optim.SGD(
+    optimizer = torch.optim.AdamW(
         classifier.head.parameters(),
         lr=args.head_lr,
-        momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
     criterion = nn.CrossEntropyLoss()
@@ -1386,7 +1385,7 @@ def main() -> None:
 
     training_start = time.perf_counter()
 
-    print("Training population linear head with SGD")
+    print("Training population linear head with AdamW")
     print(
         f"epochs={args.epochs}, lr={args.head_lr}, "
         f"momentum={args.momentum}, "
@@ -1628,7 +1627,7 @@ def main() -> None:
             "preprocessing_hash": preprocessing_hash,
             "freeze_backbone": True,
             "trainable_backbone_parameters": 0,
-            "optimizer": "SGD",
+            "optimizer": "AdamW",
             "head_lr": float(args.head_lr),
             "momentum": float(args.momentum),
             "weight_decay": float(args.weight_decay),
@@ -1754,7 +1753,7 @@ def main() -> None:
             "preprocessing_hash": preprocessing_hash,
         },
         "training": {
-            "optimizer": "SGD",
+            "optimizer": "AdamW",
             "epochs_requested": args.epochs,
             "epochs_completed": len(epoch_rows),
             "training_seconds": training_seconds,

@@ -1000,7 +1000,7 @@ def main() -> None:
         preprocessing_config
     )
 
-    run_config = {
+    run_config   = {
         "status": "started",
         "created_at": (
             datetime.now().isoformat()

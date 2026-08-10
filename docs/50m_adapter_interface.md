@@ -1,7 +1,7 @@
 ### 模型构建
 ```
 config = Model50MConfig(
-    checkpoint_path="checkpoints/50m/model_deploy.pt",
+    checkpoint_path="checkpoints/backbones/50m/model_deploy.pt",
     classifier_path="checkpoints/50m/test_linear_head.pt",
     device="cpu",
 )

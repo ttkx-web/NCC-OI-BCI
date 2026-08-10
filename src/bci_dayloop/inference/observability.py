@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -143,10 +144,82 @@ def _json_value(value: Any) -> Any:
 
 
 class JsonlWindowLogger:
-    """Append one UTF-8 JSON object per completed or failed decoder window."""
-
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        trace_mode: str = "on_change",
+    ) -> None:
         self.path = Path(path)
+
+        if trace_mode not in {
+            "never",
+            "first",
+            "always",
+            "on_change",
+        }:
+            raise ValueError(
+                f"Unsupported trace_mode: "
+                f"{trace_mode!r}."
+            )
+
+        self.trace_mode = trace_mode
+        self._last_trace_id: str | None = None
+        self._trace_written = False
+
+    def _build_trace_payload(
+            self,
+            result: Any,
+    ) -> dict[str, Any]:
+        trace_content = {
+            "steps": list(
+                result.preprocessing_trace
+            ),
+            "diagnostics": dict(
+                result.preprocessing_diagnostics
+            ),
+        }
+
+        serialized = json.dumps(
+            _json_value(trace_content),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        trace_id = hashlib.sha256(
+            serialized.encode("utf-8")
+        ).hexdigest()[:16]
+
+        include_full = False
+
+        if self.trace_mode == "always":
+            include_full = True
+        elif self.trace_mode == "first":
+            include_full = not self._trace_written
+        elif self.trace_mode == "on_change":
+            include_full = (
+                    trace_id != self._last_trace_id
+            )
+
+        self._last_trace_id = trace_id
+
+        if include_full:
+            self._trace_written = True
+
+        payload: dict[str, Any] = {
+            "preprocessing_trace_id": trace_id,
+        }
+
+        if include_full:
+            payload[
+                "preprocessing_trace"
+            ] = trace_content["steps"]
+
+            payload[
+                "preprocessing_diagnostics"
+            ] = trace_content["diagnostics"]
+
+        return payload
 
     def _write(self, record: Mapping[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,23 +232,54 @@ class JsonlWindowLogger:
     def _timestamp() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def log_success(self, *, window_id: int, result: Any) -> None:
-        self._write(
-            {
-                "timestamp": self._timestamp(),
-                "status": "success",
-                "window_id": window_id,
-                "trial_id": result.trial_id,
-                "expected_class_id": result.expected_class_id,
-                "prediction": result.prediction,
-                "confidence": result.confidence,
-                "probabilities": result.probabilities,
-                "command": result.command,
-                "preprocessing_latency_ms": result.preprocessing_latency_ms,
-                "model_latency_ms": result.model_latency_ms,
-                "total_latency_ms": result.total_latency_ms,
-            }
+    def log_success(
+            self,
+            *,
+            window_id: int,
+            result: Any,
+    ) -> None:
+        record = {
+            "timestamp": self._timestamp(),
+            "status": "success",
+            "window_id": window_id,
+            "trial_id": result.trial_id,
+            "expected_class_id": (
+                result.expected_class_id
+            ),
+            "prediction": result.prediction,
+            "confidence": result.confidence,
+            "probabilities": (
+                result.probabilities
+            ),
+            "command": result.command,
+            "preprocessing_latency_ms": (
+                result.preprocessing_latency_ms
+            ),
+            "model_latency_ms": (
+                result.model_latency_ms
+            ),
+            "total_latency_ms": (
+                result.total_latency_ms
+            ),
+            "model_diagnostics": (
+                result.model_diagnostics
+            ),
+            "model_revision": (
+                result.model_revision
+            ),
+            "online_update_step": (
+                result.online_update_step
+            ),
+            "online_update_applied": (
+                result.online_update_applied
+            ),
+        }
+
+        record.update(
+            self._build_trace_payload(result)
         )
+
+        self._write(record)
 
     def log_error(self, *, window_id: int, error: Exception) -> None:
         self._write(

@@ -112,6 +112,10 @@ class Model50MConfig:
     mlp_ratio: float = 4.0
     dropout: float = 0.1
 
+    # 预训练 checkpoint 使用 10 个时间位置。
+    # 4 秒下游输入只使用位置 0、1、2、3，但模型结构仍保留 10 个。
+    model_n_time_patches: int = 10
+
     # 当前 finetune 仓库的默认 probe_layer_ratio=0.75，
     # depth=12 时对应 0-based index 8。
     output_layer_idx: int = 8
@@ -122,6 +126,18 @@ class Model50MConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint_path", Path(self.checkpoint_path))
+
+        if self.model_n_time_patches <= 0:
+            raise ValueError(
+                "model_n_time_patches must be positive."
+            )
+
+        if self.model_n_time_patches < self.num_time_patches:
+            raise ValueError(
+                "model_n_time_patches cannot be smaller than the number "
+                "of input time patches: "
+                f"{self.model_n_time_patches} < {self.num_time_patches}."
+            )
 
         if self.classifier_path is not None:
             object.__setattr__(

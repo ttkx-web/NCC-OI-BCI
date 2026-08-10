@@ -1,0 +1,53 @@
+project:
+  seed: 42
+  run_dir: runs/stage1_4s
+
+data:
+  dataset: BNCI2014_001
+  subject: 1
+  output_hdf5: data/processed/bnci2014_001/subject_01.h5
+  train_session: 0train
+  test_session: 1test
+  trial_tmin_sec: 2.0
+  trial_tmax_sec: 6.0
+
+model:
+  name: 50m-linear
+  checkpoint: checkpoints/backbones/50m/model_deploy.pt
+  classifier: checkpoints/heads/stage1/bnci2014_001/subject_01/personal/4s_flatten/trials_20/seed_42/head.pt
+  device: cpu
+  freeze_encoder: true
+
+model_50m:
+  target_sample_rate: 100.0
+  window_seconds: 4.0
+  model_n_time_patches: 10
+  patch_seconds: 1.0
+  patch_stride_seconds: 1.0
+  output_layer_idx: 8
+  aggregation: flatten
+  reference_mode: none
+  filter_hz: [0.1, 75.0]
+
+replay:
+  model_package: model_packages/stage1/bnci2014_001/subject_01/personal/4s_flatten/trials_20/seed_42/v1
+  acquirer: replay
+  session: 1test
+  speed: 1.0
+  loop: false
+  window_sec: 4.0
+  step_sec: 0.5
+  confidence_threshold: 0.55
+  max_windows: 100
+  jsonl_log: runs/stage1/bnci2014_001/subject_01/replay/personal/4s_flatten/trials_20/seed_42/pipeline_windows.jsonl
+  summary_json: runs/stage1/bnci2014_001/subject_01/replay/personal/4s_flatten/trials_20/seed_42/replay_summary.json
+
+labels:
+  class_names:
+    [left_hand, right_hand, feet, tongue]
+
+  command_map:
+    left_hand: LEFT
+    right_hand: RIGHT
+    feet: FORWARD
+    tongue: STOP

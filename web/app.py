@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -23,9 +25,10 @@ from bci_dayloop.inference.observability import (  # noqa: E402
 )
 from bci_dayloop.inference.realtime import SlidingWindowDecoder  # noqa: E402
 from bci_dayloop.inference.runtime_control import PipelineController, PipelineState  # noqa: E402
-from bci_dayloop.models.factory import ModelFactory  # noqa: E402
-from bci_dayloop.models.runtime_package import validate_runtime_request  # noqa: E402
 from bci_dayloop.utils.config import load_yaml  # noqa: E402
+from bci_dayloop.packages.loader import (
+    load_runtime_package,
+)
 from web.ui_runtime import (  # noqa: E402
     UiEventQueue,
     apply_events,
@@ -48,13 +51,130 @@ def describe_session(path: str, session: str) -> tuple[int, int]:
     trials = EEGHDF5(path).load(session)["data"]
     return int(trials.shape[0]), int(trials.shape[-1])
 
+@st.cache_data(max_entries=32)
+def describe_package(
+    path: str,
+) -> dict[str, object]:
+    package_path = (
+        Path(path).expanduser().resolve()
+    )
+
+    payload = load_yaml(
+        package_path / "package.yaml"
+    )
+
+    if int(payload.get("schema_version", -1)) != 2:
+        raise ValueError(
+            "Only Runtime Package schema version 2 "
+            "is supported."
+        )
+
+    model = payload.get("model")
+    input_contract = payload.get(
+        "input_contract"
+    )
+    runtime = payload.get("runtime")
+    package = payload.get("package")
+
+    for name, value in (
+        ("model", model),
+        ("input_contract", input_contract),
+        ("runtime", runtime),
+        ("package", package),
+    ):
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"package.yaml field {name!r} "
+                "must be a mapping."
+            )
+
+    return {
+        "model_name": str(
+            model.get("name", "unknown")
+        ),
+        "model_type": str(
+            model.get("type", "unknown")
+        ),
+        "class_names": tuple(
+            str(name)
+            for name in model.get(
+                "class_names",
+                [],
+            )
+        ),
+        "window_sec": float(
+            input_contract["window_sec"]
+        ),
+        "target_sample_rate": float(
+            input_contract["sample_rate"]
+        ),
+        "step_sec": float(
+            runtime.get("step_sec", 0.5)
+        ),
+        "confidence_threshold": float(
+            runtime.get(
+                "confidence_threshold",
+                0.55,
+            )
+        ),
+        "is_test_head": bool(
+            package.get("is_test_head", False)
+        ),
+        "warning_message": package.get(
+            "warning_message"
+        ),
+    }
 
 def discover_hdf5() -> list[str]:
-    return [str(path) for path in sorted((ROOT / "data" / "processed").glob("*.h5"))]
+    """Recursively discover processed HDF5 datasets."""
+    data_root = ROOT / "data" / "processed"
+
+    if not data_root.is_dir():
+        return []
+
+    files = {
+        str(path.resolve())
+        for pattern in ("*.h5", "*.hdf5")
+        for path in data_root.rglob(pattern)
+        if path.is_file()
+    }
+
+    return sorted(files)
 
 
 def discover_packages() -> list[str]:
-    return [str(path.parent) for path in sorted((ROOT / "runs").glob("*/model_package/model.yaml"))]
+    search_roots = (
+        ROOT / "model_packages",
+        ROOT / "runs",
+    )
+
+    packages: set[str] = set()
+
+    for search_root in search_roots:
+        if not search_root.is_dir():
+            continue
+
+        for package_yaml in search_root.rglob(
+            "package.yaml"
+        ):
+            package_dir = package_yaml.parent
+
+            required_files = (
+                package_dir / "backbone.pt",
+                package_dir / "classifier.pt",
+                package_dir / "preprocessing.yaml",
+                package_dir / "metrics.json",
+            )
+
+            if all(
+                path.is_file()
+                for path in required_files
+            ):
+                packages.add(
+                    str(package_dir.resolve())
+                )
+
+    return sorted(packages)
 
 
 def controller_snapshot() -> object | None:
@@ -72,6 +192,15 @@ def clear_run_display() -> None:
     st.session_state.last_result = None
     st.session_state.runtime_error = None
 
+def format_package_path(path_value: str | Path) -> str:
+    """Display a package path relative to the repository root."""
+    path = Path(path_value).expanduser().resolve()
+
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        # 路径不在仓库根目录下时，保留完整路径。
+        return str(path)
 
 for key, value in {
     "controller": None,
@@ -102,7 +231,7 @@ with st.sidebar:
         st.warning("No HDF5 file found under data/processed.")
         data_path = st.text_input(
             "Data file",
-            str(ROOT / "data" / "processed" / "bnci2014_001_s01.h5"),
+            str(ROOT / "data/processed/bnci2014_001/subject_01.h5"),
             disabled=not availability.configuration_enabled,
         )
     else:
@@ -115,24 +244,77 @@ with st.sidebar:
             disabled=not availability.configuration_enabled,
         )
     else:
-        package_path = st.selectbox("Model package", packages, disabled=not availability.configuration_enabled)
-    try:
-        selected_package_name = str(load_yaml(Path(package_path) / "model.yaml").get("name"))
-    except Exception:  # noqa: BLE001
-        selected_package_name = None
-    package_window_default = 10.0 if selected_package_name == "50m-linear" else 4.0
+        package_path = st.selectbox(
+            "Model package",
+            packages,
+            format_func=format_package_path,
+            disabled = not availability.configuration_enabled
+        )
+
+    package_summary: (
+            dict[str, object] | None
+    ) = None
+
+    selected_package_name: (
+            str | None
+    ) = None
+
+    package_window_default = 4.0
     package_step_default = 0.5
+    package_threshold_default = 0.55
+
+    try:
+        package_summary = describe_package(
+            package_path
+        )
+
+        selected_package_name = str(
+            package_summary["model_name"]
+        )
+
+        package_window_default = float(
+            package_summary["window_sec"]
+        )
+
+        package_step_default = float(
+            package_summary["step_sec"]
+        )
+
+        package_threshold_default = float(
+            package_summary[
+                "confidence_threshold"
+            ]
+        )
+
+    except Exception as exc:
+        package_summary = None
+        selected_package_name = None
+
+        # 保留上面初始化的安全默认值，
+        # 不再访问旧版 model.yaml 变量。
+        st.warning(
+            "Cannot read Runtime Package "
+            f"metadata: {exc}"
+        )
+
     if selected_package_name:
         st.caption(f"Package model: {selected_package_name}")
     acquirer_name = st.selectbox(
         "Acquirer", AcquirerFactory.list_acquirers(), disabled=not availability.configuration_enabled
     )
-    model_name = st.selectbox("Model", ModelFactory.list_models(), disabled=not availability.configuration_enabled)
+
     device = st.segmented_control(
         "Compute device", ["cuda", "cpu"], default="cuda", disabled=not availability.configuration_enabled
     )
     threshold = st.slider(
-        "Confidence threshold", 0.0, 1.0, 0.55, 0.01, disabled=not availability.configuration_enabled
+        "Confidence threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=package_threshold_default,
+        step=0.01,
+        disabled=(
+            not availability.configuration_enabled
+        ),
     )
     replay_speed = st.number_input(
         "Replay speed", min_value=0.1, max_value=100.0, value=1.0, step=0.1, disabled=not availability.configuration_enabled
@@ -142,15 +324,19 @@ with st.sidebar:
             "Maximum windows", min_value=1, max_value=10000, value=100, step=10, disabled=not availability.configuration_enabled
         )
     )
-    window_sec = float(
-        st.number_input(
-            "Window seconds", min_value=0.1, value=package_window_default, step=0.5, disabled=not availability.configuration_enabled
-        )
+    window_sec = package_window_default
+    step_sec = package_step_default
+
+    st.text_input(
+        "Window seconds",
+        value=str(window_sec),
+        disabled=True,
     )
-    step_sec = float(
-        st.number_input(
-            "Step seconds", min_value=0.1, value=package_step_default, step=0.1, disabled=not availability.configuration_enabled
-        )
+
+    st.text_input(
+        "Step seconds",
+        value=str(step_sec),
+        disabled=True,
     )
     enable_jsonl = st.checkbox("Enable JSONL logging", disabled=not availability.configuration_enabled)
     jsonl_path = st.text_input(
@@ -201,55 +387,152 @@ with st.sidebar.container(horizontal=True):
 
 if start_clicked:
     try:
-        if session is None or expected_windows is None or trial_count is None or samples_per_trial is None:
-            raise ValueError("Choose a readable data file and session before starting")
-        if window_sec <= 0:
-            raise ValueError("Window seconds must be greater than zero")
-        if step_sec <= 0 or step_sec > window_sec:
-            raise ValueError("Step seconds must be greater than zero and no greater than Window seconds")
-        package = Path(package_path)
-        runtime_package = ModelFactory.load_runtime_package(package, EEGHDF5(data_path).metadata, device=str(device))
-        validate_runtime_request(runtime_package, window_sec=window_sec, step_sec=step_sec)
-        if runtime_package.is_test_head:
-            st.warning(runtime_package.warning_message or "仅用于链路验证，预测和置信度无准确率意义")
+        if (
+            session is None
+            or expected_windows is None
+            or trial_count is None
+            or samples_per_trial is None
+        ):
+            raise ValueError(
+                "Choose a readable data file and session before starting"
+            )
 
-        target_windows = target_window_count(expected_windows, max_windows)
+        if window_sec <= 0:
+            raise ValueError(
+                "Window seconds must be greater than zero"
+            )
+
+        if step_sec <= 0 or step_sec > window_sec:
+            raise ValueError(
+                "Step seconds must be greater than zero "
+                "and no greater than Window seconds"
+            )
+
+        package = Path(package_path)
+
+        with st.spinner(
+                "Loading Runtime Model Package..."
+        ):
+            runtime_package = load_runtime_package(
+                package,
+                device=str(device),
+                verify_hashes=True,
+            )
+        dataset_classes = tuple(
+            str(name)
+            for name in class_names
+        )
+
+        if dataset_classes != (
+                runtime_package.class_names
+        ):
+            raise ValueError(
+                "Dataset class order does not match "
+                "Runtime Model Package: "
+                f"dataset={dataset_classes}, "
+                f"package="
+                f"{runtime_package.class_names}."
+            )
+
+        if runtime_package.is_test_head:
+            st.warning(
+                runtime_package.warning_message
+                or (
+                    "仅用于链路验证，预测和置信度"
+                    "无准确率意义"
+                )
+            )
+        if not np.isclose(
+                window_sec,
+                runtime_package.window_sec,
+                rtol=0.0,
+                atol=1e-6,
+        ):
+            raise ValueError(
+                "Displayed window length does not match "
+                "loaded Runtime Package."
+            )
+
+        if not np.isclose(
+                step_sec,
+                runtime_package.step_sec,
+                rtol=0.0,
+                atol=1e-6,
+        ):
+            raise ValueError(
+                "Displayed step length does not match "
+                "loaded Runtime Package."
+            )
+
+        target_windows = target_window_count(
+            expected_windows,
+            max_windows,
+        )
+
         stats = PipelineRunStats()
         stats.set_expected_windows(target_windows)
+
         event_queue = UiEventQueue()
-        logger = JsonlWindowLogger(jsonl_path) if enable_jsonl else None
+
+        logger = (
+            JsonlWindowLogger(jsonl_path)
+            if enable_jsonl
+            else None
+        )
+
         decoder = SlidingWindowDecoder(
-            runtime_package.model,
-            runtime_package.preprocessor,
-            list(runtime_package.class_names),
+            runtime_model=(
+                runtime_package.runtime_model
+            ),
+            class_names=(
+                runtime_package.class_names
+            ),
+            channel_names=channel_names,
             sample_rate=sample_rate,
             input_unit=input_unit,
-            window_sec=window_sec,
-            step_sec=step_sec,
-            confidence_threshold=float(threshold),
-            command_map=runtime_package.command_map,
+            window_sec=(
+                runtime_package.window_sec
+            ),
+            step_sec=(
+                runtime_package.step_sec
+            ),
+            confidence_threshold=float(
+                threshold
+            ),
+            command_map=(
+                runtime_package.command_map
+            ),
             run_stats=stats,
             jsonl_logger=logger,
         )
+
         acquirer_factory = lambda: AcquirerFactory.create(
             acquirer_name,
             data_path=data_path,
             session=str(session),
             speed=float(replay_speed),
             loop=False,
-            window_sec=window_sec,
-            step_sec=step_sec,
+            window_sec=runtime_package.window_sec,
+            step_sec=runtime_package.step_sec,
         )
+
         controller = PipelineController(
             decoder,
             acquirer_factory,
             max_windows=max_windows,
-            on_result_with_samples=event_queue.publish_result,
-            on_state_change=event_queue.publish_state,
+            on_result_with_samples=(
+                event_queue.publish_result
+            ),
+            on_state_change=(
+                event_queue.publish_state
+            ),
         )
+
         clear_run_display()
+
         st.session_state.controller = controller
         st.session_state.ui_event_queue = event_queue
+
         st.session_state.active_configuration = {
             "data_path": data_path,
             "session": session,
@@ -262,28 +545,93 @@ if start_clicked:
             "channel_names": channel_names,
             "input_unit": input_unit,
             "jsonl_logging": enable_jsonl,
-            "jsonl_path": jsonl_path if enable_jsonl else None,
-            "model_warning": runtime_package.warning_message,
+            "jsonl_path": (
+                jsonl_path
+                if enable_jsonl
+                else None
+            ),
+            "model_warning": (
+                runtime_package.warning_message
+            ),
         }
+
         controller.start()
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.runtime_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
 
-if stop_clicked and st.session_state.controller is not None:
-    try:
-        st.session_state.controller.stop(wait=False)
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.runtime_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
+        # 关键：重新渲染整页。
+        # 此时 Controller 已经是 RUNNING，
+        # Stop 按钮会从 disabled 变成 enabled。
+        st.rerun()
 
-if restart_clicked and st.session_state.controller is not None:
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.runtime_error = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+
+
+if (
+    stop_clicked
+    and st.session_state.controller is not None
+):
     try:
-        st.session_state.controller.stop(wait=True, timeout=5.0)
-        if st.session_state.ui_event_queue is not None:
-            st.session_state.ui_event_queue.drain()
+        controller = st.session_state.controller
+
+        # 等待工作线程真正停止。
+        controller.stop(
+            wait=True,
+            timeout=5.0,
+        )
+
+        # 处理工作线程最后提交的状态和结果事件。
+        event_queue = st.session_state.ui_event_queue
+        if event_queue is not None:
+            apply_events(
+                st.session_state,
+                event_queue.drain(),
+                history_limit=500,
+            )
+
+        # 关键：重新渲染整页。
+        # Controller 变为 STOPPED 后，
+        # Start 和配置项会重新启用。
+        st.rerun()
+
+    except Exception as exc:  # noqa: BLE001
+        st.session_state.runtime_error = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+
+if (
+    restart_clicked
+    and st.session_state.controller is not None
+):
+    try:
+        controller = st.session_state.controller
+
+        controller.stop(
+            wait=True,
+            timeout=5.0,
+        )
+
+        event_queue = st.session_state.ui_event_queue
+        if event_queue is not None:
+            event_queue.drain()
+
         clear_run_display()
-        st.session_state.controller.restart(timeout=5.0)
+
+        controller.restart(
+            timeout=5.0,
+        )
+
+        # Restart 后重新显示 RUNNING 状态和按钮。
+        st.rerun()
+
     except Exception as exc:  # noqa: BLE001
-        st.session_state.runtime_error = {"error_type": type(exc).__name__, "error_message": str(exc)}
+        st.session_state.runtime_error = {
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
 
 
 @st.fragment(run_every=0.2)

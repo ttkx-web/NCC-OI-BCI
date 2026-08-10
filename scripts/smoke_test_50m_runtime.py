@@ -13,7 +13,7 @@ from bci_dayloop.models.model_50m.runtime import (
 def main() -> None:
     data_path = (
         ROOT
-        / "data/processed/bnci2014_001_s01.h5"
+        / "data/processed/bnci2014_001/subject_01.h5"
     )
 
     dataset = EEGHDF5(data_path)
@@ -22,7 +22,7 @@ def main() -> None:
 
     runtime = build_50m_runtime_from_metadata(
         checkpoint_path=(
-            ROOT / "checkpoints/50m/model_deploy.pt"
+            ROOT / "checkpoints/backbones/50m/model_deploy.pt"
         ),
         classifier_path=(
             ROOT / "checkpoints/test_linear_head.pt"

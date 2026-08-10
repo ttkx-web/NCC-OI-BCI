@@ -9,6 +9,9 @@ from _bootstrap import ROOT  # noqa: F401
 from bci_dayloop.data.bnci import prepare_bnci2014_001_subject
 from bci_dayloop.training.pipeline import train_linear_probe
 from bci_dayloop.utils.config import load_yaml, resolve_path
+from bci_dayloop.training.labram_linear_head import (
+    train_labram_linear_head,
+)
 
 
 def main() -> None:
@@ -34,7 +37,20 @@ def main() -> None:
     else:
         print(f"[1/3] Reusing dataset: {output}")
     print("[2/3] Extracting/caching embeddings and training linear head...")
-    package, metrics = train_linear_probe(config)
+    head_path, metrics = (
+        train_labram_linear_head(config)
+    )
+
+    print(
+        f"Test accuracy: "
+        f"{metrics['final_test']['accuracy']:.4f}"
+    )
+
+    print(
+        "Linear head trained. "
+        "Run export_labram_model_package.py "
+        "to create the deployment package."
+    )
     print(f"Test accuracy: {metrics['test']['accuracy']:.4f}")
     print("[3/3] Verifying package reload in a clean Python process...")
     verify_code = (

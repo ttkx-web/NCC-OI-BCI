@@ -1,285 +1,443 @@
 # NCC-OI-BCI
 
-基于公司 **50M EEG 基座模型** 的离线、伪实时与实时脑机接口基础设施。
+面向非侵入式 EEG BCI 的 **统一模型 Runtime、离线/伪实时评估、个体化适配与真实设备实时推理框架**。
 
-本仓库提供统一的 EEG 数据读取、预处理、模型适配、Runtime Model Package、滑窗推理、运行控制、日志记录和 Streamlit 可视化能力，用于逐步完成从公开离线数据验证到公司自采数据、真实设备接入、个体化和在线自适应的工程闭环。
+当前主线任务为 **BNCI2014_001 四分类运动想象**，核心模型为公司 **50M EEG 基座模型**；LaBraM 作为已接入的公开基线。项目已经完成从离线数据、Runtime Model Package、Replay/Streamlit，到 **Neuracle JellyFish 实时采集 → 4 秒滑窗 → 50M 推理** 的统一链路。
 
-> 当前状态：**Stage 0.5 已完成**。当前并行推进 **Stage 1：简单个体化** 与 **Stage 2A：公司自采离线 EEG 数据兼容**。
+> 当前状态：Unified Runtime 已完成；50M 与 LaBraM 已接入统一 Package/Runtime；Stage 1A 个体化分类头已实现；Stage 2A 自采 Neuracle 离线数据处理已实现；Stage 2B 真实设备实时采集、Trigger、连续滑窗与 50M 实时推理闭环已实现。Rest-Tune 与 NeuroOnline 目前仅保留接口/基础类型，真实算法仍待开发。
 
 ---
 
-## 1. 项目目标
+## 1. 当前任务
 
-NCC-OI-BCI 的目标不是只运行某一个固定模型，而是构建一套可复用的 BCI Runtime，使不同 EEG 数据源、模型和任务能够通过统一接口接入同一条推理链路。
+BNCI2014_001 四分类运动想象：
 
-当前主线任务为 **BNCI2014_001 四分类运动想象**：
-
-| 类别 | 控制命令 |
+| EEG 类别 | 控制命令 |
 |---|---|
 | `left_hand` | `LEFT` |
 | `right_hand` | `RIGHT` |
 | `feet` | `FORWARD` |
 | `tongue` | `STOP` |
 
-当前正式运行模型为公司 **50M EEG 基座模型**。Stage 0 使用的 LaBraM 作为历史基线保留，用于回归测试和模型替换前后的工程对照。
+当前主要模型：
+
+- **50M**：公司 EEG 基座模型，当前实时部署主模型；
+- **LaBraM**：已完成统一 Runtime 接入的公开基线；
+- **CBraMod**：计划作为下一阶段基线接入；
+- BIOT / REVE：按后续实验需要再扩展。
 
 ---
 
-## 2. 当前进度
+## 2. 阶段进度
 
 | 阶段 | 目标 | 状态 |
 |---|---|---|
-| Stage 0 | LaBraM 伪实时基础 Pipeline | 已完成 |
-| Stage 0.5 | 将 LaBraM 替换为 50M，并完成正式分类头、Model Package、CLI Replay 和 Streamlit 验证 | 已完成 |
-| Stage 1 | 50M 简单个体化及伪实时验证 | 当前推进 |
-| Stage 2A | 公司自采离线 EEG 数据兼容 | 当前推进 |
-| Stage 2B | EEG 设备真实实时接入 | 计划中 |
-| Stage 3 | 实时 Pipeline 与简单个体化合并 | 计划中 |
-| Stage 3.5 | Rest-Tuning 静息态个体化 | 计划中 |
-| Stage 4 | 实时自适应 | 计划中 |
+| Stage 0 | LaBraM 离线/伪实时基础 Pipeline | 已完成 |
+| Stage 0.5 | 50M 替换、正式分类头、Replay、Streamlit | 已完成 |
+| Unified Runtime | 统一 Raw EEG → Canonical → Transform → Backend → ModelOutput | 已完成 |
+| Stage 1A | 冻结 50M Backbone 的群体头与个人头 | 已完成 |
+| Stage 1B | 解冻部分 Backbone 的任务相关个体化 | 计划中 |
+| Stage 2A | Neuracle 自采离线 EEG / BDF / Marker / 4s HDF5 导出 | 已实现 |
+| Stage 2B | Neuracle JellyFish 真实实时接入、Trigger、4s Window、50M 推理 | 已实现 |
+| Stage 3 | 实时 Pipeline 与个体化策略统一 | 计划中 |
+| Rest-Tune | 离线个体化 Backbone/Head 适配 | 接口已预留，算法待实现 |
+| NeuroOnline | 基于在线反馈的持续适配 | 接口已预留，算法待实现 |
 
 ---
 
-## 3. 已实现能力
+## 3. 总体架构
 
-### 3.1 模型与预处理
-
-- 公司 50M EEG Backbone 构建、冻结和部署 checkpoint 加载；
-- 标准 64 通道映射与通道别名归一化；
-- 缺失通道补零及 `channel_valid_mask`；
-- EEG 单位统一；
-- 0.1–75 Hz 带通滤波；
-- 100 Hz 重采样；
-- 严格 10 秒窗口检查；
-- 有效通道按时间维 Z-score；
-- `[64, 1000] -> [640, 100]` Token 化；
-- 指定 Transformer Block 的 Token Embedding 提取；
-- Flatten / Mean 特征聚合；
-- 线性任务分类头训练、保存和加载；
-- `predict_proba()`、`predict()` 和 `extract_embeddings()`；
-- 字典式 `signal + channel_valid_mask` 通用模型输入。
-
-### 3.2 Runtime 与 Pipeline
-
-- 模型无关的 Model Adapter / Model Factory；
-- Runtime Model Package 保存和重新加载；
-- HDF5 离线数据伪实时回放；
-- 固定窗口、固定步长滑窗推理；
-- CLI Replay；
-- Streamlit 可视化；
-- Start / Stop / Restart 运行控制；
-- 预测类别、概率、置信度和命令映射；
-- 窗口计数与异常状态记录；
-- 当前、平均和 P95 延迟记录；
-- JSONL 窗口日志；
-- Summary JSON 运行报告。
-
-### 3.3 测试与验证
-
-- 50M Tokenization Smoke Test；
-- 50M Backbone Smoke Test；
-- 50M Classifier Smoke Test；
-- 50M Adapter Smoke Test；
-- 50M Runtime Package Smoke Test；
-- BNCI 真实 10 秒离线窗口测试；
-- CLI Replay 验证；
-- Streamlit Start / Stop / Restart 验证；
-- LaBraM 历史 Pipeline 回归测试；
-- 单元测试与集成测试。
-
----
-
-## 4. 系统架构
+### 3.1 离线 / Replay
 
 ```text
-EEG Data Source
-├── Public offline EEG
-├── Self-collected offline EEG
-└── Realtime EEG stream
+HDF5 / Recorded EEG
         |
         v
-Acquirer / Replay
+RawEEGWindow
         |
         v
-Window Buffer and Sliding Window
+SignalCanonicalizer
         |
         v
-Model-specific Pipeline Preprocessor
-├── 50M Preprocessor
-└── LaBraM Preprocessor
+ModelInputTransform
+├── Model50MInputTransform
+└── LaBraMInputTransform
         |
         v
-Model Adapter
-├── 50M Adapter        <- current default
-└── LaBraM Adapter     <- Stage 0 legacy baseline
+PreparedModelInput
         |
         v
-Runtime Model Package
+ModelBackend
+├── Model50MBackend
+└── LaBraMBackend
         |
         v
-SlidingWindowDecoder
+RuntimeModel
         |
         v
-PipelineController
-├── CLI Replay
-├── Streamlit UI
-├── JSONL Window Log
-└── Summary / Latency Metrics
+ModelOutput
+        |
+        +--> RuntimeEvaluator
+        +--> CLI Replay
+        +--> Streamlit
+        +--> JSONL / Summary / Latency
 ```
 
-Pipeline 与具体模型解耦。模型所需的采样率、窗口长度、通道顺序、预处理方式和分类头参数由对应的 Model Adapter 与 Runtime Model Package 提供，不应硬编码在通用滑窗和展示模块中。
+### 3.2 真实实时链路
+
+```text
+Neuracle EEG Device
+        |
+        v
+Neuracle acquisition / JellyFish
+        |
+        v  TCP
+NeuracleJellyFishSource
+        |
+        v
+65ch mixed stream
+59 EEG + 4 EOG + 1 ECG + 1 Trigger
+        |
+        v
+select_verified_eeg_channels()
+        |
+        v
+59ch EEG / 1000 Hz / uV
+        |
+        v
+RealtimeEEGWindowPipeline
+        |
+        +--> TimestampedRingBuffer
+        +--> gap / continuity check
+        +--> Trigger association
+        |
+        v
+RealtimeWindow [59, 4000]
+4.0 s window / 0.5 s step
+        |
+        v
+RealtimeRuntimeBridge
+        |
+        v
+RawEEGWindow
+        |
+        v
+RuntimeModel.prepare()
+        |
+        v
+50M PreparedModelInput
+signal [1, 64, 400]
+channel_valid_mask [1, 64]
+        |
+        v
+RuntimeModel.predict_prepared()
+        |
+        v
+50M Backbone + Linear Head
+        |
+        v
+predicted_class / probabilities / confidence
+        |
+        +--> runtime_predictions.jsonl
+        +--> runtime_inference_summary.json
+```
+
+实时链路不重新实现模型预处理。`RealtimeRuntimeBridge` 只负责 Source/Prepared Input 安全 Gate，真正的通道映射、重采样、滤波、归一化与模型输入构造仍由统一 `RuntimeModel.prepare()` 负责。
 
 ---
 
-## 5. 当前 50M Runtime 契约
+## 4. Unified Runtime
 
-### 5.1 当前配置
+核心接口：
+
+```text
+src/bci_dayloop/runtime/
+├── types.py
+├── model.py
+└── adaptation_types.py
+
+src/bci_dayloop/preprocessing/
+├── canonical.py
+├── model_50m.py
+└── labram.py
+
+src/bci_dayloop/models/
+├── base.py
+├── labram_backend.py
+└── model_50m/backend.py
+```
+
+统一调用方式：
+
+```python
+prepared = runtime_model.prepare(raw_window)
+output = runtime_model.predict_prepared(prepared)
+```
+
+上层 Replay、Evaluator 和 UI 不需要知道当前模型是 50M 还是 LaBraM。
+
+---
+
+## 5. Runtime Model Package（schema v2）
+
+当前统一 Runtime Package 为自包含五文件结构：
+
+```text
+<package>/
+├── package.yaml
+├── backbone.pt
+├── classifier.pt
+├── preprocessing.yaml
+└── metrics.json
+```
+
+`package.yaml` 包含：
+
+- `schema_version: 2`；
+- 模型类型与任务信息；
+- `InputContract`；
+- Runtime `step_sec` / confidence threshold；
+- command map；
+- Backbone / Classifier 文件哈希；
+- offline / online adaptation metadata。
+
+当前 Loader 支持：
+
+```text
+model.type = model_50m
+model.type = labram
+```
+
+统一入口：
+
+```python
+from bci_dayloop.packages import load_runtime_package
+
+package = load_runtime_package(
+    "model_packages/...",
+    device="cpu",
+)
+
+runtime_model = package.runtime_model
+```
+
+旧版 `model.yaml/base_model.json` Package 仅作为历史兼容代码保留，新开发应使用 schema-v2 Package。
+
+---
+
+## 6. 当前 50M 4 秒 Runtime 契约
+
+BNCI2014_001 / Stage 1 与 Stage 2B 当前使用的 50M 下游契约：
 
 | 配置项 | 当前值 |
 |---|---|
-| 数据集 | BNCI2014_001 Subject 1 |
 | 任务 | 四分类运动想象 |
-| 原始采样率 | 250 Hz |
-| Runtime 窗口 | 10 秒 |
-| 滑窗步长 | 0.5 秒 |
-| 目标采样率 | 100 Hz |
-| 标准通道数 | 64 |
-| Patch 长度 | 1 秒 |
-| Patch 步长 | 1 秒 |
-| Token 数量 | 640 |
-| Token 长度 | 100 |
+| 模型目标采样率 | 100 Hz |
+| 标准目标通道 | 64 |
+| Runtime window | 4.0 s |
+| Runtime step | 0.5 s |
+| 模型输入 | `[1, 64, 400]` |
+| Patch 长度 | 1 s |
+| Patch 步长 | 1 s |
+| 实际时间 Patch 数 | 4 |
+| 预训练时间位置容量 | `model_n_time_patches=10` |
 | Transformer 输出层 | `output_layer_idx=8` |
-| 特征聚合 | `flatten` |
+| 默认聚合 | `flatten` |
 | 分类类别数 | 4 |
 
-### 5.2 Pipeline 原始输入
+### 6.1 为什么 4 秒输入仍保留 10 个时间位置
+
+50M Backbone 的预训练 checkpoint 使用 10 秒时间位置参数。4 秒下游输入只产生 4 个真实时间 Patch：
 
 ```text
-signal:        [C, T]
-channel_names: 长度 C
-sample_rate:   原始采样率
-unit:          V / mV / uV / µV
+实际输入时间 Patch = 4
+预训练时间位置容量 = 10
+实际 Token 数 = 64 × 4 = 256
 ```
 
-BNCI 原始采样率为 250 Hz 时，一个真实 10 秒窗口为：
-
-```text
-raw_window: [C, 2500]
-```
-
-当前 Stage 0.5 必须输入真实 10 秒窗口，不允许将 4 秒数据补零为 10 秒。
-
-### 5.3 50M 预处理输出
-
-```text
-signal:             [64, 1000] float32
-channel_valid_mask: [64]       float32
-```
-
-通用 Pipeline 使用字典传递模型输入：
-
-```python
-{
-    "signal": signal,
-    "channel_valid_mask": channel_valid_mask,
-}
-```
-
-### 5.4 Token、Backbone 与分类输出
-
-```text
-token_inputs:          [B, 640, 100]
-token_channel_indices: [B, 640]
-token_time_indices:    [B, 640]
-token_valid_mask:      [B, 640]
-
-token_embeddings:      [B, 640, 512]
-flatten_features:      [B, 327680]
-logits:                [B, 4]
-probabilities:         [B, 4]
-```
+`model_n_time_patches=10` 不代表将 4 秒 EEG 补成 10 秒。
 
 ---
 
-## 6. 仓库结构
+## 7. Stage 2B 实时输入契约
+
+当前批准的实时设备输入为：
+
+```text
+59 EEG channels
+1000 Hz
+uV
+4.0 s
+[59, 4000]
+```
+
+Runtime 目标：
+
+```text
+64 channels
+100 Hz
+4.0 s
+[1, 64, 400]
+```
+
+当前批准的 59 → 64 mapping：
+
+- 同名有效目标通道：57；
+- 设备额外通道：`PO5`, `PO6`，允许忽略；
+- 50M 目标缺失通道：`AFz`, `CPz`, `P1`, `P2`, `Iz`, `F9`, `F10`；
+- 缺失目标由统一 50M preprocessing 显式 zero-fill；
+- 对应 `channel_valid_mask=False`；
+- 其他 alias、重复通道、未知通道或额外缺失通道均 fail closed。
+
+Source 层 `model_safe=true` 只代表实时 EEG 的单位/通道来源通过验证，不代表最终模型输入已通过；最终仍必须经过 `RealtimeRuntimeBridge` 的 prepared-input gate。
+
+> 当前 Stage 2B 实时 Gate 固定验证 4 秒 50M Runtime Contract。后续 2s / 3s / 4s 延迟实验需要同步扩展 Runtime Package 与 realtime gate，不能直接拿 4s Package 跑 2s 输入。
+
+---
+
+## 8. BNCI2014_001 数据与实验协议
+
+处理后的数据建议按被试保存：
+
+```text
+data/processed/bnci2014_001/
+├── subject_01.h5
+├── subject_02.h5
+├── ...
+└── subject_09.h5
+```
+
+### 8.1 群体模型 LOSO baseline
+
+以 Subject 1 为目标被试：
+
+```text
+Population Train:
+Subject 2–9 / 0train
+
+Population Validation:
+Subject 2–9 / 1test
+
+Final Held-out Test:
+Subject 1 / 1test
+```
+
+目标被试不得参与群体模型训练和模型选择。
+
+### 8.2 Personal Head
+
+```text
+Target Subject / 0train
+        |
+        +--> Personal Train
+        +--> Personal Validation
+
+Target Subject / 1test
+        |
+        +--> Final Test
+```
+
+Stage 1A 当前只更新分类头，50M Backbone 保持冻结。
+
+### 8.3 正式性能评估
+
+正式 Accuracy / Balanced Accuracy / Macro-F1 / Confusion Matrix 使用：
+
+```text
+scripts/evaluate_runtime_package.py
+```
+
+Evaluator 为 trial-aligned：每个 trial 独立切窗，不允许窗口跨 trial。
+
+连续 Replay 主要用于工程链路与 latency 验证，不应替代正式 trial-aligned 性能评价。
+
+---
+
+## 9. 目录结构
 
 ```text
 NCC-OI-BCI/
 ├── configs/
-│   ├── day1_bnci_s01.yaml
-│   └── stage05_50m_bnci_s01.yaml
+│   ├── stage0/
+│   ├── stage05/
+│   └── stage1/
 │
 ├── data/
+│   ├── raw/
+│   ├── cache/
+│   ├── moabb_cache/
 │   └── processed/
-│       └── bnci2014_001_s01.h5       # 本地数据，不提交到 Git
+│       └── bnci2014_001/
 │
 ├── checkpoints/
-│   ├── 50m/
-│   │   └── model_deploy.pt           # 50M 部署 checkpoint
-│   ├── 50m_bnci2014_001_s01_linear_head.pt
-│   └── labram-base.pth               # Stage 0 历史基线
+│   ├── backbones/
+│   │   ├── 50m/
+│   │   └── labram/
+│   └── heads/
+│
+├── model_packages/
+├── registries/
+├── runs/
+│   ├── stage1/
+│   ├── stage2a/
+│   └── stage2b/
 │
 ├── docs/
-│   ├── README_50M_MODEL_ADAPTER.md
-│   ├── 50m_adapter_interface.md
-│   ├── 50m_model_notes.md
-│   ├── current_pip_vs_50M.md
-│   ├── standard_64_channels.json
-│   └── BEGINNER_GUIDE.md
+│   ├── stage2a/
+│   └── stage2b/
 │
 ├── scripts/
-│   ├── prepare_bnci2014_001.py
-│   ├── inspect_dataset.py
-│   ├── train_50m_linear_head.py
-│   ├── export_50m_model_package.py
-│   ├── test_50m_offline_window.py
-│   ├── replay_offline.py
-│   ├── run_pipeline.py
-│   ├── smoke_test_50m_tokenization.py
-│   ├── smoke_test_50m_backbone.py
-│   ├── smoke_test_50m_classifier.py
-│   ├── smoke_test_50m_adapter.py
-│   ├── smoke_test_50m_runtime.py
-│   ├── smoke_test_labram.py
-│   └── train_linear_probe.py
-│
 ├── src/bci_dayloop/
-│   ├── acquisition/                   # 数据源与 Replay Acquirer
-│   ├── data/                          # HDF5 数据读取
-│   ├── inference/                     # 滑窗推理、运行控制和观测指标
+│   ├── acquisition/
+│   ├── data/
+│   ├── evaluation/
+│   ├── inference/
 │   ├── models/
-│   │   ├── model_50m/                 # 50M 配置、预处理、Backbone、分类头和 Runtime
-│   │   ├── labram_linear.py           # Stage 0 LaBraM 基线
-│   │   ├── factory.py
-│   │   └── runtime_package.py
-│   └── utils/
+│   ├── packages/
+│   ├── personalization/
+│   ├── preprocessing/
+│   ├── realtime/
+│   ├── runtime/
+│   └── vendor/
 │
-├── tests/                              # 单元测试与集成测试
+├── tests/
 ├── web/
-│   ├── app.py
-│   └── ui_runtime.py
-├── runs/                               # 本地运行结果，不提交到 Git
-├── environment.yml
-├── pyproject.toml
 └── README.md
 ```
 
+目录职责：
+
+| 目录 | 内容 |
+|---|---|
+| `data/` | 原始、缓存与处理后的 EEG 数据 |
+| `checkpoints/backbones/` | 基座模型 checkpoint |
+| `checkpoints/heads/` | 训练后的任务分类头 |
+| `model_packages/` | schema-v2 Runtime Model Package |
+| `runs/` | 实验日志、指标、prediction 与 summary |
+| `registries/` | Stage 1 个人模型 Registry |
+| `docs/stage2a/` | 自采离线数据 SOP / 审计 |
+| `docs/stage2b/` | 实时设备、Trigger、Window 与 Runtime Contract 验证记录 |
+
 ---
 
-## 7. 环境安装
+## 10. 环境安装
 
-项目使用 Python 3.11。Python 包名为 `bci-dayloop`，导入名为 `bci_dayloop`。
+项目使用 Python 3.11。
 
-### 7.1 克隆仓库
+### 10.1 基础环境
 
 ```bash
 git clone https://github.com/ttkx-web/NCC-OI-BCI.git
 cd NCC-OI-BCI
+
+conda create -n bci-dayloop python=3.11 -y
+conda activate bci-dayloop
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-### 7.2 NVIDIA CUDA 环境
-
-`environment.yml` 当前包含 PyTorch 2.0.1 和 CUDA 11.8：
+### 10.2 NVIDIA CUDA 环境
 
 ```bash
 conda env create -f environment.yml
@@ -287,704 +445,553 @@ conda activate bci-dayloop
 python -m pip install -e .
 ```
 
-### 7.3 macOS 或 CPU 环境
+### 10.3 BNCI 数据准备环境
 
-macOS 不应直接安装 `environment.yml` 中的 `pytorch-cuda`。可单独创建环境后安装当前项目：
-
-```bash
-conda create -n bci-dayloop python=3.11 -y
-conda activate bci-dayloop
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-确认导入的是当前仓库：
+MOABB 只用于数据下载/准备，建议独立环境：
 
 ```bash
-python -c "import bci_dayloop; print(bci_dayloop.__file__)"
-```
-
-正常情况下，输出路径应指向当前仓库中的：
-
-```text
-NCC-OI-BCI/src/bci_dayloop/__init__.py
-```
-
----
-
-## 8. 准备外部文件
-
-模型权重、分类头、HDF5 数据和运行结果不会提交到 Git。运行 Stage 0.5 至少需要：
-
-```text
-data/processed/bnci2014_001_s01.h5
-checkpoints/50m/model_deploy.pt
-checkpoints/50m_bnci2014_001_s01_linear_head.pt
-```
-
-### 8.1 50M Backbone
-
-```text
-checkpoints/50m/model_deploy.pt
-```
-
-该文件必须是 dependency-free 部署 checkpoint，只包含 Tensor 和普通 Python 数据结构。若原始预训练 checkpoint 中包含自定义 `Config` 对象，应先在原 50M 仓库环境中转换为部署 checkpoint。
-
-### 8.2 正式运动想象分类头
-
-```text
-checkpoints/50m_bnci2014_001_s01_linear_head.pt
-```
-
-分类头 checkpoint 应包含：
-
-```text
-format_version
-head_state_dict
-metadata
-```
-
-### 8.3 BNCI HDF5 数据
-
-```text
-data/processed/bnci2014_001_s01.h5
-```
-
-该文件包含：
-
-```text
-0train    # 训练 Session
-1test     # 独立测试与 Replay Session
-```
-
----
-
-## 9. 准备 BNCI2014_001 数据
-
-主 Runtime 不依赖 MOABB。MOABB 只在首次下载或重新生成 HDF5 时使用，建议放在独立的数据准备环境中。
-
-### 9.1 创建数据准备环境
-
-```bash
-conda create -n bci-dayloop-data python=3.11 -y
-conda activate bci-dayloop-data
 python -m pip install -r requirements-data.txt
 ```
 
-### 9.2 下载并生成 HDF5
+### 10.4 Neuracle BDF / JellyFish 依赖
 
-macOS / Linux：
-
-```bash
-export MNE_DATASETS_BNCI_PATH="$PWD/data/moabb_cache"
-mkdir -p data/moabb_cache
-python scripts/prepare_bnci2014_001.py \
-  --config configs/day1_bnci_s01.yaml
-```
-
-Windows PowerShell：
-
-```powershell
-$env:MNE_DATASETS_BNCI_PATH = "$PWD\data\moabb_cache"
-New-Item -ItemType Directory -Force data\moabb_cache | Out-Null
-python scripts\prepare_bnci2014_001.py `
-  --config configs\day1_bnci_s01.yaml
-```
-
-检查数据：
+当前 vendor 代码会使用 `pyedflib`。若本地未安装：
 
 ```bash
-python scripts/inspect_dataset.py \
-  data/processed/bnci2014_001_s01.h5
+python -m pip install pyedflib
 ```
 
-完成后切回主环境：
-
-```bash
-conda deactivate
-conda activate bci-dayloop
-```
+后续应将该依赖正式加入项目依赖或改为延迟导入，避免新环境运行 Stage 2A/2B 时出现缺包。
 
 ---
 
-## 10. 训练正式 50M 线性分类头
+## 11. 准备 BNCI2014_001
 
-仓库已经定义了正式分类头路径。仅在需要重新训练分类头时执行：
+生成处理后的 HDF5：
 
 ```bash
-python scripts/train_50m_linear_head.py \
-  --data data/processed/bnci2014_001_s01.h5 \
+python scripts/prepare_bnci2014_001.py --help
+```
+
+检查：
+
+```bash
+python scripts/inspect_dataset.py \
+  data/processed/bnci2014_001/subject_01.h5
+```
+
+大文件、模型权重和运行产物默认不提交 Git。
+
+---
+
+## 12. 训练 50M 群体头
+
+```bash
+python scripts/train_50m_population_head.py \
+  --data-root data/processed/bnci2014_001 \
+  --data-pattern "subject_{subject:02d}.h5" \
+  --subjects 1 2 3 4 5 6 7 8 9 \
+  --target-subject 1 \
   --train-session 0train \
-  --test-session 1test \
-  --checkpoint checkpoints/50m/model_deploy.pt \
-  --output checkpoints/50m_bnci2014_001_s01_linear_head.pt \
+  --validation-session 1test \
+  --final-test-session 1test \
+  --checkpoint checkpoints/backbones/50m/model_deploy.pt \
   --device cpu \
-  --window-sec 10 \
-  --window-stride-sec 10 \
+  --window-sec 4 \
+  --window-stride-sec 4 \
+  --window-construction direct_trial \
+  --model-n-time-patches 10 \
+  --target-sample-rate 100 \
+  --patch-sec 1 \
+  --patch-stride-sec 1 \
+  --output-layer-idx 8 \
+  --aggregation flatten \
   --feature-batch-size 1 \
-  --feature-cache-dtype float16 \
-  --head-batch-size 32 \
   --epochs 100 \
+  --head-batch-size 32 \
   --head-lr 0.001 \
-  --momentum 0 \
   --weight-decay 0.001 \
   --metric-for-best val_bacc \
   --patience 15
 ```
 
-训练流程：
+正式实验不要使用：
 
-1. 在原始 Trial 层面对 `0train` 做训练集和验证集划分；
-2. 只在相同标签内部拼接 Trial；
-3. 构造临时 10 秒单标签窗口；
-4. 冻结 50M Backbone；
-5. 缓存分类特征；
-6. 只训练线性分类头；
-7. 根据验证集 Balanced Accuracy 选择最佳 Epoch；
-8. 最后在 `1test` 上评估一次；
-9. 保存正式分类头和训练报告。
+```text
+--max-windows-per-class-per-subject
+```
 
-> 当前分类头是正式训练产物，但使用的是 Stage 0.5 临时数据构造方式：将同标签的原始 4 秒 Trial 拼接后截取 10 秒窗口。它不等同于自然连续采集的 10 秒单 Trial 实验。
+`--save-feature-cache` 仅在需要将 frozen feature 写盘时开启；默认可只在内存中训练分类头。
 
 ---
 
-## 11. 导出 Runtime Model Package
-
-Runtime Model Package 是部署时使用的标准模型包。它将模型配置、预处理配置、分类头、类别映射、命令映射和模型文件校验信息组织成独立目录，使 CLI Replay 和 Streamlit 不依赖训练进程中的内存对象。
-
-使用默认路径导出：
+## 13. 训练 LaBraM 群体头
 
 ```bash
-python scripts/export_50m_model_package.py \
+python scripts/train_labram_population_head.py \
+  --data-root data/processed/bnci2014_001 \
+  --data-pattern "subject_{subject:02d}.h5" \
+  --subjects 1 2 3 4 5 6 7 8 9 \
+  --target-subject 1 \
+  --train-session 0train \
+  --validation-session 1test \
+  --final-test-session 1test \
+  --checkpoint checkpoints/backbones/labram/labram_base.pth \
+  --device cpu \
+  --embedding-batch-size 1 \
+  --window-sec 4 \
+  --target-sample-rate 200 \
+  --patch-samples 200 \
+  --epochs 80 \
+  --batch-size 64 \
+  --learning-rate 0.001 \
+  --weight-decay 0.0001 \
+  --patience 12 \
   --overwrite
 ```
 
-完整命令：
+LaBraM Backbone 冻结，先提取 frozen embeddings，再训练 Linear Head。
+
+---
+
+## 14. 导出 Runtime Model Package
+
+### 14.1 50M
 
 ```bash
+VERSION=$(date +%Y%m%d_%H%M%S)
+
 python scripts/export_50m_model_package.py \
-  --data data/processed/bnci2014_001_s01.h5 \
-  --checkpoint checkpoints/50m/model_deploy.pt \
-  --classifier checkpoints/50m_bnci2014_001_s01_linear_head.pt \
-  --output runs/stage05_50m/model_package \
+  --data data/processed/bnci2014_001/subject_01.h5 \
+  --checkpoint checkpoints/backbones/50m/model_deploy.pt \
+  --classifier checkpoints/heads/stage1/bnci2014_001/subject_01/population/4s_flatten/head.pt \
+  --output model_packages/stage1/bnci2014_001/subject_01/population/4s_flatten/${VERSION} \
   --device cpu \
   --session 1test \
-  --step-sec 0.5 \
-  --overwrite
+  --step-sec 0.5
 ```
 
-导出脚本会：
-
-- 加载正式分类头；
-- 创建 50M Runtime；
-- 保存 Runtime Model Package；
-- 保留源分类头训练 metadata；
-- 写入 Backbone 和分类头 SHA-256；
-- 将 Backbone 路径保存为相对路径；
-- 写入 `step_sec=0.5`；
-- 使用真实 10 秒 BNCI 窗口执行导出后 Smoke Test；
-- 生成 `export_manifest.json`；
-- 验证成功后原子替换旧 Model Package。
-
-只导出、不执行 Smoke Test：
+### 14.2 LaBraM
 
 ```bash
-python scripts/export_50m_model_package.py \
-  --skip-smoke-test
-```
+VERSION=$(date +%Y%m%d_%H%M%S)
 
----
-
-## 12. Runtime Model Package 结构
-
-```text
-runs/stage05_50m/model_package/
-├── model.yaml
-├── preprocessing.yaml
-├── classifier.pt
-├── label_map.json
-├── command_map.json
-├── base_model.json
-└── export_manifest.json
-```
-
-### `model.yaml`
-
-保存：
-
-- 模型名称与类别数；
-- 类别顺序；
-- 10 秒窗口；
-- 100 Hz 采样率；
-- Patch 配置；
-- Transformer 配置；
-- `output_layer_idx=8`；
-- `aggregation=flatten`；
-- `step_sec=0.5`；
-- 数据集和任务说明。
-
-### `preprocessing.yaml`
-
-保存：
-
-- 通道和单位配置；
-- 带通滤波配置；
-- 平均参考配置；
-- Z-score 配置；
-- 缺失通道策略；
-- 严格窗口长度检查。
-
-### `classifier.pt`
-
-保存正式训练后的线性分类头及其训练 metadata。
-
-### `label_map.json`
-
-保存稳定的数字类别顺序，必须与 HDF5 metadata 一致。
-
-### `command_map.json`
-
-默认运动想象命令映射：
-
-```json
-{
-  "left_hand": "LEFT",
-  "right_hand": "RIGHT",
-  "feet": "FORWARD",
-  "tongue": "STOP"
-}
-```
-
-### `base_model.json`
-
-保存：
-
-- Backbone checkpoint 相对路径；
-- Backbone SHA-256；
-- 分类头源文件及 SHA-256；
-- 模型类型和加载信息；
-- `is_test_head: false`；
-- `trained_head: true`。
-
-### `export_manifest.json`
-
-保存导出时间、源文件、输出文件和导出后验证信息。
-
----
-
-## 13. 离线单窗口验证
-
-使用真实 BNCI 10 秒窗口验证预处理、Backbone、分类头和原始接口一致性：
-
-```bash
-python scripts/test_50m_offline_window.py \
-  --data data/processed/bnci2014_001_s01.h5 \
-  --session 1test \
-  --checkpoint checkpoints/50m/model_deploy.pt \
-  --classifier checkpoints/50m_bnci2014_001_s01_linear_head.pt \
+python scripts/export_labram_model_package.py \
+  --data data/processed/bnci2014_001/subject_01.h5 \
+  --checkpoint checkpoints/backbones/labram/labram_base.pth \
+  --classifier <labram-population-head.pt> \
+  --output model_packages/stage0/bnci2014_001/subject_01/population/4s_labram/${VERSION} \
   --device cpu \
-  --window-sec 10 \
-  --repeat 2 \
-  --json-output runs/stage05_50m/trained_head_offline_report.json
+  --session 1test \
+  --step-sec 0.5
 ```
 
-应重点确认：
-
-```text
-预处理输出：     [64, 1000]
-Token 输入：     [1, 640, 100]
-Backbone 输出：  [1, 640, 512]
-分类特征：       [1, 327680]
-类别概率：       [1, 4]
-概率和：         约等于 1
-重复推理：       输出一致
-接口一致性：     通过
-```
+导出脚本会构建 schema-v2 Package，并默认执行 Package reload / smoke test。
 
 ---
 
-## 14. CLI 伪实时回放
+## 15. Trial-aligned 正式评估
 
-CLI Replay 将 HDF5 中的离线 EEG 拼接为连续数据流，按照指定窗口、步长和回放速度持续执行预处理与推理。
+### 15.1 50M
 
-### 14.1 快速检查一个窗口
+```bash
+python scripts/evaluate_runtime_package.py \
+  --data data/processed/bnci2014_001/subject_01.h5 \
+  --model-package <50m-package> \
+  --session 1test \
+  --device cpu \
+  --step-sec 4 \
+  --output runs/evaluation/50m_population_s01.json
+```
+
+### 15.2 LaBraM
+
+```bash
+python scripts/evaluate_runtime_package.py \
+  --data data/processed/bnci2014_001/subject_01.h5 \
+  --model-package <labram-package> \
+  --session 1test \
+  --device cpu \
+  --step-sec 4 \
+  --output runs/evaluation/labram_population_s01.json
+```
+
+输出包括：
+
+```text
+Window-level Accuracy / BAcc / Macro-F1
+Trial-level Accuracy / BAcc / Macro-F1
+Confusion Matrix
+Preprocessing latency
+Model latency
+Total P50 / P95 latency
+```
+
+对于当前 4 秒 direct-trial 正式比较，建议优先报告 `trial_metrics`。
+
+---
+
+## 16. CLI Replay
 
 ```bash
 python scripts/replay_offline.py \
-  --config configs/stage05_50m_bnci_s01.yaml \
-  --model-package runs/stage05_50m/model_package \
+  --config configs/stage1/replay_population_4s.yaml \
+  --data data/processed/bnci2014_001/subject_01.h5 \
+  --model-package <runtime-package> \
   --device cpu \
-  --max-windows 1 \
+  --max-windows 20 \
   --replay-speed 100
 ```
 
-### 14.2 按真实速度回放多个窗口
+CLI Replay 用于验证：
 
-```bash
-python scripts/replay_offline.py \
-  --config configs/stage05_50m_bnci_s01.yaml \
-  --model-package runs/stage05_50m/model_package \
-  --device cpu \
-  --max-windows 20 \
-  --replay-speed 1
-```
+- Runtime Package 加载；
+- 连续滑窗；
+- prediction / confidence；
+- preprocessing / model / total latency；
+- JSONL 与 summary。
 
-重点检查：
-
-```text
-emitted_windows == target_windows
-successful_windows == emitted_windows
-failed_windows == 0
-last_error_type == null
-```
-
-默认运行输出：
-
-```text
-runs/stage05_50m/pipeline_windows.jsonl
-runs/stage05_50m/replay_summary.json
-```
-
-其中：
-
-- JSONL 文件逐窗口记录时间、预测、置信度、延迟和异常信息；
-- Summary JSON 汇总窗口完成率、失败窗口、运行时长和延迟统计。
+正式分类性能优先使用 `evaluate_runtime_package.py`。
 
 ---
 
-## 15. Streamlit 可视化
-
-启动界面：
+## 17. Streamlit
 
 ```bash
 streamlit run web/app.py
 ```
 
-Windows 也可以运行：
+当前页面支持：
 
-```text
-run_web.bat
-```
-
-推荐选择：
-
-```text
-Data:
-data/processed/bnci2014_001_s01.h5
-
-Model package:
-runs/stage05_50m/model_package
-
-Compute device:
-cpu
-
-Session:
-1test
-
-Window:
-10.0 s
-
-Step:
-0.5 s
-```
-
-页面当前支持：
-
-- 数据文件和 Model Package 发现；
-- 模型 Adapter 与 Acquirer 选择；
-- Compute device；
-- Session；
-- Replay speed；
-- Maximum windows；
-- Confidence threshold；
+- Runtime Package 选择；
+- HDF5 Replay；
 - Start / Stop / Restart；
-- EEG 波形；
-- 当前预测与置信度；
+- EEG waveform；
+- 当前 prediction / confidence / command；
 - Prediction History；
-- 当前、平均和 P95 延迟；
-- 窗口处理和运行状态。
+- current / average / P95 latency；
+- window completion / failure；
+- 可选 JSONL logging。
+
+当前 Streamlit 主要用于 HDF5 Replay；Stage 2B 真实设备推理使用独立实时 Probe。
 
 ---
 
-## 16. 分层 Smoke Test
+## 18. Stage 2A：Neuracle 离线数据
 
-```bash
-python scripts/smoke_test_50m_tokenization.py
-python scripts/smoke_test_50m_backbone.py
-python scripts/smoke_test_50m_classifier.py
-python scripts/smoke_test_50m_adapter.py
-python scripts/smoke_test_50m_runtime.py
+仓库已提供：
+
+```text
+scripts/inspect_neuracle_bdf.py
+scripts/inspect_neuracle_trials.py
+scripts/align_neuracle_collect.py
+scripts/audit_neuracle_dataset.py
+scripts/export_neuracle_stage2a_4s.py
 ```
 
-Stage 0 LaBraM 回归测试：
+当前验证过的 Neuracle 导出中，`1.bdf` 同时包含连续信号与完整事件，可作为标准离线输入。具体流程见：
 
-```bash
-python scripts/smoke_test_labram.py \
-  --checkpoint checkpoints/labram-base.pth \
-  --device cpu
+```text
+docs/stage2a/neuracle_export_sop.md
 ```
 
-仅验证 Pipeline 结构时，可以使用随机初始化：
+---
+
+## 19. Stage 2B：真实 Neuracle → 50M 推理
+
+### 19.1 Source Probe
 
 ```bash
-python scripts/smoke_test_labram.py \
+python scripts/probe_neuracle_realtime.py --help
+```
+
+用于验证：
+
+```text
+JellyFish connection
+META
+packet continuity
+EEG / EOG / ECG / Trigger metadata
+reconnect / stop
+```
+
+### 19.2 Window Probe
+
+```bash
+python scripts/probe_neuracle_window_pipeline.py --help
+```
+
+用于验证：
+
+```text
+EEG-only selection
+Timestamped buffer
+4s / 0.5s windowing
+Trigger-window association
+gap / overflow / completion
+```
+
+### 19.3 真实实时 50M 推理
+
+```bash
+python scripts/probe_neuracle_runtime_inference.py \
+  --package <50m-runtime-package> \
   --device cpu \
-  --random-init
+  --duration-sec 60 \
+  --host 127.0.0.1 \
+  --port 8712 \
+  --expected-sfreq 1000 \
+  --window-sec 4 \
+  --step-sec 0.5
+```
+
+当前该 Probe **只接受 `model_50m` Runtime Package**，并拒绝 test head。
+
+成功窗口执行：
+
+```text
+RealtimeWindow
+→ RealtimeRuntimeBridge.prepare
+→ model_input_safe gate
+→ RuntimeModel.predict_prepared
+→ 50M Backbone
+→ Linear Head
+→ prediction
+```
+
+默认输出：
+
+```text
+runs/stage2b/neuracle_runtime_inference/
+├── runtime_predictions.jsonl
+└── runtime_inference_summary.json
+```
+
+逐窗口记录：
+
+```text
+window_id
+continuous_segment_id
+source_shape
+prepared_shape
+valid_channel_count
+predicted_class
+predicted_name
+confidence
+probabilities
+prepare_latency_ms
+inference_latency_ms
+total_model_latency_ms
+marker_summary
+```
+
+Summary 重点检查：
+
+```text
+status == passed
+missing_packets == 0
+duplicate_packets == 0
+out_of_order_packets == 0
+gap_count == 0
+model_input_failure_count == 0
+prediction_failure_count == 0
+prediction_success_count == emitted_windows
+```
+
+Stage 2B Probe 不持久化 EEG waveform。
+
+---
+
+## 20. Personalization / Adaptation
+
+### 20.1 已实现
+
+- Population Head；
+- Personal Head；
+- Personal Model Package；
+- Personal Model Registry；
+- Population vs Personal Replay；
+- `OfflineAdaptationStrategy` 基础接口；
+- `OnlineAdaptationStrategy` 基础接口；
+- `NoOfflineAdaptation` / `NoOnlineAdaptation`。
+
+### 20.2 尚未实现
+
+- Rest-Tune 真实训练策略；
+- NeuroOnline buffer / feedback update；
+- 在线 optimizer / rollback；
+- Rest-Tune + NeuroOnline 联合策略。
+
+当前推荐开发顺序：
+
+```text
+50M / LaBraM / CBraMod baseline
+        ↓
+2s / 3s / 4s 性能与 latency benchmark
+        ↓
+选择 Demo 主模型与窗口
+        ↓
+NeuroOnline v0
+frozen backbone + supervised online head update
+        ↓
+Rest-Tune
+        ↓
+Rest-Tune + NeuroOnline
 ```
 
 ---
 
-## 17. 运行测试
+## 21. 测试
 
-编译检查：
+### 21.1 编译
 
 ```bash
-python -m compileall src tests scripts web
+python -m compileall -q src scripts web tests
 ```
 
-运行测试：
+### 21.2 Unified Runtime / 模型回归
 
 ```bash
-pytest
+python -m pytest -q \
+  tests/test_model_50m_4s_runtime.py \
+  tests/test_runtime_package.py \
+  tests/test_replay_offline_cli.py \
+  tests/test_runtime_control.py \
+  tests/test_ui_runtime.py
 ```
 
-测试代码主要覆盖：
-
-- BNCI 窗口构造；
-- HDF5 数据读取；
-- 模型接口；
-- 50M Adapter 接口；
-- Runtime Model Package；
-- 滑窗推理；
-- Replay Acquirer；
-- CLI Replay；
-- Observability；
-- Runtime Control；
-- Run Report；
-- Streamlit Runtime。
-
----
-
-## 18. 预处理流程
-
-当前 Stage 0.5 暂定预处理流程：
-
-```text
-输入单位统一为 µV
--> 映射到标准 64 通道
--> 缺失通道补零并生成 channel_valid_mask
--> 可选平均参考，默认关闭
--> 在原始采样率下执行 0.1–75 Hz 带通滤波
--> 重采样到 100 Hz
--> 严格检查真实 10 秒 / 1000 点
--> 对有效通道按时间维执行 Z-score
--> 划分为 640 个长度为 100 的 Token
-```
-
-标准 64 通道列表见：
-
-```text
-docs/standard_64_channels.json
-```
-
----
-
-## 19. 运行指标
-
-### 19.1 Pipeline 指标
-
-- 运行时长；
-- Replay speed；
-- 预期窗口数；
-- 实际发出窗口数；
-- 成功推理窗口数；
-- 失败窗口数；
-- 窗口完成率；
-- 异常和超时信息。
-
-### 19.2 延迟指标
-
-- 当前延迟；
-- 平均延迟；
-- P95 延迟；
-- 单窗口推理时间；
-- 运行过程中延迟变化。
-
-### 19.3 操作与可观测性
-
-- Start / Stop / Restart 状态；
-- 配置加载结果；
-- 当前 Pipeline State；
-- 预测、置信度和历史记录；
-- JSONL 窗口日志；
-- Summary JSON；
-- 最后一次错误类型与错误信息。
-
----
-
-## 20. Stage 0 LaBraM 历史基线
-
-Stage 0 使用：
-
-```text
-configs/day1_bnci_s01.yaml
-```
-
-主要流程：
-
-```text
-BNCI2014_001 Subject 1
--> LaBraM Base
--> 缓存 Embedding
--> 训练 Linear Probe
--> 保存 Model Package
--> CLI Replay / Streamlit
-```
-
-完整运行：
+### 21.3 Stage 2B 专项
 
 ```bash
-python scripts/run_pipeline.py \
-  --config configs/day1_bnci_s01.yaml
+python -m pytest -q \
+  tests/test_neuracle_jellyfish.py \
+  tests/test_realtime_contracts.py \
+  tests/test_realtime_source_buffer.py \
+  tests/test_realtime_windowing.py \
+  tests/test_realtime_eeg_window_pipeline.py \
+  tests/test_realtime_runtime_mapping.py \
+  tests/test_realtime_runtime_bridge.py \
+  tests/test_probe_neuracle_runtime_inference.py
 ```
 
-分别运行：
+### 21.4 全量
 
 ```bash
-python scripts/train_linear_probe.py \
-  --config configs/day1_bnci_s01.yaml
-
-python scripts/replay_offline.py \
-  --config configs/day1_bnci_s01.yaml \
-  --max-windows 20
+python -m pytest -q
 ```
 
-LaBraM 仅作为历史基线和回归测试保留，当前默认正式模型为 50M。
-
----
-
-## 21. 当前边界
-
-1. 当前 50M Runtime 使用 10 秒输入配置；
-2. 正式分类头的训练窗口由同标签 4 秒 Trial 临时拼接得到；
-3. Replay 中的普通 10 秒滑窗可能跨越不同标签 Trial；
-4. 因此 Replay 单窗口预测不适合作为严格模型准确率评估；
-5. 目标采样率为 100 Hz，最终模型输入不能保留 50 Hz 以上频率成分；
-6. 当前 0.1–75 Hz 滤波设置仍需继续与 50M 预训练真实数据管线核对；
-7. 模型 checkpoint、分类头、HDF5 数据和运行结果不随 Git 仓库分发；
-8. 当前未自动从火山云 TOS 下载 checkpoint；
-9. 当前未完成 GPU 峰值显存统计；
-10. 当前尚未接入公司自采离线 EEG 数据；
-11. 当前尚未接入 EEG 设备真实实时流；
-12. 当前尚未完成简单个体化；
-13. 当前尚未实现 Rest-Tuning；
-14. 当前尚未实现在线自适应；
-15. 当前未接入实体终端控制。
-
----
-
-## 22. 下一阶段
-
-### Stage 1：简单个体化
-
-目标：
-
-- 使用多被试公开运动想象数据训练群体任务模型；
-- 留出未参与群体训练的新被试；
-- 使用目标被试少量带标签数据重训个人分类头；
-- 对比群体模型与个人模型；
-- 支持用户模型保存、加载、隔离和切换；
-- 比较不同个体化数据量下的 Accuracy / Macro-F1；
-- 验证个人模型在伪实时 Pipeline 中稳定运行。
-
-第一版优先采用：
+合并主分支前要求：
 
 ```text
-冻结 50M Backbone
-+ 使用目标被试少量数据重新训练分类头
+0 failed
+0 errors
 ```
-
-LoRA、Adapter 或最后几层微调作为后续增强对照。
-
-### Stage 2A：公司自采离线 EEG 数据兼容
-
-目标：
-
-- 完整保存公司设备的原始 EEG、事件、标签和设备元数据；
-- 检查通道名称、通道顺序、采样率、单位和参考方式；
-- 检查 NaN、缺失数据、异常通道、丢包和事件时间；
-- 将自采数据转换为统一中间数据结构；
-- 复用 Stage 0.5 的 50M Pipeline Preprocessor；
-- 验证自采数据可以正确进入 50M 并完成前向推理；
-- 验证离线读取与伪实时回放窗口一致。
-
-Stage 2A 主要验证数据兼容性，不以高准确率为主要验收门槛。
 
 ---
 
-## 23. Roadmap
+## 22. 合并 / Release 验收
 
 ```text
-Stage 0
-LaBraM 伪实时基础 Pipeline
-        |
-        v
-Stage 0.5
-50M 替换、正式分类头、Runtime Model Package、CLI 和 Streamlit
-        |
-        +-----------------------------+
-        |                             |
-        v                             v
-Stage 1                         Stage 2A
-简单个体化                     自采离线数据兼容
-        |                             |
-        |                             v
-        |                         Stage 2B
-        |                         EEG 设备实时接入
-        +-------------+---------------+
-                      |
-                      v
-                   Stage 3
-          实时 Pipeline + 简单个体化
-                      |
-                      v
-                  Stage 3.5
-              Rest-Tuning 静息态个体化
-                      |
-                      v
-                   Stage 4
-                  实时自适应
+[ ] python -m compileall -q src scripts web tests
+[ ] python -m pytest -q
+[ ] 50M Runtime Package 可导出并重新加载
+[ ] LaBraM Runtime Package 可导出并重新加载
+[ ] trial-aligned evaluator 可输出 Accuracy/BAcc/Macro-F1/Confusion Matrix
+[ ] CLI Replay 正常
+[ ] Streamlit Start / Stop / Restart 正常
+[ ] Stage 2B source/window/runtime inference 专项测试通过
+[ ] 真设备 Probe 无 packet gap / duplicate / out-of-order
+[ ] model_input_failure_count == 0
+[ ] prediction_failure_count == 0
+[ ] prediction_success_count == emitted_windows
+[ ] Git 不包含 EEG 数据、Checkpoint、Runtime Package、运行结果或隐私信息
 ```
 
 ---
 
-## 24. 文档索引
+## 23. 已知限制
 
-| 文档 | 内容 |
-|---|---|
-| [`docs/README_50M_MODEL_ADAPTER.md`](docs/README_50M_MODEL_ADAPTER.md) | 50M Adapter、分类头训练、Model Package、CLI 和 Streamlit 详细说明 |
-| [`docs/50m_adapter_interface.md`](docs/50m_adapter_interface.md) | 50M Adapter 接口 |
-| [`docs/50m_model_notes.md`](docs/50m_model_notes.md) | 50M 模型接入记录 |
-| [`docs/current_pip_vs_50M.md`](docs/current_pip_vs_50M.md) | 原 Pipeline 与 50M 输入要求对比 |
-| [`docs/standard_64_channels.json`](docs/standard_64_channels.json) | 50M 标准 64 通道顺序 |
-| [`docs/BEGINNER_GUIDE.md`](docs/BEGINNER_GUIDE.md) | 新开发者上手说明 |
+- Stage 2B 当前实时推理入口只允许 **50M**；LaBraM 尚未接入真实 JellyFish Probe；
+- Stage 2B 当前批准的 Runtime Gate 固定为 **4s / 1000Hz source → 4s / 100Hz 50M**；2s/3s 实时 Contract 尚需扩展；
+- Stage 1A 个体化目前只训练任务 Head；
+- Rest-Tune 与 NeuroOnline 只有接口，尚未形成算法闭环；
+- Streamlit 当前仍以 HDF5 Replay 为主，不直接消费 JellyFish 实时 Source；
+- 实时 Trigger 当前进入窗口 metadata / prediction record，但任务级 Trigger code → class label 映射应由具体实验协议定义，不能在设备层硬编码；
+- macOS 上 LaBraM/宽 Linear Head 优先使用 CPU，当前环境下 MPS 可能不稳定；
+- `pyedflib` 尚未写入主依赖文件，新环境使用 Neuracle vendor 代码前需单独安装。
 
 ---
 
-## 25. 开发约定
+## 24. 重要文档
 
-- 所有命令默认从仓库根目录执行；
-- 使用 `python -m pip install -e .` 安装当前仓库；
-- 不在业务脚本中直接使用 `from src...`；
-- Python 导入统一使用 `bci_dayloop...`；
-- 通用 Pipeline 不硬编码模型专属采样率、通道和窗口参数；
-- 模型专属逻辑放在对应 Model Adapter 和 Pipeline Preprocessor 中；
-- 训练产物必须能够保存，并在新进程中重新加载；
-- checkpoint、HDF5、运行日志、访问密钥和本机绝对路径不得提交到 Git；
-- 新阶段功能通过独立分支开发，并通过 Pull Request 合入 `main`；
-- 合并前至少运行：
+```text
+docs/README_stage0.md
+docs/README_stage05.md
+docs/STAGE1_PERSONALIZATION.md
 
-```bash
-python -m compileall src tests scripts web
-pytest
+docs/stage2a/neuracle_export_sop.md
+
+docs/stage2b/device_realtime_interface_audit.md
+docs/stage2b/neuracle_material_audit.md
+docs/stage2b/neuracle_real_device_validation.md
+docs/stage2b/neuracle_realtime_unit_evidence.md
+docs/stage2b/neuracle_trigger_validation.md
+docs/stage2b/neuracle_window_pipeline_validation.md
+docs/stage2b/realtime_model_input_contract_audit.md
+docs/stage2b/realtime_runtime_input_contract.md
 ```
+
+部分 Stage 2B audit 文档记录的是开发中间阶段的 fail-closed 状态，例如“仅允许 prepare、禁止 inference”。当前最新实时推理入口以：
+
+```text
+scripts/probe_neuracle_runtime_inference.py
+```
+
+以及对应测试：
+
+```text
+tests/test_probe_neuracle_runtime_inference.py
+```
+
+为准。
+
+---
+
+## 25. Git 与隐私边界
+
+以下内容不得提交：
+
+```text
+data/raw/**
+data/cache/**
+data/moabb_cache/**
+data/processed/**
+checkpoints/**
+runs/**
+model_packages/**
+registries/**
+```
+
+真实设备验证文档与日志不得包含：
+
+- EEG waveform / 原始样本值；
+- 受试者身份信息；
+- 设备序列号；
+- 私有网络地址；
+- 本机绝对路径；
+- 未脱敏设备标识。
+
+---
+
+## 26. 当前开发重点
+
+当前框架层已经进入相对稳定阶段。后续模型端优先：
+
+1. 固定 50M / LaBraM baseline；
+2. 接入 CBraMod；
+3. 比较 2s / 3s / 4s 窗口下的 BAcc、Macro-F1、prepare latency、inference P50/P95；
+4. 选择单被试 Demo 主模型与窗口长度；
+5. 实现 NeuroOnline v0；
+6. 再推进 Rest-Tune 与 Rest-Tune + NeuroOnline。
+
+设备端继续负责 JellyFish、数据连续性、时间戳与 Trigger；模型端从 `RealtimeWindow / RawEEGWindow` 之后负责窗口配置、Runtime、模型、适配与评估。

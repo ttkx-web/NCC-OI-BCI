@@ -3,27 +3,44 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import numpy as np
 from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from _bootstrap import ROOT  # noqa: F401
+
 from bci_dayloop.acquisition.factory import AcquirerFactory
-from bci_dayloop.data.hdf5_dataset import EEGHDF5, HDF5Metadata
+from bci_dayloop.data.hdf5_dataset import (
+    EEGHDF5,
+    HDF5Metadata,
+)
 from bci_dayloop.inference.observability import (
     JsonlWindowLogger,
     PipelineRunStats,
     PipelineStatsSnapshot,
     calculate_expected_windows,
 )
-from bci_dayloop.inference.realtime import SlidingWindowDecoder
-from bci_dayloop.inference.run_report import PipelineRunReport
-from bci_dayloop.inference.runtime_control import PipelineController, PipelineControllerSnapshot, PipelineState
-from bci_dayloop.models.factory import ModelFactory
-from bci_dayloop.models.runtime_package import ModelRuntimePackage, validate_runtime_request
-from bci_dayloop.utils.config import load_yaml, resolve_path
-
+from bci_dayloop.inference.realtime import (
+    SlidingWindowDecoder,
+)
+from bci_dayloop.inference.run_report import (
+    PipelineRunReport,
+)
+from bci_dayloop.inference.runtime_control import (
+    PipelineController,
+    PipelineControllerSnapshot,
+    PipelineState,
+)
+from bci_dayloop.packages.loader import (
+    LoadedRuntimePackage,
+    load_runtime_package,
+)
+from bci_dayloop.utils.config import (
+    load_yaml,
+    resolve_path,
+)
 
 @dataclass(frozen=True, slots=True)
 class ReplaySettings:
@@ -44,7 +61,7 @@ class ReplaySettings:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pseudo-realtime HDF5 replay through a model package")
-    parser.add_argument("--config", default="configs/day1_bnci_s01.yaml")
+    parser.add_argument("--config", default="configs/stage0/day1_bnci_s01.yaml")
     parser.add_argument("--data")
     parser.add_argument("--model-package")
     parser.add_argument("--device", choices=["cpu", "cuda"], default=None)
@@ -70,7 +87,7 @@ def resolve_replay_settings(args: argparse.Namespace, config: dict[str, Any]) ->
     data_config = dict(config.get("data", {}))
     run_dir = Path(project.get("run_dir", "runs/day1_bnci_s01"))
 
-    data_value = _first_defined(args.data, data_config.get("output_hdf5"), "data/processed/bnci2014_001_s01.h5")
+    data_value = _first_defined(args.data, data_config.get("output_hdf5"), "data/processed/bnci2014_001/subject_01.h5")
     package_value = _first_defined(args.model_package, replay.get("model_package"), run_dir / "model_package")
     device = str(_first_defined(args.device, model_config.get("device"), "cuda"))
     maximum_value = _first_defined(args.max_windows, replay.get("max_windows"), 100)
@@ -143,7 +160,7 @@ def build_report(
     controller_snapshot: PipelineControllerSnapshot | None,
     fallback_state: PipelineState = PipelineState.IDLE,
     fallback_error: Exception | None = None,
-    runtime_package: ModelRuntimePackage | None = None,
+    runtime_package: LoadedRuntimePackage | None = None,
 ) -> PipelineRunReport:
     if controller_snapshot is None:
         state = fallback_state.value
@@ -196,25 +213,45 @@ def build_report(
 def build_pipeline_controller(
     settings: ReplaySettings,
     *,
-    model: Any,
-    preprocessor: Any,
+    runtime_package: LoadedRuntimePackage,
     metadata: HDF5Metadata,
-    command_map: dict[str, str],
-    class_names: list[str] | tuple[str, ...] | None = None,
     stats: PipelineRunStats,
     target_windows: int,
 ) -> PipelineController:
-    logger = JsonlWindowLogger(settings.jsonl_log_path) if settings.jsonl_log_path is not None else None
+    logger = (
+        JsonlWindowLogger(
+            settings.jsonl_log_path
+        )
+        if settings.jsonl_log_path
+        is not None
+        else None
+    )
+
     decoder = SlidingWindowDecoder(
-        model,
-        preprocessor,
-        list(class_names or metadata.class_names),
+        runtime_model=(
+            runtime_package.runtime_model
+        ),
+        class_names=(
+            runtime_package.class_names
+        ),
+        channel_names=(
+            metadata.channel_names
+        ),
         sample_rate=metadata.sample_rate,
         input_unit=metadata.unit,
-        window_sec=settings.window_sec,
-        step_sec=settings.step_sec,
-        confidence_threshold=settings.confidence_threshold,
-        command_map=command_map,
+        window_sec=(
+            runtime_package.window_sec
+        ),
+        step_sec=(
+            runtime_package.step_sec
+        ),
+        confidence_threshold=(
+            runtime_package
+            .confidence_threshold
+        ),
+        command_map=(
+            runtime_package.command_map
+        ),
         run_stats=stats,
         jsonl_logger=logger,
     )
@@ -230,7 +267,11 @@ def build_pipeline_controller(
             step_sec=settings.step_sec,
         )
 
-    return PipelineController(decoder, acquirer_factory, max_windows=target_windows)
+    return PipelineController(
+        decoder,
+        acquirer_factory,
+        max_windows=target_windows,
+    )
 
 
 def stop_after_keyboard_interrupt(controller: PipelineController | None) -> Exception | None:
@@ -268,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     stats = PipelineRunStats()
     metadata: HDF5Metadata | None = None
     model_name: str | None = None
-    runtime_package: ModelRuntimePackage | None = None
+    runtime_package: LoadedRuntimePackage | None = None
     expected_windows = 0
     target_windows = 0
     controller: PipelineController | None = None
@@ -279,17 +320,126 @@ def main(argv: list[str] | None = None) -> int:
         dataset = EEGHDF5(settings.data_path)
         metadata = dataset.metadata
         trials = dataset.load(settings.session)["data"]
-        runtime_package = ModelFactory.load_runtime_package(settings.model_package, metadata, device=settings.device)
+        runtime_package = load_runtime_package(
+            settings.model_package,
+            device=settings.device,
+            verify_hashes=True,
+        )
+        dataset_classes = tuple(
+            str(name)
+            for name in metadata.class_names
+        )
+
+        if dataset_classes != runtime_package.class_names:
+            raise ValueError(
+                "Dataset class order does not match "
+                "Runtime Model Package: "
+                f"dataset={dataset_classes}, "
+                f"package={runtime_package.class_names}."
+            )
         package_window = runtime_package.window_sec
         package_step = runtime_package.step_sec
-        explicit_window = args.window_sec is not None
-        explicit_step = args.step_sec is not None
-        if runtime_package.model_name == "50m-linear":
-            if explicit_window or "window_sec" in config.get("replay", {}):
-                validate_runtime_request(runtime_package, window_sec=settings.window_sec, step_sec=package_step)
-            if explicit_step or "step_sec" in config.get("replay", {}):
-                validate_runtime_request(runtime_package, window_sec=package_window, step_sec=settings.step_sec)
-            settings = dataclass_replace(settings, window_sec=package_window, step_sec=package_step)
+
+        explicit_window = (
+                args.window_sec is not None
+                or "window_sec" in config.get("replay", {})
+        )
+
+        explicit_step = (
+                args.step_sec is not None
+                or "step_sec" in config.get("replay", {})
+        )
+        if (
+                explicit_window
+                and not np.isclose(
+            settings.window_sec,
+            package_window,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested window_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.window_sec}, "
+                f"package={package_window}."
+            )
+
+        if (
+                explicit_step
+                and not np.isclose(
+            settings.step_sec,
+            package_step,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested step_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.step_sec}, "
+                f"package={package_step}."
+            )
+        package_window = (
+            runtime_package.window_sec
+        )
+
+        package_step = (
+            runtime_package.step_sec
+        )
+
+        explicit_window = (
+                args.window_sec is not None
+                or "window_sec"
+                in config.get("replay", {})
+        )
+
+        explicit_step = (
+                args.step_sec is not None
+                or "step_sec"
+                in config.get("replay", {})
+        )
+
+        if (
+                explicit_window
+                and not np.isclose(
+            settings.window_sec,
+            package_window,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested window_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.window_sec}, "
+                f"package={package_window}."
+            )
+
+        if (
+                explicit_step
+                and not np.isclose(
+            settings.step_sec,
+            package_step,
+            atol=1e-6,
+            rtol=0.0,
+        )
+        ):
+            raise ValueError(
+                "Requested step_sec does not match "
+                "the Runtime Model Package: "
+                f"requested={settings.step_sec}, "
+                f"package={package_step}."
+            )
+
+        settings = dataclass_replace(
+            settings,
+            window_sec=package_window,
+            step_sec=package_step,
+            confidence_threshold=(
+                runtime_package.confidence_threshold
+            ),
+        )
         expected_windows, target_windows = expected_and_target_windows(
             trial_count=int(trials.shape[0]),
             samples_per_trial=int(trials.shape[-1]),
@@ -305,11 +455,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"WARNING: {runtime_package.warning_message}", file=sys.stderr)
         controller = build_pipeline_controller(
             settings,
-            model=runtime_package.model,
-            preprocessor=runtime_package.preprocessor,
+            runtime_package=runtime_package,
             metadata=metadata,
-            command_map=runtime_package.command_map,
-            class_names=runtime_package.class_names,
             stats=stats,
             target_windows=target_windows,
         )

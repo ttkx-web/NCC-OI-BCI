@@ -5,7 +5,7 @@ project:
 data:
   dataset: BNCI2014_001
   subject: 1
-  output_hdf5: data/processed/bnci2014_001_s01.h5
+  output_hdf5: data/processed/bnci2014_001/subject_01.h5
   train_session: 0train
   test_session: 1test
   trial_tmin_sec: 2.0
@@ -21,8 +21,8 @@ preprocessing:
 
 model:
   name: 50m-linear
-  checkpoint: checkpoints/50m/model_deploy.pt
-  classifier: checkpoints/50m_bnci2014_001_s01_linear_head.pt
+  checkpoint: checkpoints/backbones/50m/model_deploy.pt
+  classifier: checkpoints/heads/stage1/bnci2014_001/subject_01/population/4s_flatten/head.pt
   device: cpu
   freeze_encoder: true
 
@@ -45,7 +45,7 @@ training:
   patience: 12
 
 replay:
-  model_package: runs/stage05_50m/model_package
+  model_package: model_packages/stage05/bnci2014_001/subject_01/population/10s_flatten/v1
 
   acquirer: replay
   session: 1test
@@ -58,8 +58,8 @@ replay:
   confidence_threshold: 0.55
   max_windows: 100
 
-  jsonl_log: runs/stage05_50m/pipeline_windows.jsonl
-  summary_json: runs/stage05_50m/replay_summary.json
+  jsonl_log: runs/stage05/bnci2014_001/subject_01/replay/population/10s_flatten/pipeline_windows.jsonl
+  summary_json: runs/stage05/bnci2014_001/subject_01/replay/population/10s_flatten/replay_summary.json
 
 labels:
   class_names: [left_hand, right_hand, feet, tongue]

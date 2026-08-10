@@ -599,6 +599,9 @@ def build_classifier_metadata(
         "missing_channel_strategy": (
             "zero_with_valid_mask"
         ),
+        "model_n_time_patches": int(
+            config.model_n_time_patches
+        ),
     }
 
 
@@ -719,6 +722,21 @@ def _validate_checkpoint_metadata(
             mismatches.append(
                 f"{key}: checkpoint={actual_value!r}, "
                 f"current={expected_value!r}"
+            )
+
+    if "model_n_time_patches" in metadata:
+        actual_model_patches = int(
+            metadata["model_n_time_patches"]
+        )
+        expected_model_patches = int(
+            config.model_n_time_patches
+        )
+
+        if actual_model_patches != expected_model_patches:
+            mismatches.append(
+                "model_n_time_patches: "
+                f"checkpoint={actual_model_patches}, "
+                f"current={expected_model_patches}"
             )
 
     if mismatches:

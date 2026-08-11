@@ -11,4 +11,3 @@ router = APIRouter(prefix="/system", tags=["system"])
 @router.get("/status")
 def status() -> dict[str, object]:
     return system_status()
-

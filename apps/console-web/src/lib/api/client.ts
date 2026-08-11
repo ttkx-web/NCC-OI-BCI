@@ -25,4 +25,3 @@ export const consoleApi = {
   stopRun: (runId: string) => request(`/api/v1/runs/${runId}/stop`, { method: "POST" }),
   restartRun: (runId: string) => request(`/api/v1/runs/${runId}/restart`, { method: "POST" }),
 };
-

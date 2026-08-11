@@ -36,4 +36,3 @@ async def stream_run(websocket: WebSocket, run_id: str, service: RunService) -> 
         return
     finally:
         record.broker.unsubscribe(subscriber)
-

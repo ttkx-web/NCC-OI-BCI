@@ -21,4 +21,3 @@ def system_status() -> dict[str, object]:
         "runtime": {"state": "idle"},
         "compute": {"cuda_available": cuda_available},
     }
-

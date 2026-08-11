@@ -3,4 +3,3 @@ export const percent = (value: number | null | undefined, digits = 1) =>
 
 export const milliseconds = (value: number | null | undefined) =>
   value == null ? "—" : `${value.toFixed(1)} ms`;
-

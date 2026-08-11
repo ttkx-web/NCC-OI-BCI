@@ -23,4 +23,3 @@ def test_api_responses_do_not_expose_eeg_data_or_absolute_paths() -> None:
             assert '"waveform"' not in body
             assert "e:\\" not in body
             assert "c:\\users" not in body
-

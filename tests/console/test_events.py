@@ -72,4 +72,3 @@ def test_all_websocket_events_are_json_serializable_and_data_minimized() -> None
 def test_fatal_error_serialization_preserves_fail_closed_flag() -> None:
     event = error_event("run_test", code="MODEL_INPUT_UNSAFE", message="blocked", fatal=True)
     assert event["payload"]["fatal"] is True
-

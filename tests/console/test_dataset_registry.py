@@ -17,4 +17,3 @@ def test_dataset_discovery_returns_metadata_without_local_path(dataset_file: Pat
     payload = json.dumps(items[0].model_dump())
     assert str(dataset_file) not in payload
     assert ":\\" not in payload
-

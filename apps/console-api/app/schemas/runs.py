@@ -54,4 +54,3 @@ class RunSummary(ConsoleModel):
 
 class RunList(ConsoleModel):
     items: list[RunSummary]
-

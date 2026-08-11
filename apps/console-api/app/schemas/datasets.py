@@ -18,4 +18,3 @@ class DatasetSummary(ConsoleModel):
 
 class DatasetList(ConsoleModel):
     items: list[DatasetSummary]
-

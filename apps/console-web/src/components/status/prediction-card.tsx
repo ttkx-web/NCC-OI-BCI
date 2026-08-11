@@ -18,4 +18,3 @@ export function PredictionCard({ prediction = "left_hand", confidence = 0.824, p
     </SectionCard>
   );
 }
-

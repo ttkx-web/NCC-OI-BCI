@@ -43,4 +43,3 @@ app.include_router(api_router, prefix=settings.api_prefix)
 @app.websocket(f"{settings.websocket_prefix}/runs/{{run_id}}")
 async def run_websocket(websocket: WebSocket, run_id: str) -> None:
     await stream_run(websocket, run_id, websocket.app.state.runs)
-

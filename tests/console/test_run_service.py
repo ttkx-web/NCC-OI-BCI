@@ -83,4 +83,3 @@ def test_replay_rejects_invalid_model(runtime_package: Path, dataset_file: Path)
     service, _ = _service(runtime_package, dataset_file)
     with pytest.raises(LookupError):
         service.create_replay(_request("model_missing"))
-

@@ -9,4 +9,3 @@ class ConsoleModel(BaseModel):
 
 class MessageResponse(ConsoleModel):
     message: str
-

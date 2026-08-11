@@ -54,4 +54,3 @@ def restart_run(run_id: str, service: Annotated[RunService, Depends(run_service)
         raise HTTPException(status_code=404, detail="Run not found") from error
     except (RuntimeError, TimeoutError) as error:
         raise HTTPException(status_code=409, detail="Run is not ready to restart") from error
-

@@ -26,4 +26,3 @@ def test_invalid_model_package_is_ignored(runtime_package: Path) -> None:
     (invalid / "package.yaml").write_text("schema_version: 1\n", encoding="utf-8")
     registry = ModelRegistry([runtime_package.parents[3]])
     assert len(registry.list()) == 1
-

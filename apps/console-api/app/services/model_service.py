@@ -158,4 +158,3 @@ class ModelRegistry:
             return self._entries[model_id]
         except KeyError as error:
             raise LookupError(f"Unknown model_id: {model_id}") from error
-

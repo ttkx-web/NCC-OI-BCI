@@ -28,4 +28,3 @@ def get_model(model_id: str, registry: Annotated[ModelRegistry, Depends(model_re
         return registry.get_entry(model_id).summary
     except LookupError as error:
         raise HTTPException(status_code=404, detail="Model not found") from error
-

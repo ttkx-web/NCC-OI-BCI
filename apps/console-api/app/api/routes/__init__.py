@@ -1,2 +1,1 @@
 """Versioned REST routes."""
-

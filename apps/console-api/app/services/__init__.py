@@ -1,2 +1,1 @@
 """Console service layer."""
-

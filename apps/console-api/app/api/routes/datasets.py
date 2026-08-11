@@ -27,4 +27,3 @@ def get_dataset(
         return registry.get_entry(dataset_id, subject).summary
     except LookupError as error:
         raise HTTPException(status_code=404, detail="Dataset not found or subject is ambiguous") from error
-

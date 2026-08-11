@@ -80,4 +80,3 @@ class DatasetRegistry:
             detail = "subject_id is required" if len(candidates) > 1 else "dataset was not found"
             raise LookupError(f"{dataset_id}: {detail}")
         return candidates[0]
-

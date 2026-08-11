@@ -8,4 +8,3 @@ export function connectRun(runId: string, onEvent: (event: RunEvent) => void): W
   socket.onmessage = (message) => onEvent(JSON.parse(message.data) as RunEvent);
   return socket;
 }
-

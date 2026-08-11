@@ -116,4 +116,3 @@ def input_contract_event(
 
 def error_event(run_id: str, *, code: str, message: str, fatal: bool) -> dict[str, Any]:
     return run_event("error", run_id, {"code": code, "message": message, "fatal": fatal})
-

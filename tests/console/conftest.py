@@ -74,4 +74,3 @@ def dataset_file(tmp_path: Path) -> Path:
         handle.attrs["unit"] = "uV"
         handle.attrs["dataset_name"] = "BNCI2014_001"
     return path
-

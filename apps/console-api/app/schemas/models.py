@@ -25,4 +25,3 @@ class ModelSummary(ConsoleModel):
 
 class ModelList(ConsoleModel):
     items: list[ModelSummary]
-

@@ -135,4 +135,3 @@ pnpm dev
 ```
 
 默认前端地址为 `http://127.0.0.1:3000`，API 为 `http://127.0.0.1:8000`。可通过 `NEXT_PUBLIC_CONSOLE_API_URL` 修改 API 地址。
-

@@ -15,4 +15,3 @@ router = APIRouter(prefix="/subjects", tags=["subjects"])
 def list_subjects(registry: Annotated[DatasetRegistry, Depends(dataset_registry)]) -> dict[str, object]:
     subjects = sorted({item.subject_id for item in registry.list()})
     return {"items": [{"id": subject, "display_name": f"被试 {subject}"} for subject in subjects]}
-

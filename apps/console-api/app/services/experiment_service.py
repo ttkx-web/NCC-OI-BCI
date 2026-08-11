@@ -2,4 +2,3 @@
 
 P0 exposes only an empty read model and never starts evaluation jobs.
 """
-

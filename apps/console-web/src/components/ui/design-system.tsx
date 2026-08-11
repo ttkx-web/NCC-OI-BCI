@@ -66,4 +66,3 @@ export function KeyValue({ label, value }: { label: string; value: ReactNode }) 
 export function ProgressBar({ value, tone = "brand" }: { value: number; tone?: Tone }) {
   return <div className="progress-track"><span className={`progress-fill progress-${tone}`} style={{ width: `${Math.max(0, Math.min(100, value))}%` }} /></div>;
 }
-

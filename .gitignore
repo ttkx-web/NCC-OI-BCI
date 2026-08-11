@@ -27,6 +27,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Web Console frontend
+node_modules/
+.next/
+out/
+.env.local
+
 .venv/
 venv/
 

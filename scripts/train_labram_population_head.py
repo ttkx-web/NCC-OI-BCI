@@ -403,10 +403,9 @@ def load_preprocessed_subject_session(
     path: Path,
     session_name: str,
     preprocessor: EEGPreprocessor,
-    reference_metadata: (
-        HDF5Metadata | None
-    ),
+    reference_metadata: HDF5Metadata | None,
     expected_window_sec: float,
+    trial_window_anchor: str = "end",
     maximum_per_class: int | None,
     seed: int,
     requested_channel_names: (
@@ -473,24 +472,74 @@ def load_preprocessed_subject_session(
         dtype=np.int64,
     )
 
-    raw_window_sec = (
-        raw_data.shape[-1]
+    source_num_samples = int(source_data.shape[-1])
+    source_window_sec = (
+        source_num_samples
+        / float(metadata.sample_rate)
+    )
+
+    target_num_samples = int(
+        round(
+            float(expected_window_sec)
+            * float(metadata.sample_rate)
+        )
+    )
+
+    if target_num_samples <= 0:
+        raise ValueError(
+            "expected_window_sec must resolve to at least "
+            "one sample."
+        )
+
+    resolved_window_sec = (
+        target_num_samples
         / float(metadata.sample_rate)
     )
 
     if not np.isclose(
-        raw_window_sec,
+        resolved_window_sec,
         expected_window_sec,
         rtol=0.0,
         atol=1e-6,
     ):
         raise ValueError(
+            "expected_window_sec is not representable at "
+            f"the source sampling rate: "
+            f"requested={expected_window_sec}, "
+            f"resolved={resolved_window_sec}."
+        )
+
+    if target_num_samples > source_num_samples:
+        raise ValueError(
             f"{path}: source trials are "
-            f"{raw_window_sec:.6f}s, but this "
-            f"experiment requires "
-            f"{expected_window_sec:.6f}s direct "
-            "trials. Do not silently crop or "
-            "concatenate trials."
+            f"{source_window_sec:.6f}s, but the requested "
+            f"window is {expected_window_sec:.6f}s. "
+            "This script may crop an existing trial, but "
+            "never concatenate trials or pad missing data."
+        )
+
+    if trial_window_anchor == "end":
+        start_sample = source_num_samples - target_num_samples
+        end_sample = source_num_samples
+    elif trial_window_anchor == "start":
+        start_sample = 0
+        end_sample = target_num_samples
+    else:
+        raise ValueError(
+            "trial_window_anchor must be 'start' or 'end', "
+            f"got {trial_window_anchor!r}."
+        )
+
+    raw_data = np.ascontiguousarray(
+        raw_data[:, :, start_sample:end_sample],
+        dtype=np.float32,
+    )
+
+    if raw_data.shape[-1] != target_num_samples:
+        raise RuntimeError(
+            "Selected trial window has an unexpected sample "
+            f"count: expected={target_num_samples}, "
+            f"actual={raw_data.shape[-1]}."
         )
 
     X = preprocessor.transform(
@@ -512,18 +561,13 @@ def load_preprocessed_subject_session(
             "match labels."
         )
 
-    if X.shape[1] != len(
-        metadata.channel_names
-    ):
+    if X.shape[1] != len(metadata.channel_names):
         raise ValueError(
             "Preprocessed channel count does not "
             "match metadata."
         )
 
-    if (
-        X.shape[-1]
-        != preprocessor.config.patch_samples
-    ):
+    if X.shape[-1] != preprocessor.config.patch_samples:
         raise ValueError(
             "Unexpected LaBraM patch length: "
             f"{X.shape[-1]}."
@@ -532,8 +576,7 @@ def load_preprocessed_subject_session(
     expected_patches = int(
         round(
             expected_window_sec
-            * preprocessor.config
-            .target_sample_rate
+            * preprocessor.config.target_sample_rate
             / preprocessor.config.patch_samples
         )
     )
@@ -548,9 +591,7 @@ def load_preprocessed_subject_session(
     X, labels = limit_trials_per_class(
         X,
         labels,
-        maximum_per_class=(
-            maximum_per_class
-        ),
+        maximum_per_class=maximum_per_class,
         seed=seed,
     )
 
@@ -570,6 +611,12 @@ def load_preprocessed_subject_session(
         "raw_shape": list(
             raw_data.shape
         ),
+        "source_raw_shape": list(
+            source_data.shape
+        ),
+        "selected_raw_shape": list(
+            raw_data.shape
+        ),
         "preprocessed_shape": list(
             X.shape
         ),
@@ -582,15 +629,17 @@ def load_preprocessed_subject_session(
         "selected_channel_names": list(
             metadata.channel_names
         ),
+        "source_window_seconds": float(source_window_sec),
+        "selected_window_seconds": float(resolved_window_sec),
+        "trial_window_anchor": trial_window_anchor,
+        "start_sample": int(start_sample),
+        "end_sample": int(end_sample),
         "num_trials": int(len(X)),
         "class_counts": class_counts,
     }
 
     return (
-        np.asarray(
-            X,
-            dtype=np.float32,
-        ),
+        np.asarray(X, dtype=np.float32),
         labels,
         metadata,
         summary,
@@ -793,6 +842,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--window-sec",
         type=float,
         default=4.0,
+    )
+
+    parser.add_argument(
+        "--trial-window-anchor",
+        choices=["start", "end"],
+        default="end",
+        help=(
+            "How to select a shorter direct window from "
+            "the stored trial. 'end' keeps the trial end "
+            "fixed; for BNCI [2,6], 3s becomes [3,6]."
+        ),
     )
 
     parser.add_argument(
@@ -1143,6 +1203,7 @@ def main() -> None:
                 expected_window_sec=(
                     args.window_sec
                 ),
+                trial_window_anchor=args.trial_window_anchor,
                 maximum_per_class=(
                     args
                     .max_trials_per_class_per_subject
@@ -1174,6 +1235,7 @@ def main() -> None:
                 expected_window_sec=(
                     args.window_sec
                 ),
+                trial_window_anchor=args.trial_window_anchor,
                 maximum_per_class=(
                     args
                     .max_trials_per_class_per_subject
@@ -1351,6 +1413,7 @@ def main() -> None:
         expected_window_sec=(
             args.window_sec
         ),
+        trial_window_anchor=args.trial_window_anchor,
         maximum_per_class=(
             args
             .max_trials_per_class_per_subject

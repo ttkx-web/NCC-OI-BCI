@@ -1624,6 +1624,13 @@ def main() -> None:
             "padding": False,
             "cross_trial_concatenation": False,
         },
+        "missing_channel_policy": (
+            config.missing_channel_policy
+        ),
+        "min_observed_channels": (
+            config.min_observed_channels
+        ),
+        "spline_alpha": config.spline_alpha,
     }
 
     preprocessing_hash = stable_json_hash(

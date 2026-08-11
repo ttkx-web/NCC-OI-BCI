@@ -50,8 +50,8 @@ CHANNEL_ALIASES: dict[str, str] = {
 
 ReferenceMode = Literal["none", "average"]
 NormalizationMode = Literal["none", "per_window_zscore"]
+MissingChannelPolicy = Literal["error", "spherical_spline"]
 HeadType = Literal["official_mlp", "linear"]
-
 
 @dataclass(frozen=True, slots=True)
 class CBraModConfig:
@@ -120,8 +120,25 @@ class CBraModConfig:
     normalization: NormalizationMode = "none"
     zscore_eps: float = 1e-8
 
-    # 不允许缺失通道补零；22 通道空间布局是该模型输入的一部分。
-    allow_missing_channels: bool = False
+    # 通道匹配规则：
+    # - 输入中不属于 standard_channels 的通道会直接丢弃；
+    # - 映射到同一目标通道的多个输入通道会取平均；
+    # - 缺失目标通道的处理由 missing_channel_policy 决定。
+    #
+    # error:
+    #   保持原始严格 CBraMod 基线：只要缺少任一目标通道即报错。
+    #
+    # spherical_spline:
+    #   使用已观测到的目标通道，通过通用 standard_1005 电极坐标进行
+    #   球面样条插值，生成缺失目标通道；不会把全 0 通道送入 backbone。
+    missing_channel_policy: MissingChannelPolicy = "error"
+
+    # 仅在 missing_channel_policy="spherical_spline" 时生效。
+    # 这是最低质量门槛，不是设备通道数；必须由训练/部署协议明确记录。
+    min_observed_channels: int = 2
+
+    # 插值矩阵的 Tikhonov 正则项，固定记录到模型包，保证可复现。
+    spline_alpha: float = 1e-5
 
     # ------------------------------------------------------------------
     # 分类头
@@ -156,6 +173,31 @@ class CBraModConfig:
             Path(self.checkpoint_path),
         )
 
+        required_observed = (
+            self.n_channels
+            if self.min_observed_channels is None
+            else int(self.min_observed_channels)
+        )
+
+        if not 1 <= required_observed <= self.n_channels:
+            raise ValueError(
+                "min_observed_channels must be in "
+                f"[1, {self.n_channels}], got "
+                f"{required_observed}."
+            )
+
+        if (
+                self.missing_channel_policy == "error"
+                and required_observed != self.n_channels
+        ):
+            raise ValueError(
+                "missing_channel_policy='error' requires "
+                "min_observed_channels == n_channels."
+            )
+
+        if self.spline_alpha <= 0:
+            raise ValueError("spline_alpha must be positive.")
+
         if self.classifier_path is not None:
             object.__setattr__(
                 self,
@@ -184,6 +226,39 @@ class CBraModConfig:
                 f"len(standard_channels)="
                 f"{len(self.standard_channels)}."
             )
+        if self.missing_channel_policy not in {
+            "error",
+            "spherical_spline",
+        }:
+            raise ValueError(
+                "Unsupported missing_channel_policy: "
+                f"{self.missing_channel_policy!r}."
+            )
+
+        required_observed_channels = (
+            self.n_channels
+            if self.min_observed_channels is None
+            else int(self.min_observed_channels)
+        )
+
+        if not 1 <= required_observed_channels <= self.n_channels:
+            raise ValueError(
+                "min_observed_channels must be in "
+                f"[1, {self.n_channels}], got "
+                f"{required_observed_channels}."
+            )
+
+        if (
+                self.missing_channel_policy == "error"
+                and required_observed_channels != self.n_channels
+        ):
+            raise ValueError(
+                "missing_channel_policy='error' requires "
+                "min_observed_channels to be None or n_channels."
+            )
+
+        if self.spline_alpha <= 0:
+            raise ValueError("spline_alpha must be positive.")
 
         normalized_names = tuple(
             channel.strip().upper()
@@ -263,6 +338,30 @@ class CBraModConfig:
                 "zscore_eps must be positive."
             )
 
+        if self.missing_channel_policy not in {
+            "error",
+            "spherical_spline",
+        }:
+            raise ValueError(
+                "Unsupported missing_channel_policy: "
+                f"{self.missing_channel_policy!r}."
+            )
+
+        if not (
+            2 <= self.min_observed_channels
+            <= self.n_channels
+        ):
+            raise ValueError(
+                "min_observed_channels must be in "
+                f"[2, {self.n_channels}], got "
+                f"{self.min_observed_channels}."
+            )
+
+        if self.spline_alpha <= 0:
+            raise ValueError(
+                "spline_alpha must be positive."
+            )
+
         if self.head_type not in {"official_mlp", "linear"}:
             raise ValueError(
                 f"Unsupported head_type: {self.head_type!r}."
@@ -298,6 +397,14 @@ class CBraModConfig:
             raise ValueError(
                 "input_unit cannot be empty."
             )
+
+    @property
+    def required_observed_channels(self) -> int:
+        return (
+            self.n_channels
+            if self.min_observed_channels is None
+            else int(self.min_observed_channels)
+        )
 
     @property
     def num_samples(self) -> int:

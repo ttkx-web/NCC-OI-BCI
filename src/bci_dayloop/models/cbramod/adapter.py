@@ -507,9 +507,13 @@ class CBraModAdapter(BaseModelAdapter):
             "reference_mode": self.config.reference_mode,
             "normalization": self.config.normalization,
             "zscore_eps": self.config.zscore_eps,
-            "allow_missing_channels": (
-                self.config.allow_missing_channels
+            "missing_channel_policy": (
+                self.config.missing_channel_policy
             ),
+            "min_observed_channels": (
+                self.config.min_observed_channels
+            ),
+            "spline_alpha": self.config.spline_alpha,
         }
 
         preprocessing_payload.update(preprocessing or {})
@@ -812,10 +816,22 @@ class CBraModAdapter(BaseModelAdapter):
                     1e-8,
                 )
             ),
-            allow_missing_channels=bool(
+            missing_channel_policy=str(
                 preprocessing.get(
-                    "allow_missing_channels",
-                    False,
+                    "missing_channel_policy",
+                    "error",
+                )
+            ),
+            min_observed_channels=int(
+                preprocessing.get(
+                    "min_observed_channels",
+                    2,
+                )
+            ),
+            spline_alpha=float(
+                preprocessing.get(
+                    "spline_alpha",
+                    1e-5,
                 )
             ),
 

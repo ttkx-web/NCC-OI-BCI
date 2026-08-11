@@ -338,6 +338,24 @@ def runtime_kwargs_from_training_report(
                 "official_mlp",
             )
         ),
+        "missing_channel_policy": str(
+            preprocessing.get(
+                "missing_channel_policy",
+                "error",
+            )
+        ),
+        "min_observed_channels": int(
+            preprocessing.get(
+                "min_observed_channels",
+                2,
+            )
+        ),
+        "spline_alpha": float(
+            preprocessing.get(
+                "spline_alpha",
+                1e-5,
+            )
+        ),
     }
 
 

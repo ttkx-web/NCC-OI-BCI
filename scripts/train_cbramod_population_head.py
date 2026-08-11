@@ -2111,6 +2111,11 @@ def main() -> None:
         config=config,
         class_names=class_names,
         extra_metadata={
+            "artifact_metadata": {
+                "trained_head": True,
+                "head_type": "population",
+                "is_test_head": False,
+            },
             "target_subject": target_subject,
             "population_training_subjects": (
                 population_subjects
@@ -2208,6 +2213,11 @@ def main() -> None:
         "classifier_state_dict_sha256": (
             classifier_state_dict_sha256
         ),
+        "artifact_metadata": {
+            "trained_head": True,
+            "head_type": "population",
+            "is_test_head": False,
+        },
         "deployment_profile": deployment_profile.name,
         "training_channel_source_count": (
             deployment_profile.training_channel_source_count

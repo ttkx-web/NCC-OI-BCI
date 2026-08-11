@@ -16,6 +16,10 @@ from _bootstrap import ROOT
 from bci_dayloop.data.hdf5_dataset import (
     EEGHDF5,
 )
+from bci_dayloop.data.channel_selection import (
+    select_named_channels,
+    strict_channel_indices,
+)
 from bci_dayloop.data.preprocessing import (
     PreprocessingConfig,
 )
@@ -151,13 +155,28 @@ def verify_package(
             "package window."
         )
 
+    required_channel_names = tuple(
+        loaded.runtime_model
+        .input_contract.channel_names
+    )
+    selected_data, selected_channel_names = (
+        select_named_channels(
+            trials[0, :, :raw_points],
+            source_channel_names=(
+                dataset.metadata.channel_names
+            ),
+            requested_channel_names=(
+                required_channel_names
+            ),
+            channel_axis=0,
+        )
+    )
+
     raw_window = RawEEGWindow(
-        data=trials[0, :, :raw_points],
-        channel_names=[
-            str(name)
-            for name
-            in dataset.metadata.channel_names
-        ],
+        data=selected_data,
+        channel_names=list(
+            selected_channel_names
+        ),
         sample_rate=float(
             dataset.metadata.sample_rate
         ),
@@ -191,6 +210,16 @@ def verify_package(
     ).all():
         raise RuntimeError(
             "Package produced NaN or Inf."
+        )
+
+    if not np.isclose(
+        float(probabilities.sum()),
+        1.0,
+        rtol=0.0,
+        atol=1e-5,
+    ):
+        raise RuntimeError(
+            "Package probabilities do not sum to 1."
         )
 
     return {
@@ -334,13 +363,52 @@ def main() -> None:
         for name in metadata["channel_names"]
     )
 
-    if tuple(
+    source_channel_names = tuple(
         str(name)
         for name in data_metadata.channel_names
-    ) != channel_names:
+    )
+    strict_channel_indices(
+        source_channel_names,
+        channel_names,
+    )
+
+    source_channel_count = metadata.get(
+        "source_channel_count"
+    )
+    if (
+        source_channel_count is not None
+        and int(source_channel_count)
+        != len(source_channel_names)
+    ):
         raise ValueError(
-            "Head channel order does not match "
-            "the HDF5 dataset."
+            "Head source_channel_count does not "
+            "match the HDF5 dataset."
+        )
+
+    selected_channel_count = metadata.get(
+        "selected_channel_count"
+    )
+    if (
+        selected_channel_count is not None
+        and int(selected_channel_count)
+        != len(channel_names)
+    ):
+        raise ValueError(
+            "Head selected_channel_count does not "
+            "match head channel_names."
+        )
+
+    if (
+        len(channel_names)
+        < len(source_channel_names)
+        and metadata.get(
+            "channel_selection_policy"
+        ) != "explicit_live_intersection"
+    ):
+        raise ValueError(
+            "A subset head must declare "
+            "channel_selection_policy="
+            "'explicit_live_intersection'."
         )
 
     preprocessing_config = (
@@ -409,6 +477,14 @@ def main() -> None:
                 package_id=(
                     "labram_bnci2014_001_"
                     "subject_01_population_4s"
+                    + (
+                        f"_live{len(channel_names)}"
+                        if metadata.get(
+                            "channel_selection_policy"
+                        )
+                        == "explicit_live_intersection"
+                        else ""
+                    )
                 ),
                 package_version=(
                     output_path.name

@@ -95,6 +95,50 @@ def required_mapping(
 
     return dict(value)
 
+def read_training_source_trial_selection(
+    *,
+    report: Mapping[str, Any],
+    source: Path,
+) -> dict[str, str]:
+    preprocessing = required_mapping(
+        report,
+        "preprocessing",
+        source=source,
+    )
+
+    selection = preprocessing.get(
+        "training_source_trial_selection"
+    )
+
+    if not isinstance(selection, Mapping):
+        raise ValueError(
+            f"{source}: preprocessing."
+            "training_source_trial_selection is missing. "
+            "Re-train with the variable-window training "
+            "script before exporting this package."
+        )
+
+    policy = str(selection.get("policy", ""))
+    anchor = str(selection.get("anchor", ""))
+
+    if policy != (
+        "one_contiguous_window_per_source_trial"
+    ):
+        raise ValueError(
+            f"{source}: unsupported training source-trial "
+            f"policy {policy!r}."
+        )
+
+    if anchor not in {"start", "center", "end"}:
+        raise ValueError(
+            f"{source}: unsupported training source-trial "
+            f"anchor {anchor!r}."
+        )
+
+    return {
+        "policy": policy,
+        "anchor": anchor,
+    }
 
 def required_file(
     path: Path,
@@ -301,13 +345,17 @@ def extract_first_trial_window(
     *,
     dataset: EEGHDF5,
     session_name: str,
+    window_seconds: float,
+    anchor: str,
 ) -> RawEEGWindow:
     """
-    用一个完整、带标签的原始 4 秒 trial 做 package smoke test。
+    从一个真实 HDF5 源 trial 中，按训练时相同的规则选择
+    一个完整目标窗口，用于 export smoke test。
 
-    这只检查 package 的加载与推理一致性，不报告准确率。
+    仅用于离线 source/package 一致性验证；
+    Runtime Replay 和真实设备会直接提供完整滑窗，
+    不会再次执行该裁剪。
     """
-
     loaded = dataset.load(session_name)
 
     data = np.asarray(
@@ -326,14 +374,55 @@ def extract_first_trial_window(
             f"Session {session_name!r} is empty."
         )
 
+    if anchor not in {"start", "center", "end"}:
+        raise ValueError(
+            f"Unsupported direct-trial anchor: {anchor!r}."
+        )
+
     metadata = dataset.metadata
+    sample_rate = float(metadata.sample_rate)
+
+    source_trial = data[0]
+    source_samples = int(source_trial.shape[-1])
+    target_samples = int(
+        round(window_seconds * sample_rate)
+    )
+
+    if target_samples <= 0:
+        raise ValueError(
+            "Target smoke-test window has no samples."
+        )
+
+    if target_samples > source_samples:
+        raise ValueError(
+            f"Source trial is only "
+            f"{source_samples / sample_rate:.3f}s, but "
+            f"package requires {window_seconds:.3f}s. "
+            "The export smoke test does not pad, concatenate, "
+            "or cross source-trial boundaries."
+        )
+
+    if anchor == "start":
+        start_sample = 0
+    elif anchor == "center":
+        start_sample = (
+            source_samples - target_samples
+        ) // 2
+    else:  # anchor == "end"
+        start_sample = source_samples - target_samples
+
+    end_sample = start_sample + target_samples
+
+    selected_trial = np.ascontiguousarray(
+        source_trial[:, start_sample:end_sample]
+    )
 
     return RawEEGWindow(
-        data=data[0],
+        data=selected_trial,
         channel_names=list(
             metadata.channel_names
         ),
-        sample_rate=float(metadata.sample_rate),
+        sample_rate=sample_rate,
         unit=str(metadata.unit),
         layout="CT",
         trial_id=str(
@@ -346,6 +435,30 @@ def extract_first_trial_window(
             "source": (
                 "export_cbramod_model_package"
             ),
+            "training_source_trial_selection": {
+                "policy": (
+                    "one_contiguous_window_per_source_trial"
+                ),
+                "anchor": anchor,
+                "source_samples": source_samples,
+                "source_seconds": (
+                    source_samples / sample_rate
+                ),
+                "selected_start_sample": start_sample,
+                "selected_end_sample_exclusive": (
+                    end_sample
+                ),
+                "selected_start_seconds": (
+                    start_sample / sample_rate
+                ),
+                "selected_end_seconds": (
+                    end_sample / sample_rate
+                ),
+                "selected_samples": target_samples,
+                "selected_seconds": (
+                    target_samples / sample_rate
+                ),
+            },
         },
     )
 
@@ -1053,6 +1166,17 @@ def main() -> None:
         ]
     )
 
+    training_source_trial_selection = (
+        read_training_source_trial_selection(
+            report=report,
+            source=training_report_path,
+        )
+    )
+
+    window_tag = (
+        f"{float(runtime_kwargs['window_seconds']):g}s"
+    )
+
     if len(runtime_kwargs["standard_channels"]) != int(
         runtime_kwargs["n_channels"]
     ):
@@ -1100,6 +1224,9 @@ def main() -> None:
         "classifier_source_sha256": sha256_file(
             classifier_path
         ),
+        "training_source_trial_selection": (
+            training_source_trial_selection
+        ),
     }
 
     print("=" * 72)
@@ -1130,6 +1257,12 @@ def main() -> None:
     raw_window = extract_first_trial_window(
         dataset=dataset,
         session_name=args.session,
+        window_seconds=float(
+            runtime_kwargs["window_seconds"]
+        ),
+        anchor=training_source_trial_selection[
+            "anchor"
+        ],
     )
 
     source_probabilities = predict_probabilities(
@@ -1178,7 +1311,7 @@ def main() -> None:
             package_id=(
                 "cbramod_bnci2014_001_"
                 f"subject_{int(report['target_subject']):02d}_"
-                "population_4s_frozen_head"
+                f"population_{window_tag}_frozen_head"
             ),
             package_version=output_path.name,
             dataset_name=str(metadata.dataset_name),

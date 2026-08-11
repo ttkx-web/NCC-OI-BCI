@@ -1,0 +1,46 @@
+benchmark:
+  mode: replay
+  device: cpu
+
+  data:
+    path: data/processed/bnci2014_001/subject_01.h5
+    session: 1test
+    source_mode: continuous_session
+
+  schedule:
+    step_sec: 0.5
+    align_decision_endpoints: true
+    warmup_windows: 20
+    measured_windows: 200
+
+  output:
+    root_dir: runs/benchmarks/window_latency
+    write_per_window_csv: true
+
+  candidates:
+    - id: labram_1s
+      package: model_packages/stage0/bnci2014_001/subject_01/labram/population/1s/v1
+    - id: labram_2s
+      package: model_packages/stage0/bnci2014_001/subject_01/labram/population/2s/v1
+    - id: labram_3s
+      package: model_packages/stage0/bnci2014_001/subject_01/labram/population/3s/v1
+    - id: labram_4s
+      package: model_packages/stage0/bnci2014_001/subject_01/labram/population/4s/v1
+
+    - id: model_50m_1s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/1s_flatten/v1
+    - id: model_50m_2s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/2s_flatten/v1
+    - id: model_50m_3s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/3s_flatten/v1
+    - id: model_50m_4s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/4s_flatten/v1
+
+    - id: cbramod_1s
+      package: model_packages/stage1/bnci2014_001/subject_01/cbramod/1s_flatten/v1
+    - id: cbramod_2s
+      package: model_packages/stage1/bnci2014_001/subject_01/cbramod/2s_flatten/v1
+    - id: cbramod_3s
+      package: model_packages/stage1/bnci2014_001/subject_01/cbramod/3s_flatten/v1
+    - id: cbramod_4s
+      package: model_packages/stage1/bnci2014_001/subject_01/cbramod/4s_flatten/v1

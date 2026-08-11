@@ -1,4 +1,4 @@
-"""Run the approved Neuracle realtime path through a 50M Runtime Package.
+"""Run the approved Neuracle realtime path through a Runtime Package.
 
 The probe never writes EEG samples or device-identifying connection metadata.
 It uses the existing source, unit selector, timestamped window pipeline, and
@@ -31,6 +31,11 @@ from bci_dayloop.realtime.neuracle_jellyfish import (
 )
 from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline, RealtimePipelineError
 from bci_dayloop.realtime.runtime_bridge import RealtimeRuntimeBridge
+from bci_dayloop.realtime.runtime_policy import (
+    RealtimeModelPolicy,
+    RealtimeModelPolicyRegistry,
+    RealtimePolicyError,
+)
 
 
 def _health_summary(health: Mapping[str, object]) -> dict[str, object]:
@@ -86,6 +91,10 @@ def _prediction_record(
     confidence: float,
     probabilities: list[float],
     inference_latency_ms: float,
+    model_type: str,
+    model_name: str,
+    package_id: str | None,
+    realtime_policy_id: str,
 ) -> dict[str, object]:
     """Create the intentionally metadata-only output for one successful window."""
     prepare_latency = prepared_summary.get("prepare_latency_ms")
@@ -104,6 +113,10 @@ def _prediction_record(
         "inference_latency_ms": inference_latency_ms,
         "total_model_latency_ms": float(prepare_latency) + inference_latency_ms,
         "marker_summary": prepared_summary["marker_summary"],
+        "model_type": model_type,
+        "model_name": model_name,
+        "package_id": package_id,
+        "realtime_policy_id": realtime_policy_id,
     }
 
 
@@ -145,6 +158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     source: NeuracleJellyFishSource | None = None
     package: LoadedRuntimePackage | None = None
+    policy: RealtimeModelPolicy | None = None
     pipeline = RealtimeEEGWindowPipeline(
         sampling_rate=args.expected_sfreq,
         window_seconds=args.window_sec,
@@ -158,6 +172,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": "failed",
         "duration_sec": args.duration_sec,
         "package": None,
+        "package_id": None,
+        "model_type": None,
+        "model_name": None,
+        "realtime_policy_id": None,
+        "prepared_shape": None,
+        "compatibility_status": "not_checked",
+        "compatibility_error": None,
         "is_test_head": None,
         "received_packets": 0,
         "received_samples": 0,
@@ -182,16 +203,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         package = load_runtime_package(args.package, device=args.device)
-        summary["package"] = _safe_package_info(package)
+        package_info = _safe_package_info(package)
+        summary["package"] = package_info
+        summary["package_id"] = package_info["package_id"]
+        summary["model_type"] = package.model_type
+        summary["model_name"] = package.model_name
         summary["is_test_head"] = package.is_test_head
-        if package.model_type != "model_50m":
-            raise ValueError("Runtime Package must be model_50m")
         if package.is_test_head:
             raise ValueError("Runtime Package test head is not allowed for a live inference probe")
+        policy = RealtimeModelPolicyRegistry.create(package)
+        summary["realtime_policy_id"] = policy.policy_id
         if package.step_sec != args.step_sec:
-            raise ValueError("Runtime Package step_sec must match --step-sec")
+            raise RealtimePolicyError(
+                "Runtime Package step_sec must match --step-sec. BLOCKED."
+            )
+        summary["compatibility_status"] = "passed"
 
-        bridge = RealtimeRuntimeBridge(package.runtime_model)
+        bridge = RealtimeRuntimeBridge(
+            package.runtime_model,
+            policy=policy,
+        )
         args.output_dir.mkdir(parents=True, exist_ok=True)
         predictions_path = args.output_dir / "runtime_predictions.jsonl"
         source = NeuracleJellyFishSource(
@@ -223,6 +254,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     summary["last_error"] = "prepared_input_gate_failed"
                     continue
                 summary["model_input_safe_count"] = int(summary["model_input_safe_count"]) + 1
+                summary["prepared_shape"] = (
+                    list(prepared.prepared_signal_shape)
+                    if prepared.prepared_signal_shape is not None
+                    else None
+                )
                 prepare_latency = prepared.prepare_latency_ms
                 assert prepare_latency is not None
                 prepared_latencies.append(prepare_latency)
@@ -250,12 +286,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                         confidence=confidence,
                         probabilities=probabilities,
                         inference_latency_ms=inference_latency,
+                        model_type=package.model_type,
+                        model_name=package.model_name,
+                        package_id=(
+                            str(summary["package_id"])
+                            if summary["package_id"] is not None
+                            else None
+                        ),
+                        realtime_policy_id=policy.policy_id,
                     ),
                 )
                 summary["prediction_success_count"] = int(summary["prediction_success_count"]) + 1
     except KeyboardInterrupt:
         exit_code = 130
         summary["last_error"] = "interrupted"
+    except RealtimePolicyError as exc:
+        exit_code = 2
+        summary["compatibility_status"] = "blocked"
+        summary["compatibility_error"] = str(exc)
+        summary["last_error"] = "realtime_policy_blocked"
     except (NeuracleSourceError, RealtimePipelineError, ValueError, FileNotFoundError):
         exit_code = 2
         summary["last_error"] = "probe_failed"
@@ -295,6 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         success = (
             exit_code == 0
             and package is not None
+            and policy is not None
             and package.is_test_head is False
             and pipeline.failed_windows == 0
             and pipeline.timestamp_gap_count == 0

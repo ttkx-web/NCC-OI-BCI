@@ -15,6 +15,11 @@ from scripts.probe_neuracle_runtime_inference import main
 
 
 POLICY = APPROVED_NEURACLE_59_TO_STANDARD64
+LIVE19_FOR_TEST = (
+    "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1",
+    "Cz", "C2", "C4", "C6", "CP3", "CP1", "CP2", "CP4", "Pz",
+    "POz",
+)
 
 
 class FakeInferenceSource:
@@ -139,30 +144,107 @@ class FakeRuntime:
         )
 
 
-def _package(tmp_path: Path, runtime: FakeRuntime, *, test_head: bool = False) -> object:
+class FakeLaBraMRuntime:
+    def __init__(
+        self,
+        *,
+        channel_names: tuple[str, ...] = LIVE19_FOR_TEST,
+    ) -> None:
+        self.input_contract = InputContract(
+            channel_names=channel_names,
+            sample_rate=200.0,
+            window_sec=4.0,
+            num_samples=800,
+            input_unit="uV",
+            tensor_layout="BCTP",
+            model_input_keys=("signal",),
+        )
+        self.predict_calls = 0
+
+    def prepare(self, raw_window: RawEEGWindow) -> PreparedModelInput:
+        assert raw_window.data.shape == (
+            len(self.input_contract.channel_names),
+            4000,
+        )
+        assert tuple(raw_window.channel_names) == self.input_contract.channel_names
+        channels = len(self.input_contract.channel_names)
+        return PreparedModelInput(
+            model_input={
+                "signal": torch.zeros(
+                    (1, channels, 4, 200),
+                    dtype=torch.float32,
+                )
+            },
+            canonical_window=CanonicalEEGWindow(
+                data=np.zeros((channels, 4000), dtype=np.float32),
+                channel_names=list(self.input_contract.channel_names),
+                sample_rate=1000.0,
+                unit="uV",
+            ),
+            preprocessing_trace=["fake labram runtime"],
+            diagnostics={
+                "source_channel_count": channels,
+                "target_channel_count": channels,
+                "missing_channel_names": [],
+            },
+        )
+
+    def predict_prepared(self, _prepared: PreparedModelInput) -> object:
+        self.predict_calls += 1
+        return SimpleNamespace(
+            predicted_class=1,
+            confidence=0.7,
+            probabilities=torch.tensor(
+                [[0.1, 0.7, 0.1, 0.1]],
+                dtype=torch.float32,
+            ),
+        )
+
+
+def _package(
+    tmp_path: Path,
+    runtime: object,
+    *,
+    test_head: bool = False,
+    model_type: str = "model_50m",
+) -> object:
     package_path = tmp_path / "package"
     package_path.mkdir()
     return SimpleNamespace(
         runtime_model=runtime,
         package_path=package_path,
-        model_type="model_50m",
-        model_name="50m-linear",
+        model_type=model_type,
+        model_name=(
+            "50m-linear"
+            if model_type == "model_50m"
+            else "labram-linear"
+        ),
         class_names=("left_hand", "right_hand", "feet", "tongue"),
         step_sec=0.5,
         is_test_head=test_head,
-        package_metadata={"package": {"id": "approved_50m"}},
+        package_metadata={
+            "package": {
+                "id": f"approved_{model_type}",
+            }
+        },
     )
 
 
 def _run_probe(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    runtime: FakeRuntime,
+    runtime: object,
     *,
     test_head: bool = False,
+    model_type: str = "model_50m",
 ) -> tuple[int, dict[str, object]]:
     FakeInferenceSource.instances.clear()
-    package = _package(tmp_path, runtime, test_head=test_head)
+    package = _package(
+        tmp_path,
+        runtime,
+        test_head=test_head,
+        model_type=model_type,
+    )
     monkeypatch.setattr("scripts.probe_neuracle_runtime_inference.NeuracleJellyFishSource", FakeInferenceSource)
     monkeypatch.setattr("scripts.probe_neuracle_runtime_inference.load_runtime_package", lambda *_args, **_kwargs: package)
     output_dir = tmp_path / "out"
@@ -197,6 +279,13 @@ def test_runtime_inference_probe_uses_bridge_then_predicts_sanitized_metadata(
     assert summary["model_input_safe_count"] == 1
     assert summary["prediction_success_count"] == 1
     assert summary["prediction_failure_count"] == 0
+    assert summary["model_type"] == "model_50m"
+    assert summary["model_name"] == "50m-linear"
+    assert summary["package_id"] == "approved_model_50m"
+    assert summary["realtime_policy_id"] == (
+        "model_50m_neuracle_59_to_standard64_v1"
+    )
+    assert summary["prepared_shape"] == [1, 64, 400]
     assert summary["final_health"]["state"] == "stopped"
     assert summary["final_health"]["connected"] is False
     assert len(records) == 1
@@ -206,6 +295,12 @@ def test_runtime_inference_probe_uses_bridge_then_predicts_sanitized_metadata(
     assert records[0]["predicted_name"] == "feet"
     assert records[0]["probabilities"] == pytest.approx([0.05, 0.10, 0.80, 0.05])
     assert records[0]["marker_summary"] == [{"event_type": "trigger", "code": 4}]
+    assert records[0]["model_type"] == "model_50m"
+    assert records[0]["model_name"] == "50m-linear"
+    assert records[0]["package_id"] == "approved_model_50m"
+    assert records[0]["realtime_policy_id"] == (
+        "model_50m_neuracle_59_to_standard64_v1"
+    )
     serialized = json.dumps({"summary": summary, "records": records})
     assert '"samples":[' not in serialized
     assert "127.0.0.1" not in serialized
@@ -256,4 +351,85 @@ def test_test_head_is_rejected_before_connecting_to_a_device(
     assert result == 2
     assert summary["is_test_head"] is True
     assert summary["last_error"] == "probe_failed"
+    assert not FakeInferenceSource.instances
+
+
+def test_labram_package_uses_registered_policy_and_predicts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = FakeLaBraMRuntime()
+
+    result, summary = _run_probe(
+        monkeypatch,
+        tmp_path,
+        runtime,
+        model_type="labram",
+    )
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "out" / "runtime_predictions.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert result == 0
+    assert summary["status"] == "passed"
+    assert summary["model_type"] == "labram"
+    assert summary["model_name"] == "labram-linear"
+    assert summary["package_id"] == "approved_labram"
+    assert summary["realtime_policy_id"] == (
+        "labram_package_required_channels_v1"
+    )
+    assert summary["prepared_shape"] == [1, 19, 4, 200]
+    assert records[0]["prepared_shape"] == [1, 19, 4, 200]
+    assert records[0]["valid_channel_count"] == 19
+    assert records[0]["model_type"] == "labram"
+    assert records[0]["predicted_name"] == "right_hand"
+    serialized = json.dumps({"summary": summary, "records": records})
+    assert '"samples":[' not in serialized
+    assert "127.0.0.1" not in serialized
+    assert "raw_device_timestamp" not in serialized
+    assert runtime.predict_calls == 1
+
+
+def test_labram_incompatible_contract_fails_before_device_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = FakeLaBraMRuntime(
+        channel_names=LIVE19_FOR_TEST + ("CPz",)
+    )
+
+    result, summary = _run_probe(
+        monkeypatch,
+        tmp_path,
+        runtime,
+        model_type="labram",
+    )
+
+    assert result == 2
+    assert summary["last_error"] == "realtime_policy_blocked"
+    assert summary["compatibility_status"] == "blocked"
+    assert "BLOCKED" in str(summary["compatibility_error"])
+    assert not FakeInferenceSource.instances
+
+
+def test_unknown_model_type_fails_before_device_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = FakeRuntime()
+
+    result, summary = _run_probe(
+        monkeypatch,
+        tmp_path,
+        runtime,
+        model_type="cbramod",
+    )
+
+    assert result == 2
+    assert summary["last_error"] == "realtime_policy_blocked"
+    assert summary["compatibility_status"] == "blocked"
+    assert "BLOCKED" in str(summary["compatibility_error"])
     assert not FakeInferenceSource.instances

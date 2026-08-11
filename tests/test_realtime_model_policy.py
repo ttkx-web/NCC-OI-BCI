@@ -12,6 +12,7 @@ from bci_dayloop.realtime.runtime_mapping import (
     APPROVED_NEURACLE_59_TO_STANDARD64,
 )
 from bci_dayloop.realtime.runtime_policy import (
+    CBraModRealtimePolicy,
     LaBraMRealtimePolicy,
     RealtimeModelPolicyRegistry,
 )
@@ -28,6 +29,15 @@ LIVE19 = (
     "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1",
     "Cz", "C2", "C4", "C6", "CP3", "CP1", "CP2", "CP4", "Pz",
     "POz",
+)
+CBRAMOD22 = (
+    "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1",
+    "Cz", "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4",
+    "P1", "Pz", "P2", "POz",
+)
+CBRAMOD_MISSING = ("CPz", "P1", "P2")
+COMPLETION_SHA = (
+    "a3f7918a08115e0d3bb33ffb5cbb8fc1a467313872a6bc28fb16d6bc0636bae5"
 )
 
 
@@ -120,17 +130,97 @@ class FakeLaBraMRuntime:
         )
 
 
+class FakeCBraModRuntime:
+    def __init__(
+        self,
+        *,
+        missing_channel_policy: str = "spherical_spline",
+        min_observed_channels: int = 19,
+        completion_sha: str = COMPLETION_SHA,
+    ) -> None:
+        self.input_contract = InputContract(
+            channel_names=CBRAMOD22,
+            sample_rate=200.0,
+            window_sec=4.0,
+            num_samples=800,
+            input_unit="uV",
+            tensor_layout="BCTP",
+            strict_window_duration=True,
+            model_input_keys=("signal",),
+        )
+        self.input_transform = SimpleNamespace(
+            config=SimpleNamespace(
+                missing_channel_policy=missing_channel_policy,
+                min_observed_channels=min_observed_channels,
+                spline_alpha=1e-5,
+            )
+        )
+        self.completion_sha = completion_sha
+        self.received: RawEEGWindow | None = None
+
+    def prepare(self, raw_window: RawEEGWindow) -> PreparedModelInput:
+        self.received = raw_window
+        return PreparedModelInput(
+            model_input={
+                "signal": torch.zeros((1, 22, 4, 200), dtype=torch.float32)
+            },
+            canonical_window=CanonicalEEGWindow(
+                data=np.zeros((22, 800), dtype=np.float32),
+                channel_names=list(CBRAMOD22),
+                sample_rate=200.0,
+                unit="uV",
+            ),
+            preprocessing_trace=["fake-cbramod-shared-preprocessor"],
+            diagnostics={
+                "observed_channel_count": 19,
+                "observed_channel_names": list(LIVE19),
+                "missing_channel_names": ["CPZ", "P1", "P2"],
+                "duplicate_channel_count": 0,
+                "completion_policy": "spherical_spline",
+                "completion_matrix_sha256": self.completion_sha,
+            },
+        )
+
+
+def _cbramod_metadata(
+    *,
+    policy: str = "spherical_spline",
+    min_observed_channels: int = 19,
+    completion_sha: str = COMPLETION_SHA,
+    include_completion: bool = True,
+) -> dict[str, object]:
+    completion: dict[str, object] | None = None
+    if include_completion:
+        completion = {
+            "deployment_profile": "neuracle_live19_spline22",
+            "observed_required": 19,
+            "observed_channel_names": list(LIVE19),
+            "missing_expected": list(CBRAMOD_MISSING),
+            "missing_channel_policy": policy,
+            "min_observed_channels": min_observed_channels,
+            "spline_alpha": 1e-5,
+            "channel_completion_source": "shared_runtime_preprocessor",
+            "completion_matrix_sha256": completion_sha,
+        }
+    return {
+        "runtime": {"channel_completion": completion},
+        "provenance": {"completion_matrix_sha256": completion_sha},
+    }
+
+
 def _package(
-    runtime: FakeLaBraMRuntime,
+    runtime: object,
     *,
     model_type: str = "labram",
     is_test_head: bool = False,
+    package_metadata: dict[str, object] | None = None,
 ) -> object:
     return SimpleNamespace(
         runtime_model=runtime,
         model_type=model_type,
         model_name="labram-linear",
         is_test_head=is_test_head,
+        package_metadata=package_metadata or {},
     )
 
 
@@ -212,12 +302,109 @@ def test_unknown_model_type_is_blocked_without_fallback() -> None:
     runtime = FakeLaBraMRuntime()
     with pytest.raises(ValueError, match="BLOCKED"):
         RealtimeModelPolicyRegistry.create(
-            _package(runtime, model_type="cbramod")
+            _package(runtime, model_type="unknown-model")
         )
+
+
+def test_cbramod_registry_policy_preserves_source_and_validates_prepared() -> None:
+    runtime = FakeCBraModRuntime()
+    package = _package(
+        runtime,
+        model_type="cbramod",
+        package_metadata=_cbramod_metadata(),
+    )
+    policy = RealtimeModelPolicyRegistry.create(package)
+    result = RealtimeRuntimeBridge(runtime, policy=policy).prepare(_window())
+
+    assert isinstance(policy, CBraModRealtimePolicy)
+    assert policy.missing_target_channels == CBRAMOD_MISSING
+    assert len(policy.ignored_source_channels) == 40
+    assert result.model_input_safe is True
+    assert result.prepared_signal_shape == (1, 22, 4, 200)
+    assert result.valid_channel_count == 19
+    assert result.policy_metadata == {
+        "observed_channel_count": 19,
+        "missing_channel_names": list(CBRAMOD_MISSING),
+        "completion_policy": "spherical_spline",
+        "completion_matrix_sha256": COMPLETION_SHA,
+    }
+    assert runtime.received is not None
+    assert runtime.received.data.shape == (59, 4000)
+    assert tuple(runtime.received.channel_names) == SOURCE_POLICY.source_channel_names
+
+
+def test_cbramod_strict22_package_is_blocked() -> None:
+    runtime = FakeCBraModRuntime(missing_channel_policy="error", min_observed_channels=22)
+    with pytest.raises(ValueError, match="spherical_spline"):
+        RealtimeModelPolicyRegistry.create(
+            _package(
+                runtime,
+                model_type="cbramod",
+                package_metadata=_cbramod_metadata(include_completion=False),
+            )
+        )
+
+
+def test_cbramod_test_head_is_blocked() -> None:
+    runtime = FakeCBraModRuntime()
+    with pytest.raises(ValueError, match="test head"):
+        RealtimeModelPolicyRegistry.create(
+            _package(
+                runtime,
+                model_type="cbramod",
+                is_test_head=True,
+                package_metadata=_cbramod_metadata(),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("runtime", "metadata", "message"),
+    [
+        (
+            FakeCBraModRuntime(missing_channel_policy="error", min_observed_channels=22),
+            _cbramod_metadata(policy="error", min_observed_channels=22),
+            "spherical_spline",
+        ),
+        (
+            FakeCBraModRuntime(min_observed_channels=18),
+            _cbramod_metadata(min_observed_channels=18),
+            "min_observed_channels=19",
+        ),
+    ],
+)
+def test_cbramod_wrong_live_contract_is_blocked(
+    runtime: FakeCBraModRuntime,
+    metadata: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        RealtimeModelPolicyRegistry.create(
+            _package(
+                runtime,
+                model_type="cbramod",
+                package_metadata=metadata,
+            )
+        )
+
+
+def test_cbramod_prepared_completion_sha_must_match_package() -> None:
+    runtime = FakeCBraModRuntime(completion_sha="wrong")
+    policy = CBraModRealtimePolicy(
+        _package(
+            runtime,
+            model_type="cbramod",
+            package_metadata=_cbramod_metadata(),
+        )
+    )
+    result = RealtimeRuntimeBridge(runtime, policy=policy).prepare(_window())
+    assert result.model_input_safe is False
+    assert "SHA" in str(result.failure_reason)
 
 
 def test_registry_exposes_only_approved_model_types() -> None:
     assert RealtimeModelPolicyRegistry.list_model_types() == [
+        "cbramod",
         "labram",
         "model_50m",
     ]

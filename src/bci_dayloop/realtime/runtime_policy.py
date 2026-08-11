@@ -8,6 +8,11 @@ from typing import Protocol
 import numpy as np
 import torch
 
+from bci_dayloop.models.cbramod.config import (
+    BCICIV2A_22_CHANNELS,
+    CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE,
+    CBRAMOD_NEURACLE_SIMULATED_MISSING_CHANNELS,
+)
 from bci_dayloop.realtime.channel_units import EEG_UNIT
 from bci_dayloop.runtime.types import (
     InputContract,
@@ -33,6 +38,7 @@ class RuntimePackageLike(Protocol):
     model_type: str
     model_name: str
     is_test_head: bool
+    package_metadata: Mapping[str, object]
 
 
 class RealtimePolicyError(ValueError):
@@ -44,6 +50,7 @@ class PreparedValidation:
     failure_reason: str | None
     signal_shape: tuple[int, ...] | None
     valid_channel_count: int | None
+    policy_metadata: Mapping[str, object] | None = None
 
 
 class RealtimeModelPolicy(ABC):
@@ -483,6 +490,252 @@ class LaBraMRealtimePolicy(RealtimeModelPolicy):
         )
 
 
+class CBraModRealtimePolicy(RealtimeModelPolicy):
+    model_type = "cbramod"
+    policy_id = "cbramod_neuracle_59_live19_spline22_v1"
+
+    def __init__(self, package: RuntimePackageLike) -> None:
+        self._target_channel_names = tuple(BCICIV2A_22_CHANNELS)
+        source = _validate_exact_unique_channels(
+            APPROVED_NEURACLE_59_TO_STANDARD64.source_channel_names,
+            logical_name="approved Neuracle source channel_names",
+        )
+        self._observed_channel_names = tuple(
+            name for name in self._target_channel_names if name in source
+        )
+        self._missing_channel_names = tuple(
+            name for name in self._target_channel_names if name not in source
+        )
+        self._ignored_source_channels = tuple(
+            name for name in source if name not in self._target_channel_names
+        )
+        self._completion_matrix_sha256 = ""
+        self.validate_package(package)
+
+    @property
+    def required_channel_names(self) -> tuple[str, ...]:
+        return self._target_channel_names
+
+    @property
+    def missing_target_channels(self) -> tuple[str, ...]:
+        return self._missing_channel_names
+
+    @property
+    def ignored_source_channels(self) -> tuple[str, ...]:
+        return self._ignored_source_channels
+
+    def validate_package(self, package: RuntimePackageLike) -> None:
+        if package.model_type != self.model_type:
+            raise ValueError(
+                "CBraModRealtimePolicy requires model_type='cbramod'"
+            )
+        if package.is_test_head:
+            raise ValueError("A test head is not allowed for realtime inference")
+
+        contract = package.runtime_model.input_contract
+        if tuple(contract.channel_names) != self._target_channel_names:
+            raise ValueError(
+                "CBRaMod realtime package must use the approved 22-channel "
+                "target montage"
+            )
+        if (
+            contract.sample_rate != 200.0
+            or contract.window_sec != 4.0
+            or contract.num_samples != 800
+            or contract.input_unit != EEG_UNIT
+            or contract.tensor_layout != "BCTP"
+            or contract.model_input_keys != ("signal",)
+            or contract.strict_window_duration is not True
+        ):
+            raise ValueError(
+                "CBRaMod realtime package must declare 22 channels at "
+                "200 Hz, 4.0 seconds / 800 samples, uV, BCTP, and "
+                "model_input_keys=('signal',)"
+            )
+
+        config = getattr(
+            getattr(package.runtime_model, "input_transform", None),
+            "config",
+            None,
+        )
+        if config is None:
+            raise ValueError("CBRaMod Runtime preprocessor config is unavailable")
+        if getattr(config, "missing_channel_policy", None) != "spherical_spline":
+            raise ValueError(
+                "CBRaMod realtime package requires "
+                "missing_channel_policy='spherical_spline'"
+            )
+        if getattr(config, "min_observed_channels", None) != 19:
+            raise ValueError(
+                "CBRaMod realtime package requires min_observed_channels=19"
+            )
+        if not np.isclose(
+            float(getattr(config, "spline_alpha", float("nan"))),
+            1e-5,
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError("CBRaMod realtime package requires spline_alpha=1e-5")
+
+        if len(self._observed_channel_names) != 19:
+            raise ValueError(
+                "Approved Neuracle source must expose exactly 19 CBRaMod "
+                "target channels"
+            )
+        if self._missing_channel_names != tuple(
+            CBRAMOD_NEURACLE_SIMULATED_MISSING_CHANNELS
+        ):
+            raise ValueError(
+                "Approved Neuracle source must be missing exactly CPz/P1/P2"
+            )
+
+        metadata = package.package_metadata
+        if not isinstance(metadata, Mapping):
+            raise ValueError("CBRaMod package metadata must be a mapping")
+        runtime = metadata.get("runtime")
+        if not isinstance(runtime, Mapping):
+            raise ValueError("CBRaMod package runtime metadata is unavailable")
+        completion = runtime.get("channel_completion")
+        if not isinstance(completion, Mapping):
+            raise ValueError(
+                "Strict22 CBRaMod package cannot be used as a Neuracle Live package"
+            )
+        expected_values: dict[str, object] = {
+            "deployment_profile": CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE,
+            "observed_required": 19,
+            "observed_channel_names": list(self._observed_channel_names),
+            "missing_expected": list(self._missing_channel_names),
+            "missing_channel_policy": "spherical_spline",
+            "min_observed_channels": 19,
+            "spline_alpha": 1e-5,
+            "channel_completion_source": "shared_runtime_preprocessor",
+        }
+        for key, expected in expected_values.items():
+            actual = completion.get(key)
+            if key == "spline_alpha":
+                try:
+                    matches = np.isclose(
+                        float(actual), float(expected), rtol=0.0, atol=0.0
+                    )
+                except (TypeError, ValueError):
+                    matches = False
+            else:
+                matches = actual == expected
+            if not matches:
+                raise ValueError(
+                    "CBRaMod package channel_completion mismatch for "
+                    f"{key}"
+                )
+        completion_sha = completion.get("completion_matrix_sha256")
+        if not isinstance(completion_sha, str) or not completion_sha.strip():
+            raise ValueError(
+                "CBRaMod package must declare completion_matrix_sha256"
+            )
+        provenance = metadata.get("provenance")
+        if not isinstance(provenance, Mapping) or provenance.get(
+            "completion_matrix_sha256"
+        ) != completion_sha:
+            raise ValueError(
+                "CBRaMod package completion SHA differs from provenance"
+            )
+        self._completion_matrix_sha256 = completion_sha
+
+    def select_source(
+        self,
+        window: RealtimeWindow,
+    ) -> tuple[np.ndarray, tuple[str, ...]]:
+        return window.samples, window.channel_names
+
+    def validate_prepared(
+        self,
+        prepared: PreparedModelInput,
+        runtime_model: RuntimePrepareOnly,
+    ) -> PreparedValidation:
+        if not isinstance(prepared, PreparedModelInput):
+            return PreparedValidation(
+                "RuntimeModel.prepare must return PreparedModelInput",
+                None,
+                None,
+            )
+        if not isinstance(prepared.model_input, dict) or set(
+            prepared.model_input
+        ) != {"signal"}:
+            return PreparedValidation(
+                "CBRaMod prepared model_input must contain only 'signal'",
+                None,
+                None,
+            )
+        signal = prepared.model_input["signal"]
+        if not isinstance(signal, torch.Tensor):
+            return PreparedValidation(
+                "CBRaMod prepared signal must be a tensor",
+                None,
+                None,
+            )
+        signal_shape = tuple(int(value) for value in signal.shape)
+        if (
+            signal.dtype != torch.float32
+            or signal_shape != (1, 22, 4, 200)
+            or not torch.isfinite(signal).all().item()
+        ):
+            return PreparedValidation(
+                "CBRaMod prepared signal must be finite float32 with shape "
+                "[1, 22, 4, 200]",
+                signal_shape,
+                None,
+            )
+        diagnostics = prepared.diagnostics
+        if not isinstance(diagnostics, Mapping):
+            return PreparedValidation(
+                "CBRaMod prepared diagnostics must be a mapping",
+                signal_shape,
+                None,
+            )
+        observed = tuple(
+            str(name).strip().upper()
+            for name in diagnostics.get("observed_channel_names", ())
+        )
+        expected_observed = tuple(
+            name.upper() for name in self._observed_channel_names
+        )
+        missing = tuple(
+            str(name).strip().upper()
+            for name in diagnostics.get("missing_channel_names", ())
+        )
+        expected_missing = tuple(
+            name.upper() for name in self._missing_channel_names
+        )
+        checks = (
+            (int(diagnostics.get("observed_channel_count", -1)) == 19,
+             "CBRaMod prepared observed_channel_count must be 19"),
+            (observed == expected_observed,
+             "CBRaMod prepared observed channels changed"),
+            (missing == expected_missing,
+             "CBRaMod prepared missing channels must be CPz/P1/P2"),
+            (int(diagnostics.get("duplicate_channel_count", -1)) == 0,
+             "CBRaMod prepared duplicate_channel_count must be 0"),
+            (diagnostics.get("completion_policy") == "spherical_spline",
+             "CBRaMod prepared completion_policy must be spherical_spline"),
+            (diagnostics.get("completion_matrix_sha256")
+             == self._completion_matrix_sha256,
+             "CBRaMod prepared completion SHA must match the Runtime Package"),
+        )
+        for passed, reason in checks:
+            if not passed:
+                return PreparedValidation(reason, signal_shape, None)
+        return PreparedValidation(
+            None,
+            signal_shape,
+            19,
+            {
+                "observed_channel_count": 19,
+                "missing_channel_names": list(self._missing_channel_names),
+                "completion_policy": "spherical_spline",
+                "completion_matrix_sha256": self._completion_matrix_sha256,
+            },
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimePackageView:
     runtime_model: RuntimePrepareOnly
@@ -496,6 +749,7 @@ PolicyBuilder = Callable[[RuntimePackageLike], RealtimeModelPolicy]
 
 class RealtimeModelPolicyRegistry:
     _builders: dict[str, PolicyBuilder] = {
+        "cbramod": lambda package: CBraModRealtimePolicy(package),
         "model_50m": lambda package: _build_model_50m_policy(package),
         "labram": lambda package: LaBraMRealtimePolicy(package),
     }

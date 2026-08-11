@@ -98,7 +98,7 @@ def _prediction_record(
 ) -> dict[str, object]:
     """Create the intentionally metadata-only output for one successful window."""
     prepare_latency = prepared_summary.get("prepare_latency_ms")
-    return {
+    record = {
         "window_id": prepared_summary["window_id"],
         "continuous_segment_id": prepared_summary["continuous_segment_id"],
         "source_shape": prepared_summary["source_shape"],
@@ -118,6 +118,17 @@ def _prediction_record(
         "package_id": package_id,
         "realtime_policy_id": realtime_policy_id,
     }
+    policy_metadata = prepared_summary.get("policy_metadata")
+    if isinstance(policy_metadata, Mapping):
+        for key in (
+            "observed_channel_count",
+            "missing_channel_names",
+            "completion_policy",
+            "completion_matrix_sha256",
+        ):
+            if key in policy_metadata:
+                record[key] = policy_metadata[key]
+    return record
 
 
 def _prediction_values(output: object, *, class_names: tuple[str, ...]) -> tuple[int, str, float, list[float]]:
@@ -179,6 +190,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "prepared_shape": None,
         "compatibility_status": "not_checked",
         "compatibility_error": None,
+        "observed_channel_count": None,
+        "missing_channel_names": None,
+        "completion_policy": None,
+        "completion_matrix_sha256": None,
         "is_test_head": None,
         "received_packets": 0,
         "received_samples": 0,
@@ -259,6 +274,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if prepared.prepared_signal_shape is not None
                     else None
                 )
+                for key, value in prepared.policy_metadata.items():
+                    if key in {
+                        "observed_channel_count",
+                        "missing_channel_names",
+                        "completion_policy",
+                        "completion_matrix_sha256",
+                    }:
+                        summary[key] = value
                 prepare_latency = prepared.prepare_latency_ms
                 assert prepare_latency is not None
                 prepared_latencies.append(prepare_latency)

@@ -43,6 +43,7 @@ class RealtimePreparedWindow:
     model_input_safe: bool
     failure_reason: str | None
     realtime_policy_id: str
+    policy_metadata: dict[str, object] = field(default_factory=dict)
     prepared_input: PreparedModelInput | None = field(
         default=None,
         repr=False,
@@ -70,6 +71,7 @@ class RealtimePreparedWindow:
             "model_input_safe": self.model_input_safe,
             "failure_reason": self.failure_reason,
             "realtime_policy_id": self.realtime_policy_id,
+            "policy_metadata": dict(self.policy_metadata),
         }
 
 
@@ -198,6 +200,7 @@ class RealtimeRuntimeBridge:
             model_input_safe=True,
             failure_reason=None,
             realtime_policy_id=self.policy.policy_id,
+            policy_metadata=dict(validation.policy_metadata or {}),
             prepared_input=prepared,
         )
 
@@ -229,6 +232,7 @@ class RealtimeRuntimeBridge:
             model_input_safe=False,
             failure_reason=reason,
             realtime_policy_id=self.policy.policy_id,
+            policy_metadata={},
         )
 
 

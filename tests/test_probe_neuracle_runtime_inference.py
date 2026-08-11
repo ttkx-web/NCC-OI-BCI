@@ -20,6 +20,14 @@ LIVE19_FOR_TEST = (
     "Cz", "C2", "C4", "C6", "CP3", "CP1", "CP2", "CP4", "Pz",
     "POz",
 )
+CBRAMOD22_FOR_TEST = (
+    "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1",
+    "Cz", "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4",
+    "P1", "Pz", "P2", "POz",
+)
+CBRAMOD_COMPLETION_SHA = (
+    "a3f7918a08115e0d3bb33ffb5cbb8fc1a467313872a6bc28fb16d6bc0636bae5"
+)
 
 
 class FakeInferenceSource:
@@ -201,6 +209,86 @@ class FakeLaBraMRuntime:
         )
 
 
+class FakeCBraModRuntime:
+    def __init__(self, *, min_observed_channels: int = 19) -> None:
+        self.input_contract = InputContract(
+            channel_names=CBRAMOD22_FOR_TEST,
+            sample_rate=200.0,
+            window_sec=4.0,
+            num_samples=800,
+            input_unit="uV",
+            tensor_layout="BCTP",
+            strict_window_duration=True,
+            model_input_keys=("signal",),
+        )
+        self.input_transform = SimpleNamespace(
+            config=SimpleNamespace(
+                missing_channel_policy="spherical_spline",
+                min_observed_channels=min_observed_channels,
+                spline_alpha=1e-5,
+            )
+        )
+        self.predict_calls = 0
+
+    def prepare(self, raw_window: RawEEGWindow) -> PreparedModelInput:
+        assert raw_window.data.shape == (59, 4000)
+        assert tuple(raw_window.channel_names) == POLICY.source_channel_names
+        return PreparedModelInput(
+            model_input={
+                "signal": torch.zeros((1, 22, 4, 200), dtype=torch.float32)
+            },
+            canonical_window=CanonicalEEGWindow(
+                data=np.zeros((22, 800), dtype=np.float32),
+                channel_names=list(CBRAMOD22_FOR_TEST),
+                sample_rate=200.0,
+                unit="uV",
+            ),
+            preprocessing_trace=["fake cbramod shared runtime preprocessor"],
+            diagnostics={
+                "observed_channel_count": 19,
+                "observed_channel_names": list(LIVE19_FOR_TEST),
+                "missing_channel_names": ["CPZ", "P1", "P2"],
+                "duplicate_channel_count": 0,
+                "completion_policy": "spherical_spline",
+                "completion_matrix_sha256": CBRAMOD_COMPLETION_SHA,
+            },
+        )
+
+    def predict_prepared(self, _prepared: PreparedModelInput) -> object:
+        self.predict_calls += 1
+        return SimpleNamespace(
+            predicted_class=0,
+            confidence=0.6,
+            probabilities=torch.tensor(
+                [[0.6, 0.1, 0.2, 0.1]], dtype=torch.float32
+            ),
+        )
+
+
+def _cbramod_package_metadata(
+    *, min_observed_channels: int = 19,
+) -> dict[str, object]:
+    return {
+        "package": {"id": "approved_cbramod"},
+        "runtime": {
+            "channel_completion": {
+                "deployment_profile": "neuracle_live19_spline22",
+                "observed_required": 19,
+                "observed_channel_names": list(LIVE19_FOR_TEST),
+                "missing_expected": ["CPz", "P1", "P2"],
+                "missing_channel_policy": "spherical_spline",
+                "min_observed_channels": min_observed_channels,
+                "spline_alpha": 1e-5,
+                "channel_completion_source": "shared_runtime_preprocessor",
+                "completion_matrix_sha256": CBRAMOD_COMPLETION_SHA,
+            }
+        },
+        "provenance": {
+            "completion_matrix_sha256": CBRAMOD_COMPLETION_SHA,
+        },
+    }
+
+
 def _package(
     tmp_path: Path,
     runtime: object,
@@ -210,6 +298,11 @@ def _package(
 ) -> object:
     package_path = tmp_path / "package"
     package_path.mkdir()
+    package_metadata = (
+        _cbramod_package_metadata()
+        if model_type == "cbramod"
+        else {"package": {"id": f"approved_{model_type}"}}
+    )
     return SimpleNamespace(
         runtime_model=runtime,
         package_path=package_path,
@@ -217,16 +310,16 @@ def _package(
         model_name=(
             "50m-linear"
             if model_type == "model_50m"
-            else "labram-linear"
+            else (
+                "labram-linear"
+                if model_type == "labram"
+                else "cbramod-frozen-head"
+            )
         ),
         class_names=("left_hand", "right_hand", "feet", "tongue"),
         step_sec=0.5,
         is_test_head=test_head,
-        package_metadata={
-            "package": {
-                "id": f"approved_{model_type}",
-            }
-        },
+        package_metadata=package_metadata,
     )
 
 
@@ -415,6 +508,84 @@ def test_labram_incompatible_contract_fails_before_device_connect(
     assert not FakeInferenceSource.instances
 
 
+def test_cbramod_package_uses_registered_policy_and_reports_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = FakeCBraModRuntime()
+    result, summary = _run_probe(
+        monkeypatch,
+        tmp_path,
+        runtime,
+        model_type="cbramod",
+    )
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "out" / "runtime_predictions.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert result == 0
+    assert summary["compatibility_status"] == "passed"
+    assert summary["model_type"] == "cbramod"
+    assert summary["model_name"] == "cbramod-frozen-head"
+    assert summary["package_id"] == "approved_cbramod"
+    assert summary["realtime_policy_id"] == (
+        "cbramod_neuracle_59_live19_spline22_v1"
+    )
+    assert summary["prepared_shape"] == [1, 22, 4, 200]
+    assert summary["observed_channel_count"] == 19
+    assert summary["missing_channel_names"] == ["CPz", "P1", "P2"]
+    assert summary["completion_policy"] == "spherical_spline"
+    assert summary["completion_matrix_sha256"] == CBRAMOD_COMPLETION_SHA
+    assert records[0]["observed_channel_count"] == 19
+    assert records[0]["missing_channel_names"] == ["CPz", "P1", "P2"]
+    assert records[0]["completion_matrix_sha256"] == CBRAMOD_COMPLETION_SHA
+    assert runtime.predict_calls == 1
+    serialized = json.dumps({"summary": summary, "records": records})
+    assert '"samples":[' not in serialized
+    assert "127.0.0.1" not in serialized
+    assert "raw_device_timestamp" not in serialized
+
+
+def test_cbramod_incompatible_contract_fails_before_device_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeInferenceSource.instances.clear()
+    runtime = FakeCBraModRuntime(min_observed_channels=18)
+    package = _package(tmp_path, runtime, model_type="cbramod")
+    package.package_metadata = _cbramod_package_metadata(
+        min_observed_channels=18
+    )
+    monkeypatch.setattr(
+        "scripts.probe_neuracle_runtime_inference.NeuracleJellyFishSource",
+        FakeInferenceSource,
+    )
+    monkeypatch.setattr(
+        "scripts.probe_neuracle_runtime_inference.load_runtime_package",
+        lambda *_args, **_kwargs: package,
+    )
+    output_dir = tmp_path / "out"
+    result = main(
+        [
+            "--package", str(package.package_path),
+            "--duration-sec", "0.01",
+            "--output-dir", str(output_dir),
+            "--no-save-waveform",
+        ]
+    )
+    summary = json.loads(
+        (output_dir / "runtime_inference_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result == 2
+    assert summary["compatibility_status"] == "blocked"
+    assert summary["last_error"] == "realtime_policy_blocked"
+    assert not FakeInferenceSource.instances
+
+
 def test_unknown_model_type_fails_before_device_connect(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -425,7 +596,7 @@ def test_unknown_model_type_fails_before_device_connect(
         monkeypatch,
         tmp_path,
         runtime,
-        model_type="cbramod",
+        model_type="unknown-model",
     )
 
     assert result == 2

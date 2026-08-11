@@ -16,12 +16,17 @@ import torch
 
 from _bootstrap import ROOT
 
+from bci_dayloop.data.channel_selection import select_named_channels
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
 from bci_dayloop.models.cbramod.runtime import (
     CBraModRuntime,
     build_cbramod_runtime,
 )
-from bci_dayloop.runtime.types import RawEEGWindow
+from bci_dayloop.packages.loader import (
+    LoadedRuntimePackage,
+    load_runtime_package,
+)
+from bci_dayloop.runtime.types import PreparedModelInput, RawEEGWindow
 from bci_dayloop.utils.config import (
     dump_json,
     dump_yaml,
@@ -265,6 +270,31 @@ def runtime_kwargs_from_training_report(
         source=Path("training_report.json"),
     )
 
+    n_channels = len(preprocessing["standard_channels"])
+    missing_channel_policy = str(
+        preprocessing.get("missing_channel_policy", "error")
+    )
+    min_observed_value = preprocessing.get("min_observed_channels")
+    if min_observed_value is None:
+        if missing_channel_policy == "spherical_spline":
+            raise ValueError(
+                "Spherical-spline training report must explicitly declare "
+                "min_observed_channels."
+            )
+        min_observed_channels = n_channels
+    else:
+        min_observed_channels = int(min_observed_value)
+    spline_alpha_value = preprocessing.get("spline_alpha")
+    if spline_alpha_value is None:
+        if missing_channel_policy == "spherical_spline":
+            raise ValueError(
+                "Spherical-spline training report must explicitly declare "
+                "spline_alpha."
+            )
+        spline_alpha = 1e-5
+    else:
+        spline_alpha = float(spline_alpha_value)
+
     return {
         "target_sample_rate": float(
             preprocessing["target_sample_rate"]
@@ -272,9 +302,7 @@ def runtime_kwargs_from_training_report(
         "window_seconds": float(
             preprocessing["window_seconds"]
         ),
-        "n_channels": len(
-            preprocessing["standard_channels"]
-        ),
+        "n_channels": n_channels,
         "time_segments": int(
             preprocessing["time_segments"]
         ),
@@ -338,23 +366,36 @@ def runtime_kwargs_from_training_report(
                 "official_mlp",
             )
         ),
-        "missing_channel_policy": str(
-            preprocessing.get(
-                "missing_channel_policy",
-                "error",
+        "missing_channel_policy": missing_channel_policy,
+        "min_observed_channels": min_observed_channels,
+        "spline_alpha": spline_alpha,
+        "deployment_profile": str(
+            preprocessing.get("deployment_profile", "strict22")
+        ),
+        "training_channel_source_count": int(
+            preprocessing.get("training_channel_source_count", n_channels)
+        ),
+        "observed_channel_names": tuple(
+            str(name)
+            for name in preprocessing.get(
+                "observed_channel_names",
+                preprocessing["standard_channels"],
             )
         ),
-        "min_observed_channels": int(
-            preprocessing.get(
-                "min_observed_channels",
-                2,
+        "simulated_missing_channels": tuple(
+            str(name)
+            for name in preprocessing.get(
+                "simulated_missing_channels", ()
             )
         ),
-        "spline_alpha": float(
+        "channel_completion_source": str(
             preprocessing.get(
-                "spline_alpha",
-                1e-5,
+                "channel_completion_source",
+                "shared_runtime_preprocessor",
             )
+        ),
+        "completion_matrix_sha256": preprocessing.get(
+            "completion_matrix_sha256"
         ),
     }
 
@@ -365,6 +406,7 @@ def extract_first_trial_window(
     session_name: str,
     window_seconds: float,
     anchor: str,
+    observed_channel_names: tuple[str, ...] | None = None,
 ) -> RawEEGWindow:
     """
     从一个真实 HDF5 源 trial 中，按训练时相同的规则选择
@@ -399,6 +441,13 @@ def extract_first_trial_window(
 
     metadata = dataset.metadata
     sample_rate = float(metadata.sample_rate)
+
+    data, selected_channel_names = select_named_channels(
+        data,
+        source_channel_names=metadata.channel_names,
+        requested_channel_names=observed_channel_names,
+        channel_axis=1,
+    )
 
     source_trial = data[0]
     source_samples = int(source_trial.shape[-1])
@@ -438,7 +487,7 @@ def extract_first_trial_window(
     return RawEEGWindow(
         data=selected_trial,
         channel_names=list(
-            metadata.channel_names
+            selected_channel_names
         ),
         sample_rate=sample_rate,
         unit=str(metadata.unit),
@@ -529,6 +578,83 @@ def predict_probabilities(
     return probabilities
 
 
+def validate_deployment_prepared(
+    prepared: PreparedModelInput,
+    *,
+    runtime_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    signal = prepared.model_input.get("signal")
+    expected_shape = (
+        1,
+        int(runtime_kwargs["n_channels"]),
+        int(runtime_kwargs["time_segments"]),
+        int(runtime_kwargs["points_per_patch"]),
+    )
+    if not isinstance(signal, torch.Tensor):
+        raise TypeError("CBRaMod prepared signal must be a torch.Tensor.")
+    if tuple(signal.shape) != expected_shape:
+        raise RuntimeError(
+            "CBRaMod prepared signal shape mismatch: "
+            f"{tuple(signal.shape)} != {expected_shape}."
+        )
+    if signal.dtype != torch.float32 or not torch.isfinite(signal).all().item():
+        raise RuntimeError(
+            "CBRaMod prepared signal must be finite torch.float32."
+        )
+
+    diagnostics = dict(prepared.diagnostics)
+    observed = tuple(
+        str(name).upper()
+        for name in diagnostics.get("observed_channel_names", ())
+    )
+    expected_observed = tuple(
+        str(name).upper()
+        for name in runtime_kwargs["observed_channel_names"]
+    )
+    missing = tuple(
+        str(name).upper()
+        for name in diagnostics.get("missing_channel_names", ())
+    )
+    expected_missing = tuple(
+        str(name).upper()
+        for name in runtime_kwargs["simulated_missing_channels"]
+    )
+    if observed != expected_observed or missing != expected_missing:
+        raise RuntimeError(
+            "CBRaMod deployment smoke channel diagnostics do not match "
+            "the training profile."
+        )
+    if int(diagnostics.get("duplicate_channel_count", -1)) != 0:
+        raise RuntimeError("CBRaMod deployment smoke found duplicate channels.")
+    expected_policy = (
+        "none"
+        if not expected_missing
+        else str(runtime_kwargs["missing_channel_policy"])
+    )
+    if diagnostics.get("completion_policy") != expected_policy:
+        raise RuntimeError(
+            "CBRaMod deployment smoke completion policy mismatch."
+        )
+    completion_sha256 = diagnostics.get("completion_matrix_sha256")
+    if completion_sha256 != runtime_kwargs.get("completion_matrix_sha256"):
+        raise RuntimeError(
+            "CBRaMod deployment smoke completion matrix SHA-256 mismatch."
+        )
+    return {
+        "observed_channel_count": len(observed),
+        "observed_channel_names": list(runtime_kwargs["observed_channel_names"]),
+        "missing_channel_names": list(
+            runtime_kwargs["simulated_missing_channels"]
+        ),
+        "duplicate_channel_count": 0,
+        "completion_policy": diagnostics.get("completion_policy"),
+        "completion_matrix_sha256": completion_sha256,
+        "prepared_shape": list(expected_shape),
+        "prepared_dtype": "float32",
+        "prepared_finite": True,
+    }
+
+
 def build_package_payload(
     *,
     class_names: tuple[str, ...],
@@ -590,6 +716,15 @@ def build_package_payload(
             "training report preprocessing manifest."
         )
 
+    if (
+        runtime_kwargs["missing_channel_policy"] == "spherical_spline"
+        and not runtime_kwargs.get("completion_matrix_sha256")
+    ):
+        raise ValueError(
+            "Spherical-spline package requires a training completion "
+            "matrix SHA-256."
+        )
+
     preprocessing_payload = {
         "schema_version": 1,
         "canonicalizer": {
@@ -644,6 +779,18 @@ def build_package_payload(
             ),
             "normalization": str(
                 runtime_kwargs["normalization"]
+            ),
+            "missing_channel_policy": str(
+                runtime_kwargs["missing_channel_policy"]
+            ),
+            "min_observed_channels": int(
+                runtime_kwargs["min_observed_channels"]
+            ),
+            "spline_alpha": float(
+                runtime_kwargs["spline_alpha"]
+            ),
+            "completion_matrix_sha256": runtime_kwargs.get(
+                "completion_matrix_sha256"
             ),
         },
     }
@@ -704,6 +851,35 @@ def build_package_payload(
                 str(key): str(value)
                 for key, value in command_map.items()
             },
+            "channel_completion": {
+                "deployment_profile": str(
+                    runtime_kwargs["deployment_profile"]
+                ),
+                "observed_required": len(
+                    runtime_kwargs["observed_channel_names"]
+                ),
+                "observed_channel_names": list(
+                    runtime_kwargs["observed_channel_names"]
+                ),
+                "missing_expected": list(
+                    runtime_kwargs["simulated_missing_channels"]
+                ),
+                "missing_channel_policy": str(
+                    runtime_kwargs["missing_channel_policy"]
+                ),
+                "min_observed_channels": int(
+                    runtime_kwargs["min_observed_channels"]
+                ),
+                "spline_alpha": float(
+                    runtime_kwargs["spline_alpha"]
+                ),
+                "channel_completion_source": str(
+                    runtime_kwargs["channel_completion_source"]
+                ),
+                "completion_matrix_sha256": runtime_kwargs.get(
+                    "completion_matrix_sha256"
+                ),
+            },
         },
         "adaptation": {
             "offline": {
@@ -731,6 +907,12 @@ def build_package_payload(
             ),
             "source_training_report": (
                 training_report_path.name
+            ),
+            "training_channel_source_count": int(
+                runtime_kwargs["training_channel_source_count"]
+            ),
+            "completion_matrix_sha256": runtime_kwargs.get(
+                "completion_matrix_sha256"
             ),
         },
     }
@@ -760,7 +942,7 @@ def load_package_runtime_for_smoke_test(
     package_path: Path,
     device: str,
     verify_hashes: bool,
-) -> CBraModRuntime:
+) -> LoadedRuntimePackage:
     """
     当前仅供本导出脚本内部验证。
 
@@ -768,6 +950,17 @@ def load_package_runtime_for_smoke_test(
     _load_cbramod_package()，使 replay_offline.py 和 Streamlit
     能通过统一 load_runtime_package() 加载。
     """
+
+    loaded_package = load_runtime_package(
+        package_path,
+        device=device,
+        verify_hashes=verify_hashes,
+    )
+    if loaded_package.model_type != "cbramod":
+        raise ValueError(
+            "Export smoke expected a CBRaMod Runtime Package."
+        )
+    return loaded_package
 
     package_yaml_path = required_file(
         package_path / "package.yaml",
@@ -1268,7 +1461,16 @@ def main() -> None:
         **{
             key: value
             for key, value in runtime_kwargs.items()
-            if key != "standard_channels"
+            if key
+            not in {
+                "standard_channels",
+                "deployment_profile",
+                "training_channel_source_count",
+                "observed_channel_names",
+                "simulated_missing_channels",
+                "channel_completion_source",
+                "completion_matrix_sha256",
+            }
         },
     )
 
@@ -1281,6 +1483,15 @@ def main() -> None:
         anchor=training_source_trial_selection[
             "anchor"
         ],
+        observed_channel_names=tuple(
+            runtime_kwargs["observed_channel_names"]
+        ),
+    )
+
+    source_prepared = source_runtime.runtime_model.prepare(raw_window)
+    source_prepared_diagnostics = validate_deployment_prepared(
+        source_prepared,
+        runtime_kwargs=runtime_kwargs,
     )
 
     source_probabilities = predict_probabilities(
@@ -1379,6 +1590,25 @@ def main() -> None:
                 raw_window=raw_window,
             )
 
+            package_prepared = package_runtime.runtime_model.prepare(
+                raw_window
+            )
+            package_prepared_diagnostics = validate_deployment_prepared(
+                package_prepared,
+                runtime_kwargs=runtime_kwargs,
+            )
+
+            if (
+                source_prepared_diagnostics["completion_matrix_sha256"]
+                != package_prepared_diagnostics[
+                    "completion_matrix_sha256"
+                ]
+            ):
+                raise RuntimeError(
+                    "Training and packaged Runtime completion matrix "
+                    "SHA-256 values differ."
+                )
+
             if not np.allclose(
                 source_probabilities,
                 package_probabilities,
@@ -1410,6 +1640,14 @@ def main() -> None:
                 ),
                 "probabilities": (
                     package_probabilities[0].tolist()
+                ),
+                "deployment_prepared": (
+                    package_prepared_diagnostics
+                ),
+                "training_completion_matrix_sha256": (
+                    source_prepared_diagnostics[
+                        "completion_matrix_sha256"
+                    ]
                 ),
                 "warning": (
                     "This is an export integrity smoke test, "

@@ -53,6 +53,84 @@ NormalizationMode = Literal["none", "per_window_zscore"]
 MissingChannelPolicy = Literal["error", "spherical_spline"]
 HeadType = Literal["official_mlp", "linear"]
 
+
+CBRAMOD_STRICT22_PROFILE = "strict22"
+CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE = (
+    "neuracle_live19_spline22"
+)
+CBRAMOD_NEURACLE_SIMULATED_MISSING_CHANNELS: tuple[str, ...] = (
+    "CPz",
+    "P1",
+    "P2",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CBraModDeploymentProfile:
+    name: str
+    training_channel_source_count: int
+    observed_channel_names: tuple[str, ...]
+    simulated_missing_channels: tuple[str, ...]
+    missing_channel_policy: MissingChannelPolicy
+    min_observed_channels: int
+    spline_alpha: float
+    channel_completion_source: str
+
+
+def resolve_cbramod_deployment_profile(
+    name: str,
+    *,
+    target_channel_names: tuple[str, ...] = BCICIV2A_22_CHANNELS,
+) -> CBraModDeploymentProfile:
+    profile_name = str(name).strip()
+    target_channels = tuple(str(value) for value in target_channel_names)
+
+    if len(target_channels) != len(set(target_channels)):
+        raise ValueError("CBRaMod target channels contain duplicates.")
+
+    if profile_name == CBRAMOD_STRICT22_PROFILE:
+        return CBraModDeploymentProfile(
+            name=profile_name,
+            training_channel_source_count=len(target_channels),
+            observed_channel_names=target_channels,
+            simulated_missing_channels=(),
+            missing_channel_policy="error",
+            min_observed_channels=len(target_channels),
+            spline_alpha=1e-5,
+            channel_completion_source="shared_runtime_preprocessor",
+        )
+
+    if profile_name == CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE:
+        missing = CBRAMOD_NEURACLE_SIMULATED_MISSING_CHANNELS
+        absent_from_target = tuple(
+            channel for channel in missing if channel not in target_channels
+        )
+        if absent_from_target:
+            raise ValueError(
+                "Neuracle Live simulated missing channels are absent from "
+                f"the CBRaMod target montage: {absent_from_target}."
+            )
+        observed = tuple(
+            channel for channel in target_channels if channel not in missing
+        )
+        if len(target_channels) != 22 or len(observed) != 19:
+            raise ValueError(
+                "Neuracle Live CBRaMod profile requires 22 target channels "
+                "and exactly 19 observed channels."
+            )
+        return CBraModDeploymentProfile(
+            name=profile_name,
+            training_channel_source_count=22,
+            observed_channel_names=observed,
+            simulated_missing_channels=missing,
+            missing_channel_policy="spherical_spline",
+            min_observed_channels=19,
+            spline_alpha=1e-5,
+            channel_completion_source="shared_runtime_preprocessor",
+        )
+
+    raise ValueError(f"Unsupported CBRaMod deployment profile: {profile_name!r}.")
+
 @dataclass(frozen=True, slots=True)
 class CBraModConfig:
     """
@@ -135,7 +213,7 @@ class CBraModConfig:
 
     # 仅在 missing_channel_policy="spherical_spline" 时生效。
     # 这是最低质量门槛，不是设备通道数；必须由训练/部署协议明确记录。
-    min_observed_channels: int = 2
+    min_observed_channels: int | None = None
 
     # 插值矩阵的 Tikhonov 正则项，固定记录到模型包，保证可复现。
     spline_alpha: float = 1e-5
@@ -177,6 +255,11 @@ class CBraModConfig:
             self.n_channels
             if self.min_observed_channels is None
             else int(self.min_observed_channels)
+        )
+        object.__setattr__(
+            self,
+            "min_observed_channels",
+            required_observed,
         )
 
         if not 1 <= required_observed <= self.n_channels:

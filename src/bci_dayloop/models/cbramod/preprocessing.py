@@ -721,6 +721,49 @@ class CBraModPipelinePreprocessor(ModelInputTransform):
 
         return cached
 
+    def completion_matrix_sha256_for(
+        self,
+        observed_channel_names: Sequence[str],
+    ) -> str | None:
+        """Return the shared runtime completion-matrix identity.
+
+        This uses the exact same cached spherical-spline implementation as
+        ``transform``. Training/export code can therefore record provenance
+        without maintaining a second interpolation implementation.
+        """
+        observed = tuple(
+            self._canonical_channel_name(str(name))
+            for name in observed_channel_names
+        )
+        if len(observed) != len(set(observed)):
+            raise ValueError("Observed CBRaMod channels contain duplicates.")
+        unknown = tuple(
+            name for name in observed if name not in self._target_channel_indices
+        )
+        if unknown:
+            raise ValueError(
+                "Observed channels are outside the CBRaMod target montage: "
+                f"{unknown}."
+            )
+        missing = tuple(
+            name for name in self._target_channels if name not in observed
+        )
+        if not missing:
+            return None
+        if self.config.missing_channel_policy != "spherical_spline":
+            raise ValueError(
+                "Completion matrix is unavailable unless "
+                "missing_channel_policy='spherical_spline'."
+            )
+        if len(observed) < self.config.required_observed_channels:
+            raise ValueError(
+                "Too few observed channels for the configured completion "
+                f"policy: {len(observed)} < "
+                f"{self.config.required_observed_channels}."
+            )
+        _, matrix_sha256 = self._completion_matrix(observed, missing)
+        return matrix_sha256
+
     def _complete_missing_channels(
         self,
         signal: np.ndarray,

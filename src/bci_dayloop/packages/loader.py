@@ -1029,6 +1029,117 @@ def _load_cbramod_package(
             "match preprocessing transform standard_channels."
         )
 
+    n_channels = int(transform["n_channels"])
+    policy_value = transform.get("missing_channel_policy")
+    missing_channel_policy = (
+        "error" if policy_value is None else str(policy_value)
+    )
+    min_observed_value = transform.get("min_observed_channels")
+    if min_observed_value is None:
+        if missing_channel_policy == "spherical_spline":
+            raise ValueError(
+                "CBRaMod spherical_spline package must explicitly declare "
+                "transform.min_observed_channels."
+            )
+        min_observed_channels = n_channels
+    else:
+        min_observed_channels = int(min_observed_value)
+    spline_alpha_value = transform.get("spline_alpha")
+    if spline_alpha_value is None:
+        if missing_channel_policy == "spherical_spline":
+            raise ValueError(
+                "CBRaMod spherical_spline package must explicitly declare "
+                "transform.spline_alpha."
+            )
+        spline_alpha = 1e-5
+    else:
+        spline_alpha = float(spline_alpha_value)
+
+    completion_metadata = runtime_config.get("channel_completion")
+    if (
+        missing_channel_policy == "spherical_spline"
+        and completion_metadata is None
+    ):
+        raise ValueError(
+            "CBRaMod spherical_spline package must declare "
+            "runtime.channel_completion."
+        )
+    if completion_metadata is not None:
+        if not isinstance(completion_metadata, dict):
+            raise ValueError(
+                "runtime.channel_completion must be a mapping."
+            )
+        expected_completion_values = {
+            "missing_channel_policy": missing_channel_policy,
+            "min_observed_channels": min_observed_channels,
+            "spline_alpha": spline_alpha,
+        }
+        for key, expected_value in expected_completion_values.items():
+            if completion_metadata.get(key) != expected_value:
+                raise ValueError(
+                    "CBRaMod runtime.channel_completion does not match "
+                    f"preprocessing transform for {key}."
+                )
+        observed_names = tuple(
+            str(name)
+            for name in completion_metadata.get(
+                "observed_channel_names", ()
+            )
+        )
+        missing_names = tuple(
+            str(name)
+            for name in completion_metadata.get("missing_expected", ())
+        )
+        if len(observed_names) != len(set(observed_names)):
+            raise ValueError(
+                "CBRaMod runtime observed channels contain duplicates."
+            )
+        if len(missing_names) != len(set(missing_names)):
+            raise ValueError(
+                "CBRaMod runtime missing channels contain duplicates."
+            )
+        if set(observed_names).intersection(missing_names):
+            raise ValueError(
+                "CBRaMod runtime observed and missing channels overlap."
+            )
+        if tuple(
+            name for name in channel_names if name in observed_names
+        ) != observed_names or tuple(
+            name for name in channel_names if name in missing_names
+        ) != missing_names:
+            raise ValueError(
+                "CBRaMod runtime channel completion order does not match "
+                "the package target montage."
+            )
+        if set(observed_names).union(missing_names) != set(channel_names):
+            raise ValueError(
+                "CBRaMod runtime observed/missing channels do not partition "
+                "the package target montage."
+            )
+        if int(completion_metadata.get("observed_required", -1)) != len(
+            observed_names
+        ):
+            raise ValueError(
+                "CBRaMod runtime observed_required does not match its "
+                "observed channel list."
+            )
+        if (
+            missing_channel_policy == "spherical_spline"
+            and completion_metadata.get("channel_completion_source")
+            != "shared_runtime_preprocessor"
+        ):
+            raise ValueError(
+                "CBRaMod spherical-spline package must use the shared "
+                "runtime preprocessor."
+            )
+        if completion_metadata.get(
+            "completion_matrix_sha256"
+        ) != transform.get("completion_matrix_sha256"):
+            raise ValueError(
+                "CBRaMod completion matrix SHA-256 differs between runtime "
+                "and preprocessing metadata."
+            )
+
     config = CBraModConfig(
         checkpoint_path=backbone_path,
         classifier_path=classifier_path,
@@ -1036,7 +1147,7 @@ def _load_cbramod_package(
 
         target_sample_rate=float(contract["sample_rate"]),
         window_seconds=float(contract["window_sec"]),
-        n_channels=int(transform["n_channels"]),
+        n_channels=n_channels,
         standard_channels=channel_names,
         time_segments=int(transform["time_segments"]),
         points_per_patch=int(transform["points_per_patch"]),
@@ -1065,9 +1176,9 @@ def _load_cbramod_package(
             transform.get("normalization", "none")
         ),
         zscore_eps=float(transform.get("zscore_eps", 1e-8)),
-        allow_missing_channels=bool(
-            transform.get("allow_missing_channels", False)
-        ),
+        missing_channel_policy=missing_channel_policy,
+        min_observed_channels=min_observed_channels,
+        spline_alpha=spline_alpha,
 
         num_classes=num_classes,
         backbone_output_dim=int(
@@ -1087,13 +1198,50 @@ def _load_cbramod_package(
     classifier = build_cbramod_classifier(config).to(
         backbone.device
     )
-    load_cbramod_classifier_checkpoint(
+    classifier_report = load_cbramod_classifier_checkpoint(
         classifier,
         classifier_path,
         config=config,
         class_names=class_names,
         strict_metadata=True,
     )
+
+    if missing_channel_policy == "spherical_spline":
+        classifier_metadata = classifier_report.metadata
+        assert isinstance(completion_metadata, dict)
+        provenance = package_payload.get("provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError("CBRaMod package provenance must be a mapping.")
+        required_classifier_metadata = {
+            "deployment_profile": completion_metadata.get(
+                "deployment_profile"
+            ),
+            "training_channel_source_count": provenance.get(
+                "training_channel_source_count"
+            ),
+            "observed_channel_count": len(
+                completion_metadata["observed_channel_names"]
+            ),
+            "observed_channel_names": completion_metadata[
+                "observed_channel_names"
+            ],
+            "simulated_missing_channels": completion_metadata[
+                "missing_expected"
+            ],
+            "missing_channel_policy": missing_channel_policy,
+            "min_observed_channels": min_observed_channels,
+            "spline_alpha": spline_alpha,
+            "completion_matrix_sha256": transform.get(
+                "completion_matrix_sha256"
+            ),
+            "channel_completion_source": "shared_runtime_preprocessor",
+        }
+        for key, expected_value in required_classifier_metadata.items():
+            if classifier_metadata.get(key) != expected_value:
+                raise ValueError(
+                    "CBRaMod classifier metadata does not match the "
+                    f"spherical-spline package for {key}."
+                )
 
     runtime_model = RuntimeModel(
         canonicalizer=SignalCanonicalizer(

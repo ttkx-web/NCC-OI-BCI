@@ -421,7 +421,83 @@ def validate_loaded_session(
 # ---------------------------------------------------------------------------
 # Window construction
 # ---------------------------------------------------------------------------
+def select_direct_trial_segment(
+    *,
+    trials: np.ndarray,
+    sample_rate: float,
+    window_seconds: float,
+    anchor: str,
+    split_name: str,
+) -> tuple[np.ndarray, dict[str, int | float | str]]:
+    """
+    从每个源 trial 中显式选择一个连续窗口。
 
+    不补零、不拼接、不跨 trial；每个输出窗口仍只对应一个源 trial。
+    """
+    trials = np.asarray(trials, dtype=np.float32)
+
+    if trials.ndim != 3:
+        raise ValueError(
+            f"{split_name}: trials must have shape [N,C,T], "
+            f"got {trials.shape}."
+        )
+    if sample_rate <= 0:
+        raise ValueError(
+            f"{split_name}: sample_rate must be positive, "
+            f"got {sample_rate}."
+        )
+    if window_seconds <= 0:
+        raise ValueError(
+            f"{split_name}: window_seconds must be positive, "
+            f"got {window_seconds}."
+        )
+    if anchor not in {"start", "center", "end"}:
+        raise ValueError(
+            f"{split_name}: unsupported direct-trial anchor "
+            f"{anchor!r}; expected start, center, or end."
+        )
+
+    source_samples = int(trials.shape[-1])
+    target_samples = int(round(window_seconds * sample_rate))
+
+    if target_samples <= 0:
+        raise ValueError(
+            f"{split_name}: target window has no samples."
+        )
+
+    if target_samples > source_samples:
+        raise ValueError(
+            f"{split_name}: source trials are only "
+            f"{source_samples / sample_rate:.3f}s, but "
+            f"--window-sec={window_seconds:.3f}s requires "
+            f"{target_samples} samples. Direct-trial mode does not "
+            "pad, concatenate, or cross source-trial boundaries."
+        )
+
+    if anchor == "start":
+        start_sample = 0
+    elif anchor == "center":
+        start_sample = (source_samples - target_samples) // 2
+    else:  # anchor == "end"
+        start_sample = source_samples - target_samples
+
+    end_sample = start_sample + target_samples
+
+    return (
+        trials[..., start_sample:end_sample],
+        {
+            "policy": "one_contiguous_window_per_source_trial",
+            "anchor": anchor,
+            "source_samples": source_samples,
+            "source_seconds": source_samples / sample_rate,
+            "selected_start_sample": start_sample,
+            "selected_end_sample_exclusive": end_sample,
+            "selected_start_seconds": start_sample / sample_rate,
+            "selected_end_seconds": end_sample / sample_rate,
+            "selected_samples": target_samples,
+            "selected_seconds": target_samples / sample_rate,
+        },
+    )
 
 def build_subject_window_bundle(
     *,
@@ -434,7 +510,8 @@ def build_subject_window_bundle(
     seed: int,
     shuffle_trials_within_class: bool,
     max_windows_per_class: int | None,
-        window_construction: str,
+    window_construction: str,
+    direct_trial_anchor: str,
 ) -> tuple[WindowBundle, HDF5Metadata, dict[str, Any]]:
     dataset = EEGHDF5(path)
     metadata = dataset.metadata
@@ -470,8 +547,20 @@ def build_subject_window_bundle(
     )
 
     if window_construction == "direct_trial":
+        direct_trials, direct_trial_selection = (
+            select_direct_trial_segment(
+                trials=trials,
+                sample_rate=metadata.sample_rate,
+                window_seconds=window_seconds,
+                anchor=direct_trial_anchor,
+                split_name=(
+                    f"subject_{subject_id:02d}/{session_name}"
+                ),
+            )
+        )
+
         window_set = build_direct_trial_windows(
-            trials=trials,
+            trials=direct_trials,
             labels=labels,
             trial_ids=global_trial_ids,
             sample_rate=metadata.sample_rate,
@@ -484,6 +573,7 @@ def build_subject_window_bundle(
         )
 
     elif window_construction == "same_label_concat":
+        direct_trial_selection = None
         window_set = build_same_label_concat_windows(
             trials=trials,
             labels=labels,
@@ -533,6 +623,7 @@ def build_subject_window_bundle(
             np.asarray(session_data["labels"], dtype=np.int64),
             metadata.class_names,
         ),
+        "direct_trial_selection": direct_trial_selection,
         "derived_windows_total": int(len(window_set.windows)),
         "derived_windows_per_class": class_name_counts(
             window_set.labels,
@@ -602,6 +693,7 @@ def build_population_split(
     max_windows_per_class_per_subject: int | None,
     reference_metadata: HDF5Metadata | None = None,
     window_construction: str,
+    direct_trial_anchor: str,
 ) -> SplitBuildResult:
     bundles: list[WindowBundle] = []
     summaries: dict[str, Any] = {}
@@ -627,6 +719,7 @@ def build_population_split(
             shuffle_trials_within_class=shuffle_trials_within_class,
             max_windows_per_class=max_windows_per_class_per_subject,
             window_construction=window_construction,
+            direct_trial_anchor=direct_trial_anchor,
         )
         if common_metadata is None:
             common_metadata = metadata
@@ -868,6 +961,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--window-construction",
         choices=("direct_trial", "same_label_concat"),
         default="direct_trial",
+    )
+    parser.add_argument(
+        "--direct-trial-anchor",
+        choices=("start", "center", "end"),
+        default="end",
+        help=(
+            "When --window-construction=direct_trial and a source trial "
+            "is longer than --window-sec, select one contiguous segment "
+            "from the start, center, or end. Default: end."
+        ),
     )
 
     parser.add_argument(
@@ -1123,6 +1226,7 @@ def main() -> None:
             args.max_windows_per_class_per_subject
         ),
         window_construction=args.window_construction,
+        direct_trial_anchor=args.direct_trial_anchor,
     )
 
     print("Building population validation windows...")
@@ -1140,6 +1244,7 @@ def main() -> None:
         ),
         reference_metadata=train_build.metadata,
         window_construction=args.window_construction,
+        direct_trial_anchor=args.direct_trial_anchor,
     )
 
     metadata = train_build.metadata
@@ -1248,6 +1353,14 @@ def main() -> None:
             config.model_n_time_patches
         ),
         "window_construction": args.window_construction,
+        "direct_trial_selection": (
+            {
+                "policy": "one_contiguous_window_per_source_trial",
+                "anchor": args.direct_trial_anchor,
+            }
+            if args.window_construction == "direct_trial"
+            else None
+        ),
     }
     preprocessing_hash = stable_json_hash(preprocessing_contract)
 
@@ -1527,6 +1640,7 @@ def main() -> None:
         ),
         reference_metadata=metadata,
         window_construction=args.window_construction,
+        direct_trial_anchor=args.direct_trial_anchor,
     )
 
     target_subject_values = set(

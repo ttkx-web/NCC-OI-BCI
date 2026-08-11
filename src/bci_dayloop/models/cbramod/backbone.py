@@ -103,21 +103,21 @@ class CBraModBackbone(nn.Module):
 
     def _validate_official_architecture_contract(self) -> None:
         """
-        CBRaMod 的频域分支将 patch_size=200 写死为 rFFT 后的 101 维，
-        因此当前官方预训练权重不能接受其他 points_per_patch。
-        """
+        保持与官方 checkpoint 一致的结构约束。
 
+        points_per_patch 必须为 200：频域分支会对每个 patch
+        做 rFFT，并将 101 个频点送入固定输入维度的 Linear。
+
+        time_segments 可以为正整数。官方 vendor 的前向实现从输入
+        张量读取实际 patch_num，因此 1/2/3/4 个 1 秒 segment
+        均采用同一冻结 backbone；正式实验前必须做真实 checkpoint
+        smoke test。
+        """
         if self.config.n_channels != 22:
             raise ValueError(
                 "The current CBraMod baseline is defined for "
-                f"22 channels, got n_channels={self.config.n_channels}."
-            )
-
-        if self.config.time_segments != 4:
-            raise ValueError(
-                "The current CBraMod baseline is defined for "
-                "4 time segments, got "
-                f"time_segments={self.config.time_segments}."
+                f"22 channels, got n_channels="
+                f"{self.config.n_channels}."
             )
 
         if self.config.points_per_patch != _OFFICIAL_IN_DIM:

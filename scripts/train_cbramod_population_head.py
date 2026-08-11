@@ -77,7 +77,9 @@ from bci_dayloop.preprocessing.canonical import (
 )
 from bci_dayloop.runtime.types import RawEEGWindow
 from bci_dayloop.utils.config import dump_yaml
-
+from bci_dayloop.data.trial_windows import (
+    select_direct_trial_window,
+)
 
 # ---------------------------------------------------------------------
 # Data containers
@@ -158,6 +160,63 @@ class Metrics:
 # Generic helpers
 # ---------------------------------------------------------------------
 
+def resolve_cbramod_time_segments(
+    *,
+    window_seconds: float,
+    target_sample_rate: float,
+    points_per_patch: int = 200,
+) -> int:
+    """
+    官方 CBraMod 保持每个 patch 为 200 点。
+
+    在 200 Hz 下，这等价于要求 window_seconds 是整数秒。
+    """
+    if window_seconds <= 0:
+        raise ValueError(
+            "--window-seconds must be positive."
+        )
+
+    if target_sample_rate <= 0:
+        raise ValueError(
+            "--target-sample-rate must be positive."
+        )
+
+    target_samples_float = (
+        window_seconds * target_sample_rate
+    )
+    target_samples = int(round(target_samples_float))
+
+    if not np.isclose(
+        target_samples_float,
+        target_samples,
+        rtol=0.0,
+        atol=1e-6,
+    ):
+        raise ValueError(
+            "CBraMod window duration does not map to an "
+            "integer number of samples: "
+            f"{window_seconds} s × "
+            f"{target_sample_rate} Hz = "
+            f"{target_samples_float}."
+        )
+
+    if target_samples % points_per_patch != 0:
+        raise ValueError(
+            "CBraMod currently requires an integer number "
+            "of 200-sample patches. At 200 Hz, "
+            "--window-seconds must be an integer number "
+            f"of seconds. Got {window_seconds}s -> "
+            f"{target_samples} samples."
+        )
+
+    time_segments = target_samples // points_per_patch
+
+    if time_segments <= 0:
+        raise ValueError(
+            "CBraMod time_segments must be positive."
+        )
+
+    return time_segments
 
 def resolve_repo_path(
     value: str | Path,
@@ -644,6 +703,7 @@ def build_subject_feature_split(
     preprocessor: CBraModPipelinePreprocessor,
     backbone: CBraModBackbone,
     feature_batch_size: int,
+    direct_trial_anchor: str,
 ) -> tuple[FeatureSplit, HDF5Metadata]:
     dataset = EEGHDF5(subject_path)
     metadata = dataset.metadata
@@ -722,6 +782,17 @@ def build_subject_feature_split(
         num_classes=len(metadata.class_names),
         split_name=(
             f"subject_{subject_id:02d}/{session_name}"
+        ),
+    )
+
+    data, _ = select_direct_trial_window(
+        data,
+        sample_rate=float(metadata.sample_rate),
+        window_seconds=preprocessor.config.window_seconds,
+        anchor=direct_trial_anchor,
+        context=(
+            f"subject_{subject_id:02d}/"
+            f"{session_name}"
         ),
     )
 
@@ -1266,6 +1337,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--direct-trial-anchor",
+        choices=["start", "center", "end"],
+        default="end",
+        help=(
+            "When source trials are longer than "
+            "--window-seconds, choose one contiguous "
+            "direct-trial segment. Default: end."
+        ),
+    )
+
+    parser.add_argument(
         "--input-unit",
         default="uV",
     )
@@ -1355,6 +1437,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argument_parser().parse_args()
 
+    time_segments = resolve_cbramod_time_segments(
+        window_seconds=args.window_seconds,
+        target_sample_rate=args.target_sample_rate,
+        points_per_patch=200,
+    )
+
+    window_tag = (
+        f"{args.window_seconds:g}s_flatten"
+    )
+
     set_seed(args.seed)
 
     subjects = normalize_subjects(args.subjects)
@@ -1394,7 +1486,7 @@ def main() -> None:
         / "bnci2014_001"
         / f"subject_{target_subject:02d}"
         / "cbramod"
-        / "4s_flatten"
+        / window_tag
     )
 
     run_dir = (
@@ -1411,7 +1503,7 @@ def main() -> None:
         / "bnci2014_001"
         / f"subject_{target_subject:02d}"
         / "cbramod"
-        / "4s_flatten"
+        / window_tag
         / "head.pt"
     )
 
@@ -1477,7 +1569,7 @@ def main() -> None:
         target_sample_rate=args.target_sample_rate,
         window_seconds=args.window_seconds,
         n_channels=22,
-        time_segments=4,
+        time_segments=time_segments,
         points_per_patch=200,
         input_unit=args.input_unit,
 
@@ -1524,6 +1616,14 @@ def main() -> None:
         "window_tolerance_seconds": (
             config.window_tolerance_seconds
         ),
+        "training_source_trial_selection": {
+            "policy": (
+                "one_contiguous_window_per_source_trial"
+            ),
+            "anchor": args.direct_trial_anchor,
+            "padding": False,
+            "cross_trial_concatenation": False,
+        },
     }
 
     preprocessing_hash = stable_json_hash(
@@ -1625,6 +1725,7 @@ def main() -> None:
             feature_cache_dir
             / (
                 f"{split_name}_"
+                f"{window_tag}_"
                 f"target_{target_subject:02d}_"
                 f"seed_{args.seed}.pt"
             )
@@ -1669,6 +1770,9 @@ def main() -> None:
                     backbone=backbone,
                     feature_batch_size=(
                         args.feature_batch_size
+                    ),
+                    direct_trial_anchor=(
+                        args.direct_trial_anchor
                     ),
                 )
             )

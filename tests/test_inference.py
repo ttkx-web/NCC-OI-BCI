@@ -13,7 +13,7 @@ from bci_dayloop.inference.realtime import (
 from bci_dayloop.models.base import (
     add_batch_dimension,
 )
-from tests.runtime_fakes import (
+from runtime_fakes import (
     build_fixed_runtime,
 )
 

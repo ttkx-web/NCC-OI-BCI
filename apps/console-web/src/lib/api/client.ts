@@ -1,4 +1,4 @@
-import type { DatasetSummary, ModelSummary } from "@/types/api";
+import type { DatasetSummary, ModelSummary, RunSummary, SystemStatus } from "@/types/api";
 
 export const API_BASE = process.env.NEXT_PUBLIC_CONSOLE_API_URL ?? "http://127.0.0.1:8000";
 
@@ -22,6 +22,14 @@ export const consoleApi = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  startLive: (payload: { model_id: string; source: "neuracle_jellyfish"; compute_device: "cpu" | "cuda"; confidence_threshold: number }) =>
+    request<{ run_id: string; state: string }>("/api/v1/runs/live", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  runs: async () => (await request<{ items: RunSummary[] }>("/api/v1/runs")).items,
+  run: (runId: string) => request<RunSummary>(`/api/v1/runs/${runId}`),
+  systemStatus: () => request<SystemStatus>("/api/v1/system/status"),
   stopRun: (runId: string) => request(`/api/v1/runs/${runId}/stop`, { method: "POST" }),
   restartRun: (runId: string) => request(`/api/v1/runs/${runId}/restart`, { method: "POST" }),
 };

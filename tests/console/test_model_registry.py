@@ -7,7 +7,7 @@ from app.services.model_service import ModelRegistry
 
 
 def test_model_package_discovery_is_stable_and_privacy_safe(runtime_package: Path) -> None:
-    registry = ModelRegistry([runtime_package.parents[3]])
+    registry = ModelRegistry([runtime_package.parents[3]], runtime_verifier=lambda _path: True)
     first = registry.list()
     second = registry.list()
     assert len(first) == 1
@@ -24,5 +24,5 @@ def test_invalid_model_package_is_ignored(runtime_package: Path) -> None:
     invalid = runtime_package.parents[2] / "invalid" / "v1"
     invalid.mkdir(parents=True)
     (invalid / "package.yaml").write_text("schema_version: 1\n", encoding="utf-8")
-    registry = ModelRegistry([runtime_package.parents[3]])
+    registry = ModelRegistry([runtime_package.parents[3]], runtime_verifier=lambda _path: True)
     assert len(registry.list()) == 1

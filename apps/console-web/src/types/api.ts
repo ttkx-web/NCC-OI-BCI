@@ -73,10 +73,31 @@ export interface InputContractPayload {
   valid_channels: number;
   window_sec: number;
   target_sample_rate: number;
+  reason?: string;
+}
+
+export interface RunSummary {
+  id: string;
+  run_type: string;
+  state: RunState;
+  dataset_id: string | null;
+  subject_id: string | null;
+  session: string | null;
+  model_id: string;
+  created_at: number;
+  successful_windows: number;
+  failed_windows: number;
+  expected_windows: number | null;
+}
+
+export interface SystemStatus {
+  device: { status: string; source: string | null; health?: Record<string, unknown> };
+  runtime: { state: string; run_id?: string; model_id?: string };
+  compute: { cuda_available: boolean };
 }
 
 export type RunEvent = {
-  type: "state" | "prediction" | "latency" | "runtime_health" | "input_contract" | "error";
+  type: "state" | "prediction" | "latency" | "runtime_health" | "device_health" | "input_contract" | "trigger" | "window" | "error";
   run_id: string;
   timestamp: number;
   payload: Record<string, unknown>;

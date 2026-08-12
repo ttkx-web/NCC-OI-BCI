@@ -6,7 +6,10 @@ from typing import Any, Literal
 from app.schemas.common import ConsoleModel
 
 
-EventType = Literal["state", "prediction", "latency", "runtime_health", "input_contract", "error"]
+EventType = Literal[
+    "state", "prediction", "latency", "runtime_health", "device_health",
+    "input_contract", "trigger", "window", "error",
+]
 
 
 class RunEvent(ConsoleModel):
@@ -112,6 +115,31 @@ def input_contract_event(
             "target_sample_rate": target_sample_rate,
         },
     )
+
+
+def device_health_event(run_id: str, *, health: dict[str, Any]) -> dict[str, Any]:
+    """Publish source health only; caller must never include signal payloads."""
+    allowed = {
+        "state", "connected", "metadata_ready", "channel_count", "sampling_rate",
+        "received_packets", "malformed_packets", "missing_packets", "duplicate_packets",
+        "out_of_order_packets", "reconnect_count", "last_error", "last_packet_age_sec",
+        "stream_unit", "eeg_unit", "unit_evidence_level", "eeg_model_safe", "model_safe",
+    }
+    return run_event("device_health", run_id, {key: health.get(key) for key in allowed if key in health})
+
+
+def trigger_event(run_id: str, *, event_type: str, code: int | str | None) -> dict[str, Any]:
+    return run_event("trigger", run_id, {"event_type": event_type, "code": code})
+
+
+def window_event(
+    run_id: str, *, window_id: int, status: str, continuous_segment_id: int | str | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    return run_event("window", run_id, {
+        "window_id": window_id, "status": status,
+        "continuous_segment_id": continuous_segment_id, "reason": reason,
+    })
 
 
 def error_event(run_id: str, *, code: str, message: str, fatal: bool) -> dict[str, Any]:

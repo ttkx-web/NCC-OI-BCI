@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.dependencies import run_service
-from app.schemas.runs import ReplayCreate, RunCreated, RunList, RunState, RunSummary
+from app.schemas.runs import LiveCreate, ReplayCreate, RunCreated, RunList, RunState, RunSummary
 from app.services.run_service import RunService
 
 
@@ -20,6 +20,19 @@ def create_replay(payload: ReplayCreate, service: Annotated[RunService, Depends(
         raise HTTPException(status_code=404, detail="Dataset or model not found") from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    return RunCreated(run_id=record.id, state=RunState.STARTING)
+
+
+@router.post("/live", response_model=RunCreated, status_code=202)
+def create_live(payload: LiveCreate, service: Annotated[RunService, Depends(run_service)]) -> RunCreated:
+    try:
+        record = service.create_live(payload)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="Model not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return RunCreated(run_id=record.id, state=RunState.STARTING)
 
 

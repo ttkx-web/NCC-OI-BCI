@@ -18,7 +18,7 @@ from app.schemas.events import (
     runtime_health_event,
     state_event,
 )
-from app.schemas.runs import ReplayCreate, RunState, RunSummary
+from app.schemas.runs import LiveCreate, ReplayCreate, RunState, RunSummary
 from app.services.dataset_service import DatasetEntry, DatasetRegistry
 from app.services.model_service import ModelEntry, ModelRegistry
 
@@ -61,8 +61,9 @@ class RunEventBroker:
 @dataclass(slots=True)
 class RunRecord:
     id: str
-    request: ReplayCreate
+    request: ReplayCreate | LiveCreate
     created_at: float
+    run_type: str = "replay"
     state: RunState = RunState.STARTING
     controller: Any | None = None
     broker: RunEventBroker = field(default_factory=RunEventBroker)
@@ -75,22 +76,26 @@ class RunRecord:
 
     def summary(self) -> RunSummary:
         with self.lock:
-            if self.controller is not None:
+            if self.controller is not None and hasattr(self.controller, "stats"):
                 stats = self.controller.stats.snapshot()
                 successful = stats.successful_windows
                 failed = stats.failed_windows
                 expected = stats.expected_windows
+            elif self.controller is not None:
+                successful = int(getattr(self.controller, "successful_windows", self.successful_windows))
+                failed = int(getattr(self.controller, "failed_windows", self.failed_windows))
+                expected = getattr(self.controller, "expected_windows", self.expected_windows)
             else:
                 successful = self.successful_windows
                 failed = self.failed_windows
                 expected = self.expected_windows
             return RunSummary(
                 id=self.id,
-                run_type="replay",
+                run_type=self.run_type,
                 state=self.state,
-                dataset_id=self.request.dataset_id,
-                subject_id=self.request.subject_id,
-                session=self.request.session,
+                dataset_id=getattr(self.request, "dataset_id", None),
+                subject_id=getattr(self.request, "subject_id", None),
+                session=getattr(self.request, "session", None),
                 model_id=self.request.model_id,
                 created_at=self.created_at,
                 successful_windows=successful,
@@ -100,6 +105,7 @@ class RunRecord:
 
 
 ControllerFactory = Callable[[RunRecord, DatasetEntry, ModelEntry], Any]
+LiveControllerFactory = Callable[[RunRecord, ModelEntry], Any]
 
 
 class RunService:
@@ -109,10 +115,12 @@ class RunService:
         models: ModelRegistry,
         *,
         controller_factory: ControllerFactory | None = None,
+        live_controller_factory: LiveControllerFactory | None = None,
     ) -> None:
         self.datasets = datasets
         self.models = models
         self.controller_factory = controller_factory or self._build_controller
+        self.live_controller_factory = live_controller_factory or self._build_live_controller
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.RLock()
 
@@ -139,6 +147,44 @@ class RunService:
             daemon=True,
         ).start()
         return record
+
+    def create_live(self, request: LiveCreate) -> RunRecord:
+        model = self.models.get_entry(request.model_id)
+        if not model.summary.runtime_verified:
+            raise ValueError("Selected Runtime Package has not passed runtime verification")
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        record = RunRecord(id=run_id, request=request, created_at=time.time(), run_type="live")
+        record.broker.publish(state_event(run_id, RunState.STARTING.value))
+        with self._lock:
+            if any(item.run_type == "live" and item.state not in TERMINAL_STATES for item in self._runs.values()):
+                raise RuntimeError("A Live run is already active")
+            self._runs[run_id] = record
+        threading.Thread(
+            target=self._initialize_live,
+            args=(record, model),
+            name=f"console-live-init-{run_id}",
+            daemon=True,
+        ).start()
+        return record
+
+    def _initialize_live(self, record: RunRecord, model: ModelEntry) -> None:
+        try:
+            controller = self.live_controller_factory(record, model)
+            with record.lock:
+                if record.stop_requested:
+                    record.state = RunState.STOPPED
+                    record.broker.publish(state_event(record.id, record.state.value))
+                    return
+                record.controller = controller
+            controller.start()
+        except Exception:
+            with record.lock:
+                record.state = RunState.FAILED
+            record.broker.publish(error_event(
+                record.id, code="LIVE_INITIALIZATION_FAILED",
+                message="Live Runtime 初始化失败，预测已阻断", fatal=True,
+            ))
+            record.broker.publish(state_event(record.id, RunState.FAILED.value))
 
     def _initialize(self, record: RunRecord, dataset: DatasetEntry, model: ModelEntry) -> None:
         try:
@@ -302,6 +348,11 @@ class RunService:
             on_result=on_result,
             on_state_change=on_state,
         )
+
+    def _build_live_controller(self, record: RunRecord, model: ModelEntry) -> Any:
+        from app.services.live_service import LiveRuntimeController
+
+        return LiveRuntimeController(record, model)
 
     def get(self, run_id: str) -> RunRecord:
         with self._lock:

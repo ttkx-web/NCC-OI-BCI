@@ -40,7 +40,7 @@ class FakeController:
 
 
 def _service(runtime_package: Path, dataset_file: Path) -> tuple[RunService, str]:
-    models = ModelRegistry([runtime_package.parents[3]])
+    models = ModelRegistry([runtime_package.parents[3]], runtime_verifier=lambda _path: True)
     datasets = DatasetRegistry(dataset_file.parents[2])
     model_id = models.list()[0].id
     datasets.list()

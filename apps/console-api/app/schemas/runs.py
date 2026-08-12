@@ -33,6 +33,15 @@ class ReplayCreate(ConsoleModel):
     confidence_threshold: float = Field(default=0.55, ge=0, le=1)
 
 
+class LiveCreate(ConsoleModel):
+    """A hardware run request.  The source is deliberately allow-listed."""
+
+    model_id: str = Field(min_length=1)
+    source: str = Field(default="neuracle_jellyfish", pattern="^neuracle_jellyfish$")
+    compute_device: ComputeDevice = ComputeDevice.CPU
+    confidence_threshold: float = Field(default=0.55, ge=0, le=1)
+
+
 class RunCreated(ConsoleModel):
     run_id: str
     state: RunState
@@ -42,9 +51,9 @@ class RunSummary(ConsoleModel):
     id: str
     run_type: str
     state: RunState
-    dataset_id: str
-    subject_id: str
-    session: str
+    dataset_id: str | None = None
+    subject_id: str | None = None
+    session: str | None = None
     model_id: str
     created_at: float
     successful_windows: int = 0

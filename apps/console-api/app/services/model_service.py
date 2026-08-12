@@ -9,10 +9,12 @@ from typing import Any, Iterable
 
 import yaml
 
+from bci_dayloop.packages.loader import load_runtime_package
+
 from app.schemas.models import ModelSummary
 
 
-SUPPORTED_RUNTIME_TYPES = {"model_50m", "labram"}
+SUPPORTED_RUNTIME_TYPES = {"model_50m", "labram", "cbramod"}
 DISPLAY_NAMES = {"model_50m": "50M", "labram": "LaBraM", "cbramod": "CBraMod"}
 
 
@@ -67,9 +69,25 @@ def _safe_file(package_path: Path, value: Any) -> Path:
 
 
 class ModelRegistry:
-    def __init__(self, roots: Iterable[Path]) -> None:
+    def __init__(self, roots: Iterable[Path], *, runtime_verifier: Any | None = None) -> None:
         self.roots = tuple(Path(root).resolve() for root in roots)
         self._entries: dict[str, ModelEntry] = {}
+        self._runtime_verifier = runtime_verifier or self._verify_runtime
+        self._verification_cache: dict[Path, bool] = {}
+
+    def _verify_runtime(self, package_path: Path) -> bool:
+        """Use the sole Runtime Package loader; never infer validity from YAML."""
+        cached = self._verification_cache.get(package_path)
+        if cached is not None:
+            return cached
+        try:
+            load_runtime_package(package_path, device="cpu", verify_hashes=True)
+        except Exception:
+            verified = False
+        else:
+            verified = True
+        self._verification_cache[package_path] = verified
+        return verified
 
     def refresh(self) -> None:
         entries: dict[str, ModelEntry] = {}
@@ -131,7 +149,7 @@ class ModelRegistry:
             sample_rate=float(contract["sample_rate"]),
             target_channels=len(channel_names),
             schema_version=2,
-            runtime_verified=model_type in SUPPORTED_RUNTIME_TYPES,
+            runtime_verified=(model_type in SUPPORTED_RUNTIME_TYPES and bool(self._runtime_verifier(package_path))),
             package_version=version,
             balanced_accuracy=_metric(metrics, "balanced_accuracy"),
             macro_f1=_metric(metrics, "macro_f1"),

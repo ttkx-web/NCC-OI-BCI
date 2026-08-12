@@ -107,46 +107,16 @@ class RealtimeRuntimeBridge:
         )
         segment_id = window.metadata.get("continuous_segment_id")
         source_shape = tuple(int(value) for value in window.samples.shape)
-        failure = _source_failure(window)
-        if failure:
-            return self._failure(
-                window,
-                source_shape,
-                segment_id,
-                marker_summary,
-                failure,
-            )
-
         try:
-            selected_data, selected_names = self.policy.select_source(window)
+            raw_window = self.to_raw_window(window)
         except Exception as exc:
             return self._failure(
                 window,
                 source_shape,
                 segment_id,
                 marker_summary,
-                "realtime policy source selection failed: "
-                f"{type(exc).__name__}: {exc}",
+                str(exc),
             )
-
-        raw_window = RawEEGWindow(
-            data=selected_data,
-            channel_names=list(selected_names),
-            sample_rate=window.sampling_rate,
-            unit=window.unit,
-            layout="CT",
-            window_id=str(window.window_id),
-            metadata={
-                "source": "stage2b_realtime_window",
-                "continuous_segment_id": segment_id,
-                "provenance": dict(window.metadata),
-                "realtime_policy_id": self.policy.policy_id,
-                "marker_summary": tuple(
-                    {"event_type": kind, "code": code}
-                    for kind, code in marker_summary
-                ),
-            },
-        )
         started = time.perf_counter()
         try:
             prepared = self.runtime_model.prepare(raw_window)
@@ -161,10 +131,77 @@ class RealtimeRuntimeBridge:
                 latency=(time.perf_counter() - started) * 1000.0,
             )
         latency = (time.perf_counter() - started) * 1000.0
+        return self.validate_prepared_window(
+            window,
+            prepared,
+            prepare_latency_ms=latency,
+        )
+
+    def to_raw_window(self, window: RealtimeWindow) -> RawEEGWindow:
+        """Apply the source and policy-selection gates without preprocessing.
+
+        This public boundary lets a benchmark time exactly one
+        ``RuntimeModel.prepare`` call while retaining the same approved source
+        and policy gates used by :meth:`prepare`.
+        """
+        failure = _source_failure(window)
+        if failure:
+            raise ValueError(failure)
+        try:
+            selected_data, selected_names = self.policy.select_source(window)
+        except Exception as exc:
+            raise ValueError(
+                "realtime policy source selection failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        marker_summary = tuple(
+            (marker.event_type, marker.code)
+            for marker in window.markers
+        )
+        return RawEEGWindow(
+            data=selected_data,
+            channel_names=list(selected_names),
+            sample_rate=window.sampling_rate,
+            unit=window.unit,
+            layout="CT",
+            window_id=str(window.window_id),
+            metadata={
+                "source": "stage2b_realtime_window",
+                "continuous_segment_id": window.metadata.get(
+                    "continuous_segment_id"
+                ),
+                "provenance": dict(window.metadata),
+                "realtime_policy_id": self.policy.policy_id,
+                "marker_summary": tuple(
+                    {"event_type": kind, "code": code}
+                    for kind, code in marker_summary
+                ),
+            },
+        )
+
+    def validate_prepared_window(
+        self,
+        window: RealtimeWindow,
+        prepared: PreparedModelInput,
+        *,
+        prepare_latency_ms: float | None = None,
+    ) -> RealtimePreparedWindow:
+        """Apply the policy prepared-input gate without invoking prediction."""
+        marker_summary = tuple(
+            (marker.event_type, marker.code)
+            for marker in window.markers
+        )
+        segment_id = window.metadata.get("continuous_segment_id")
+        source_shape = tuple(int(value) for value in window.samples.shape)
+        failure = _source_failure(window)
+        if failure:
+            return self._failure(
+                window, source_shape, segment_id, marker_summary, failure,
+                prepare_latency_ms,
+            )
         try:
             validation = self.policy.validate_prepared(
-                prepared,
-                self.runtime_model,
+                prepared, self.runtime_model,
             )
         except Exception as exc:
             return self._failure(
@@ -174,7 +211,7 @@ class RealtimeRuntimeBridge:
                 marker_summary,
                 "prepared-input validation failed: "
                 f"{type(exc).__name__}: {exc}",
-                latency,
+                prepare_latency_ms,
             )
         if validation.failure_reason:
             return self._failure(
@@ -183,7 +220,7 @@ class RealtimeRuntimeBridge:
                 segment_id,
                 marker_summary,
                 validation.failure_reason,
-                latency,
+                prepare_latency_ms,
                 validation.signal_shape,
                 validation.valid_channel_count,
             )
@@ -195,7 +232,7 @@ class RealtimeRuntimeBridge:
             valid_channel_count=validation.valid_channel_count,
             missing_target_channels=self.policy.missing_target_channels,
             ignored_source_channels=self.policy.ignored_source_channels,
-            prepare_latency_ms=latency,
+            prepare_latency_ms=prepare_latency_ms,
             marker_summary=marker_summary,
             model_input_safe=True,
             failure_reason=None,

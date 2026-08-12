@@ -58,6 +58,15 @@ class CandidateBenchmarkSummary:
 
     created_at_utc: str
 
+    deadline_ms: float | None = None
+    deadline_miss_count: int | None = None
+    deadline_miss_rate: float | None = None
+    expected_windows: int | None = None
+    completed_windows: int | None = None
+    failed_windows: int | None = None
+    source_integrity: dict[str, int] | None = None
+    status: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -96,6 +105,7 @@ WINDOW_RECORD_FIELDNAMES = [
     # 真实设备模式才有；Replay 中为空。
     "window_ready_to_prediction_ms",
     "last_sample_received_to_prediction_ms",
+    "deadline_missed",
 ]
 
 
@@ -158,6 +168,7 @@ def flatten_window_record(
     *,
     candidate: BenchmarkCandidate,
     record: WindowBenchmarkRecord,
+    deadline_ms: float | None = None,
 ) -> dict[str, object]:
     """
     将“候选模型信息 + 单个窗口结果”拍平成一行 CSV。
@@ -205,6 +216,12 @@ def flatten_window_record(
         "last_sample_received_to_prediction_ms": (
             record.last_sample_received_to_prediction_ms
         ),
+        "deadline_missed": (
+            None
+            if deadline_ms is None
+            or record.last_sample_received_to_prediction_ms is None
+            else record.last_sample_received_to_prediction_ms > deadline_ms
+        ),
     }
 
 
@@ -212,11 +229,36 @@ def build_candidate_summary(
     *,
     candidate: BenchmarkCandidate,
     records: Sequence[WindowBenchmarkRecord],
+    deadline_ms: float | None = None,
+    expected_windows: int | None = None,
+    failed_windows: int | None = None,
+    source_integrity: dict[str, int] | None = None,
+    status: str | None = None,
 ) -> CandidateBenchmarkSummary:
     if not records:
         raise ValueError(
             "Cannot build a summary from zero records."
         )
+
+    last_sample_latencies = [
+        record.last_sample_received_to_prediction_ms
+        for record in records
+    ]
+    deadline_miss_count = None
+    deadline_miss_rate = None
+    if deadline_ms is not None:
+        if deadline_ms <= 0:
+            raise ValueError("deadline_ms must be positive when provided")
+        if any(value is None for value in last_sample_latencies):
+            raise ValueError(
+                "device deadline statistics require last-sample latency for every record"
+            )
+        deadline_miss_count = sum(
+            float(value) > deadline_ms
+            for value in last_sample_latencies
+            if value is not None
+        )
+        deadline_miss_rate = deadline_miss_count / len(records)
 
     return CandidateBenchmarkSummary(
         candidate=candidate,
@@ -264,6 +306,19 @@ def build_candidate_summary(
                 ]
             )
         ),
+
+        deadline_ms=deadline_ms,
+        deadline_miss_count=deadline_miss_count,
+        deadline_miss_rate=deadline_miss_rate,
+        expected_windows=expected_windows,
+        completed_windows=len(records),
+        failed_windows=failed_windows,
+        source_integrity=(
+            dict(source_integrity)
+            if source_integrity is not None
+            else None
+        ),
+        status=status,
 
         created_at_utc=datetime.now(
             timezone.utc

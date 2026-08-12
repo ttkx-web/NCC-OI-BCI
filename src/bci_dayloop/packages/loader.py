@@ -1029,6 +1029,24 @@ def _load_cbramod_package(
             "match preprocessing transform standard_channels."
         )
 
+    if (
+        "missing_channel_policy" not in transform
+        and bool(
+            transform.get(
+                "allow_missing_channels",
+                False,
+            )
+        )
+    ):
+        raise ValueError(
+            "This is a legacy CBraMod package with "
+            "allow_missing_channels=true. Its old completion "
+            "semantics cannot be safely mapped to the new "
+            "spherical_spline protocol. Re-export the package "
+            "with missing_channel_policy, "
+            "min_observed_channels, and spline_alpha."
+        )
+
     config = CBraModConfig(
         checkpoint_path=backbone_path,
         classifier_path=classifier_path,
@@ -1064,9 +1082,32 @@ def _load_cbramod_package(
         normalization=str(
             transform.get("normalization", "none")
         ),
-        zscore_eps=float(transform.get("zscore_eps", 1e-8)),
-        allow_missing_channels=bool(
-            transform.get("allow_missing_channels", False)
+        zscore_eps=float(
+            transform.get("zscore_eps", 1e-8)
+        ),
+        missing_channel_policy=str(
+            transform.get(
+                "missing_channel_policy",
+                "error",
+            )
+        ),
+        min_observed_channels=(
+            None
+            if transform.get(
+                "min_observed_channels"
+            ) is None
+            else int(
+                transform["min_observed_channels"]
+            )
+        ),
+        unknown_channel_policy=str(
+            transform.get(
+                "unknown_channel_policy",
+                "ignore",
+            )
+        ),
+        spline_alpha=float(
+            transform.get("spline_alpha", 1e-5)
         ),
 
         num_classes=num_classes,

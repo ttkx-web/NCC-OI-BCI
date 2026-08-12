@@ -23,7 +23,16 @@ except ModuleNotFoundError:
     from scripts._bootstrap import ROOT
 
 from bci_dayloop.utils.config import load_yaml
-from scripts.probe_neuracle_runtime_inference import main as run_runtime_probe
+
+# ``python scripts/<name>.py`` puts ``scripts/`` (rather than the repository
+# root) on sys.path.  Prefer the sibling import for that supported CLI form,
+# then retain the package import for ``python -m scripts.<name>``.
+try:
+    from probe_neuracle_runtime_inference import main as run_runtime_probe
+except ModuleNotFoundError as exc:
+    if exc.name != "probe_neuracle_runtime_inference":
+        raise
+    from scripts.probe_neuracle_runtime_inference import main as run_runtime_probe
 
 
 HOST_ENV = "NEURACLE_JELLYFISH_HOST"

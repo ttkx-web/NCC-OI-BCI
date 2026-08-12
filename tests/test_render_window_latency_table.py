@@ -65,8 +65,15 @@ def test_renderer_includes_live_deadline_integrity_and_max(tmp_path: Path) -> No
     rows = renderer.read_summary_rows(path)
     long_table = renderer.build_long_markdown(rows, summary_path=path)
     wide_table = renderer.build_wide_markdown(rows, metric_name="last_sample_received_to_prediction_ms", summary_path=path)
+    wide_csv = tmp_path / "wide.csv"
+    renderer.write_wide_csv(
+        rows,
+        metric_name="last_sample_received_to_prediction_ms",
+        path=wide_csv,
+    )
 
     assert "Deadline misses" in long_table
     assert "200/200" in long_table
     assert "PASS" in long_table
     assert "Max (ms)" in wide_table
+    assert "model_50m_p95_ms" in wide_csv.read_text(encoding="utf-8")

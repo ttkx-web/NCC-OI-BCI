@@ -1,11 +1,42 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 import scripts.run_variable_window_live_smoke as smoke
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ("scripts/run_variable_window_live_smoke.py", "--help"),
+        ("-m", "scripts.run_variable_window_live_smoke", "--help"),
+    ),
+)
+def test_live_smoke_cli_help_supports_script_and_module_modes(
+    command: tuple[str, ...],
+) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = "src"
+
+    completed = subprocess.run(
+        [sys.executable, *command],
+        cwd=repository_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--output-dir" in completed.stdout
 
 
 def _combinations() -> tuple[smoke.SmokeCombination, ...]:

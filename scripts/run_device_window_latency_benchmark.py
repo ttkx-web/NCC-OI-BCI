@@ -40,6 +40,12 @@ from bci_dayloop.realtime.neuracle_jellyfish import (
 from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline
 from bci_dayloop.realtime.runtime_bridge import RealtimeRuntimeBridge
 from bci_dayloop.realtime.runtime_policy import RealtimeModelPolicyRegistry
+from bci_dayloop.realtime.window_contract import (
+    APPROVED_REALTIME_WINDOW_SECONDS,
+    NEURACLE_SOURCE_SAMPLING_RATE,
+    REALTIME_STEP_SECONDS,
+    validate_approved_realtime_window_contract,
+)
 from bci_dayloop.utils.config import load_yaml, resolve_path
 
 
@@ -78,6 +84,7 @@ def _source_integrity_passes(integrity: Mapping[str, int]) -> bool:
             "duplicate_packets",
             "out_of_order_packets",
             "malformed_packets",
+            "reconnect_count",
             "gap_count",
             "buffer_overflow_count",
             "dropped_window_count",
@@ -102,6 +109,50 @@ def _candidate_status(summary: object, integrity: Mapping[str, int]) -> str:
     ):
         return "PASS"
     return "FAIL"
+
+
+def _schedule_contract(
+    schedule: Mapping[str, object],
+    candidates: object,
+) -> tuple[float | None, tuple[float, ...]]:
+    """Parse either the frozen 4 s schedule or package-driven grid mode."""
+    if not isinstance(candidates, list):
+        raise ValueError("device benchmark candidates must be a list")
+    step_sec = float(schedule.get("step_sec", REALTIME_STEP_SECONDS))
+    if step_sec != REALTIME_STEP_SECONDS:
+        raise ValueError("approved device benchmark step_sec must be 0.5")
+    if schedule.get("package_driven_windows") is True:
+        allowed_raw = schedule.get("allowed_window_sec")
+        if not isinstance(allowed_raw, list):
+            raise ValueError("package-driven benchmark must declare allowed_window_sec")
+        allowed = tuple(float(value) for value in allowed_raw)
+        if allowed != APPROVED_REALTIME_WINDOW_SECONDS:
+            raise ValueError("allowed_window_sec must be exactly [1.0, 2.0, 3.0, 4.0]")
+        if len(candidates) != 12:
+            raise ValueError("package-driven benchmark must contain exactly 12 candidates")
+        return None, allowed
+
+    window_sec = float(schedule.get("window_sec", 4.0))
+    if window_sec != 4.0 or len(candidates) != 3:
+        raise ValueError("frozen device benchmark is fixed at 4.0s / three candidates")
+    return window_sec, (window_sec,)
+
+
+def _prepared_contract(loaded: object) -> tuple[int, ...]:
+    """Return the policy-validated prepared shape for manifest audit only."""
+    model_type = str(getattr(loaded, "model_type"))
+    runtime_model = getattr(loaded, "runtime_model")
+    contract = runtime_model.input_contract
+    window_sec = validate_approved_realtime_window_contract(
+        contract, sampling_rate=float(contract.sample_rate)
+    )
+    if model_type == "model_50m":
+        return (1, 64, int(window_sec * 100))
+    if model_type == "labram":
+        return (1, 19, int(window_sec), 200)
+    if model_type == "cbramod":
+        return (1, 22, int(window_sec), 200)
+    raise ValueError(f"unsupported benchmark model_type: {model_type!r}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,22 +186,23 @@ def main(argv: list[str] | None = None) -> int:
             f"live device host is required via environment variable {host_env!r}"
         )
     device = args.device or str(benchmark.get("device", "cuda"))
-    window_sec = float(schedule.get("window_sec", 4.0))
-    step_sec = float(schedule.get("step_sec", 0.5))
+    candidates = benchmark.get("candidates")
+    fixed_window_sec, allowed_window_seconds = _schedule_contract(
+        schedule, candidates
+    )
+    step_sec = float(schedule.get("step_sec", REALTIME_STEP_SECONDS))
     warmup_windows = int(schedule.get("warmup_windows", 20))
     measured_windows = int(schedule.get("measured_windows", 200))
     duration_sec = float(
         args.duration_sec if args.duration_sec is not None else source_config.get("duration_sec", 150.0)
     )
-    if window_sec != 4.0 or step_sec != 0.5:
-        raise ValueError("this approved device benchmark is fixed at 4.0s / 0.5s")
     if warmup_windows != 20 or measured_windows != 200:
         raise ValueError("this approved device benchmark is fixed at warmup=20 / measured=200")
     if duration_sec <= 0:
         raise ValueError("duration_sec must be positive")
-    candidates = benchmark.get("candidates")
-    if not isinstance(candidates, list) or len(candidates) != 3:
-        raise ValueError("device benchmark must contain the three fixed candidates")
+    if float(source_config.get("expected_sampling_rate", 0.0)) != NEURACLE_SOURCE_SAMPLING_RATE:
+        raise ValueError("approved device benchmark source must be 1000 Hz")
+    assert isinstance(candidates, list)
     output_root = (
         resolve_path(args.output_root)
         if args.output_root is not None
@@ -170,8 +222,12 @@ def main(argv: list[str] | None = None) -> int:
         "config_sha256": _sha256(config_path),
         "source_contract": {
             "eeg_channels": 59,
-            "sampling_rate": 1000.0,
-            "window_sec": window_sec,
+            "sampling_rate": NEURACLE_SOURCE_SAMPLING_RATE,
+            "window_sec": fixed_window_sec,
+            "allowed_window_sec": list(allowed_window_seconds),
+            "window_source": (
+                "fixed_schedule" if fixed_window_sec is not None else "runtime_package"
+            ),
             "step_sec": step_sec,
             "unit": "uV",
             "unit_evidence_level": "vendor_confirmed",
@@ -179,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         "warmup_windows": warmup_windows,
         "measured_windows": measured_windows,
         "waveforms_saved": False,
+        "candidate_contracts": [],
     }
     (output_dir / "benchmark_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -204,8 +261,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             if loaded.is_test_head:
                 raise ValueError("test heads are forbidden for device benchmark")
-            if loaded.window_sec != window_sec or loaded.step_sec != step_sec:
-                raise ValueError("package window/step contract does not match device benchmark")
+            package_window_sec = validate_approved_realtime_window_contract(
+                loaded.runtime_model.input_contract,
+                sampling_rate=float(loaded.runtime_model.input_contract.sample_rate),
+            )
+            if package_window_sec not in allowed_window_seconds:
+                raise ValueError("package window contract is not approved for this benchmark")
+            if fixed_window_sec is not None and package_window_sec != fixed_window_sec:
+                raise ValueError("package window contract does not match frozen benchmark")
+            if loaded.step_sec != step_sec:
+                raise ValueError("package step_sec does not match device benchmark")
             policy = RealtimeModelPolicyRegistry.create(loaded)
             bridge = RealtimeRuntimeBridge(loaded.runtime_model, policy=policy)
             source = NeuracleJellyFishSource(
@@ -215,10 +280,20 @@ def main(argv: list[str] | None = None) -> int:
                     expected_sampling_rate=float(source_config.get("expected_sampling_rate", 1000.0)),
                 )
             )
-            pipeline = RealtimeEEGWindowPipeline(
-                sampling_rate=1000.0,
-                window_seconds=window_sec,
+            pipeline = RealtimeEEGWindowPipeline.from_runtime_input_contract(
+                loaded.runtime_model.input_contract,
+                sampling_rate=NEURACLE_SOURCE_SAMPLING_RATE,
                 step_seconds=step_sec,
+            )
+            manifest["candidate_contracts"].append(
+                {
+                    "candidate_id": candidate_id,
+                    "model_type": loaded.model_type,
+                    "package_path": _safe_path(package_path),
+                    "window_sec": package_window_sec,
+                    "source_shape": [59, round(package_window_sec * 1000)],
+                    "prepared_shape": list(_prepared_contract(loaded)),
+                }
             )
             provider = DeviceWindowProvider(
                 source=source,
@@ -242,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
                 model_type=loaded.model_type,
                 package_path=_safe_path(package_path),
                 package_sha256=_sha256(package_path / "package.yaml"),
-                window_sec=window_sec,
+                window_sec=package_window_sec,
                 step_sec=step_sec,
                 device=device,
                 source_mode="device",
@@ -275,6 +350,11 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             del loaded
             _release_model(device)
+
+    (output_dir / "benchmark_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     write_window_records_csv(path=output_dir / "window_records.csv", rows=all_rows)
     write_benchmark_summary_json(

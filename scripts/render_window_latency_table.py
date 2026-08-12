@@ -695,6 +695,70 @@ def write_long_csv(
             writer.writerow(flat_row)
 
 
+def write_wide_csv(
+    rows: list[SummaryRow],
+    *,
+    metric_name: str,
+    path: Path,
+) -> None:
+    """Write the same model-by-window comparison as the wide Markdown table."""
+    usable_rows = [row for row in rows if metric_name in row.metrics]
+    if not usable_rows:
+        raise ValueError(f"No candidate contains metric {metric_name!r}.")
+    by_pair: dict[tuple[str, float], SummaryRow] = {}
+    for row in usable_rows:
+        key = (row.model_type, row.window_sec)
+        if key in by_pair:
+            raise ValueError(
+                "Cannot build wide CSV because multiple candidates share "
+                f"(model_type, window_sec): {key!r}."
+            )
+        by_pair[key] = row
+    model_types = sorted({row.model_type for row in usable_rows}, key=model_sort_key)
+    fieldnames = ["window_sec"]
+    for model_type in model_types:
+        fieldnames.extend(
+            [
+                f"{model_type}_p50_ms",
+                f"{model_type}_p95_ms",
+                f"{model_type}_max_ms",
+                f"{model_type}_deadline_miss_count",
+                f"{model_type}_deadline_miss_rate",
+                f"{model_type}_completed_windows",
+                f"{model_type}_expected_windows",
+                f"{model_type}_failed_windows",
+                f"{model_type}_integrity",
+                f"{model_type}_status",
+            ]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for window_sec in sorted({row.window_sec for row in usable_rows}):
+            result: dict[str, object] = {"window_sec": window_sec}
+            for model_type in model_types:
+                row = by_pair.get((model_type, window_sec))
+                if row is None:
+                    continue
+                stat = row.metrics[metric_name]
+                result.update(
+                    {
+                        f"{model_type}_p50_ms": stat.p50,
+                        f"{model_type}_p95_ms": stat.p95,
+                        f"{model_type}_max_ms": stat.maximum,
+                        f"{model_type}_deadline_miss_count": row.deadline_miss_count,
+                        f"{model_type}_deadline_miss_rate": row.deadline_miss_rate,
+                        f"{model_type}_completed_windows": row.completed_windows,
+                        f"{model_type}_expected_windows": row.expected_windows,
+                        f"{model_type}_failed_windows": row.failed_windows,
+                        f"{model_type}_integrity": json.dumps(row.source_integrity, sort_keys=True),
+                        f"{model_type}_status": row.status,
+                    }
+                )
+            writer.writerow(result)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -765,6 +829,7 @@ def main() -> int:
     long_csv_path = (
         output_dir / "window_latency_summary_long.csv"
     )
+    wide_csv_path = output_dir / "window_latency_summary_wide.csv"
 
     long_markdown_path.write_text(
         build_long_markdown(
@@ -787,11 +852,17 @@ def main() -> int:
         rows,
         path=long_csv_path,
     )
+    write_wide_csv(
+        rows,
+        metric_name=args.wide_metric,
+        path=wide_csv_path,
+    )
 
     print("Rendered latency tables:")
     print("  long markdown:", long_markdown_path)
     print("  wide markdown:", wide_markdown_path)
     print("  long csv:", long_csv_path)
+    print("  wide csv:", wide_csv_path)
 
     return 0
 

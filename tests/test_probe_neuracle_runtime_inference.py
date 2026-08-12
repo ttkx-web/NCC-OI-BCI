@@ -330,6 +330,7 @@ def _run_probe(
     *,
     test_head: bool = False,
     model_type: str = "model_50m",
+    extra_args: tuple[str, ...] = (),
 ) -> tuple[int, dict[str, object]]:
     FakeInferenceSource.instances.clear()
     package = _package(
@@ -347,6 +348,7 @@ def _run_probe(
             "--duration-sec", "0.01",
             "--output-dir", str(output_dir),
             "--no-save-waveform",
+            *extra_args,
         ]
     )
     return result, json.loads((output_dir / "runtime_inference_summary.json").read_text(encoding="utf-8"))
@@ -444,6 +446,22 @@ def test_test_head_is_rejected_before_connecting_to_a_device(
     assert result == 2
     assert summary["is_test_head"] is True
     assert summary["last_error"] == "probe_failed"
+    assert not FakeInferenceSource.instances
+
+
+def test_window_override_mismatch_is_blocked_before_device_connect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    result, summary = _run_probe(
+        monkeypatch,
+        tmp_path,
+        FakeRuntime(),
+        extra_args=("--window-sec", "2.0"),
+    )
+
+    assert result == 2
+    assert summary["compatibility_status"] == "blocked"
+    assert "window-sec" in str(summary["compatibility_error"])
     assert not FakeInferenceSource.instances
 
 

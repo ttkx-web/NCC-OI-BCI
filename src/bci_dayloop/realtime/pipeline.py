@@ -9,6 +9,11 @@ from .buffer import BufferOverflowError, TimestampedRingBuffer
 from .channel_units import EEG_UNIT, VENDOR_CONFIRMED, normalize_channel_type
 from .contracts import EEGChunk, EventMarker, WindowResult
 from .windowing import FixedSlidingWindowGenerator, WindowProvenance, chunk_window_provenance
+from .window_contract import (
+    NEURACLE_SOURCE_SAMPLING_RATE,
+    REALTIME_STEP_SECONDS,
+    validate_approved_realtime_window_contract,
+)
 
 
 class RealtimePipelineError(ValueError):
@@ -44,6 +49,46 @@ class RealtimeEEGWindowPipeline:
         self.unique_trigger_count = 0
         self.marker_window_association_count = 0
         self.last_failure_reason: str | None = None
+
+    @classmethod
+    def from_runtime_input_contract(
+        cls,
+        contract: object,
+        *,
+        sampling_rate: float = NEURACLE_SOURCE_SAMPLING_RATE,
+        step_seconds: float = REALTIME_STEP_SECONDS,
+        capacity_samples: int | None = None,
+    ) -> "RealtimeEEGWindowPipeline":
+        """Build the approved source window pipeline from package metadata.
+
+        The package determines the duration.  The Stage 2B cadence is fixed
+        at 0.5 seconds so a CLI cannot silently ask for a conflicting setup.
+        """
+        if step_seconds != REALTIME_STEP_SECONDS:
+            raise RealtimePipelineError(
+                "Stage 2B realtime step_seconds must be exactly 0.5"
+            )
+        try:
+            window_seconds = validate_approved_realtime_window_contract(
+                contract, sampling_rate=float(getattr(contract, "sample_rate"))
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RealtimePipelineError(str(exc)) from exc
+        window_samples = round(window_seconds * sampling_rate)
+        step_samples = round(step_seconds * sampling_rate)
+        required_capacity = window_samples + step_samples
+        if capacity_samples is None:
+            capacity_samples = max(8000, required_capacity)
+        if capacity_samples < required_capacity:
+            raise RealtimePipelineError(
+                "TimestampBuffer capacity must cover one approved window plus one step"
+            )
+        return cls(
+            sampling_rate=sampling_rate,
+            window_seconds=window_seconds,
+            step_seconds=step_seconds,
+            capacity_samples=capacity_samples,
+        )
 
     @property
     def buffer(self) -> TimestampedRingBuffer:

@@ -24,6 +24,7 @@ from .runtime_mapping import (
     APPROVED_NEURACLE_59_TO_STANDARD64,
     ApprovedRealtimeMappingPolicy,
 )
+from .window_contract import validate_approved_realtime_window_contract
 
 
 class RuntimePrepareOnly(Protocol):
@@ -189,13 +190,15 @@ class Model50MRealtimePolicy(RealtimeModelPolicy):
                 None,
             )
         signal_shape = tuple(int(value) for value in signal.shape)
+        expected_shape = (1, 64, contract.num_samples)
         if (
             signal.dtype != torch.float32
-            or signal_shape != (1, 64, 400)
+            or signal_shape != expected_shape
             or not torch.isfinite(signal).all().item()
         ):
             return PreparedValidation(
-                "prepared signal must be finite float32 with shape [1, 64, 400]",
+                "prepared signal must be finite float32 with shape "
+                f"{list(expected_shape)}",
                 signal_shape,
                 None,
             )
@@ -272,15 +275,14 @@ class Model50MRealtimePolicy(RealtimeModelPolicy):
         contract = runtime_model.input_contract
         if contract.channel_names != self.mapping.target_channel_names:
             return "Runtime Package channel order does not match the approved policy"
-        if (
-            contract.sample_rate != 100.0
-            or contract.window_sec != 4.0
-            or contract.num_samples != 400
-        ):
-            return (
-                "Runtime Package must declare 64 channels at 100 Hz "
-                "for 4.0 seconds / 400 samples"
+        if contract.sample_rate != 100.0:
+            return "Runtime Package must declare 64 channels at 100 Hz"
+        try:
+            validate_approved_realtime_window_contract(
+                contract, sampling_rate=100.0
             )
+        except ValueError as exc:
+            return str(exc)
         if (
             contract.input_unit != EEG_UNIT
             or contract.model_input_keys
@@ -316,6 +318,7 @@ class LaBraMRealtimePolicy(RealtimeModelPolicy):
             package.runtime_model.input_contract.channel_names,
             logical_name="LaBraM required channel_names",
         )
+        self._runtime_contract = package.runtime_model.input_contract
         self._source_indices = self._validate_source_mapping()
         self._ignored_source_channels = tuple(
             name
@@ -374,18 +377,23 @@ class LaBraMRealtimePolicy(RealtimeModelPolicy):
         contract = package.runtime_model.input_contract
         if tuple(contract.channel_names) != self._required_channel_names:
             raise ValueError("LaBraM Runtime Package channel contract changed")
+        if contract.sample_rate != 200.0:
+            raise ValueError("LaBraM realtime package must declare 200 Hz")
+        try:
+            validate_approved_realtime_window_contract(
+                contract, sampling_rate=200.0
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         if (
-            contract.sample_rate != 200.0
-            or contract.window_sec != 4.0
-            or contract.num_samples != 800
-            or contract.input_unit != EEG_UNIT
+            contract.input_unit != EEG_UNIT
             or contract.tensor_layout != "BCTP"
             or contract.model_input_keys != ("signal",)
             or contract.strict_window_duration is not True
         ):
             raise ValueError(
-                "LaBraM realtime package must declare 200 Hz, 4.0 seconds, "
-                "800 samples, uV, BCTP, and model_input_keys=('signal',)"
+                "LaBraM realtime package must declare 200 Hz, uV, BCTP, "
+                "and model_input_keys=('signal',)"
             )
 
     def select_source(
@@ -396,7 +404,12 @@ class LaBraMRealtimePolicy(RealtimeModelPolicy):
             window.samples[np.asarray(self._source_indices, dtype=np.int64), :],
             dtype=np.float32,
         )
-        expected_shape = (len(self._required_channel_names), 4000)
+        window_sec = validate_approved_realtime_window_contract(
+            self._runtime_contract, sampling_rate=200.0
+        )
+        expected_shape = (
+            len(self._required_channel_names), round(window_sec * 1000.0)
+        )
         if selected.shape != expected_shape:
             raise ValueError(
                 "LaBraM explicit source selection produced an unexpected "
@@ -442,7 +455,12 @@ class LaBraMRealtimePolicy(RealtimeModelPolicy):
                 None,
             )
         signal_shape = tuple(int(value) for value in signal.shape)
-        expected_shape = (1, len(self._required_channel_names), 4, 200)
+        window_sec = validate_approved_realtime_window_contract(
+            runtime_model.input_contract, sampling_rate=200.0
+        )
+        expected_shape = (
+            1, len(self._required_channel_names), int(window_sec), 200
+        )
         if (
             signal.dtype != torch.float32
             or signal_shape != expected_shape
@@ -538,18 +556,23 @@ class CBraModRealtimePolicy(RealtimeModelPolicy):
                 "CBRaMod realtime package must use the approved 22-channel "
                 "target montage"
             )
+        if contract.sample_rate != 200.0:
+            raise ValueError("CBRaMod realtime package must declare 200 Hz")
+        try:
+            validate_approved_realtime_window_contract(
+                contract, sampling_rate=200.0
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         if (
-            contract.sample_rate != 200.0
-            or contract.window_sec != 4.0
-            or contract.num_samples != 800
-            or contract.input_unit != EEG_UNIT
+            contract.input_unit != EEG_UNIT
             or contract.tensor_layout != "BCTP"
             or contract.model_input_keys != ("signal",)
             or contract.strict_window_duration is not True
         ):
             raise ValueError(
                 "CBRaMod realtime package must declare 22 channels at "
-                "200 Hz, 4.0 seconds / 800 samples, uV, BCTP, and "
+                "200 Hz, uV, BCTP, and "
                 "model_input_keys=('signal',)"
             )
 
@@ -673,14 +696,21 @@ class CBraModRealtimePolicy(RealtimeModelPolicy):
                 None,
             )
         signal_shape = tuple(int(value) for value in signal.shape)
+        try:
+            window_sec = validate_approved_realtime_window_contract(
+                runtime_model.input_contract, sampling_rate=200.0
+            )
+        except ValueError as exc:
+            return PreparedValidation(str(exc), signal_shape, None)
+        expected_shape = (1, 22, int(window_sec), 200)
         if (
             signal.dtype != torch.float32
-            or signal_shape != (1, 22, 4, 200)
+            or signal_shape != expected_shape
             or not torch.isfinite(signal).all().item()
         ):
             return PreparedValidation(
                 "CBRaMod prepared signal must be finite float32 with shape "
-                "[1, 22, 4, 200]",
+                f"{list(expected_shape)}",
                 signal_shape,
                 None,
             )

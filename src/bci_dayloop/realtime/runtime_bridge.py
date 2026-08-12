@@ -25,6 +25,7 @@ from .runtime_policy import (
     RealtimeModelPolicy,
     RuntimePrepareOnly,
 )
+from .window_contract import approved_source_sample_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +145,10 @@ class RealtimeRuntimeBridge:
         ``RuntimeModel.prepare`` call while retaining the same approved source
         and policy gates used by :meth:`prepare`.
         """
-        failure = _source_failure(window)
+        failure = _source_failure(
+            window,
+            expected_window_seconds=self.runtime_model.input_contract.window_sec,
+        )
         if failure:
             raise ValueError(failure)
         try:
@@ -193,7 +197,10 @@ class RealtimeRuntimeBridge:
         )
         segment_id = window.metadata.get("continuous_segment_id")
         source_shape = tuple(int(value) for value in window.samples.shape)
-        failure = _source_failure(window)
+        failure = _source_failure(
+            window,
+            expected_window_seconds=self.runtime_model.input_contract.window_sec,
+        )
         if failure:
             return self._failure(
                 window, source_shape, segment_id, marker_summary, failure,
@@ -273,22 +280,43 @@ class RealtimeRuntimeBridge:
         )
 
 
-def _source_failure(window: RealtimeWindow) -> str | None:
+def _source_failure(
+    window: RealtimeWindow,
+    *,
+    expected_window_seconds: float,
+) -> str | None:
     approved = APPROVED_NEURACLE_59_TO_STANDARD64
-    if window.samples.shape != (59, 4000):
-        return "source samples must have shape [59, 4000]"
+    try:
+        expected_samples = approved_source_sample_count(expected_window_seconds)
+    except ValueError as exc:
+        return str(exc)
+    if window.samples.shape != (59, expected_samples):
+        return f"source samples must have shape [59, {expected_samples}]"
     if window.channel_names != approved.source_channel_names:
         return "source channel_names do not match the approved ordered policy"
     if window.sampling_rate != 1000.0 or not math.isclose(
         window.samples.shape[1] / window.sampling_rate,
-        4.0,
+        expected_window_seconds,
         abs_tol=1e-9,
     ):
-        return "source must be 4.0 seconds at 1000 Hz"
-    if window.timestamps.shape != (4000,) or not np.all(
+        return (
+            "source must be "
+            f"{expected_window_seconds:.1f} seconds at 1000 Hz"
+        )
+    if window.timestamps.shape != (expected_samples,) or not np.all(
         np.diff(window.timestamps) > 0
     ):
-        return "source timestamps must be strictly increasing with length 4000"
+        return (
+            "source timestamps must be strictly increasing with length "
+            f"{expected_samples}"
+        )
+    if not np.allclose(
+        np.diff(window.timestamps),
+        1.0 / window.sampling_rate,
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        return "source timestamps contain a gap or non-uniform sampling interval"
     if window.unit != EEG_UNIT or window.metadata.get("source_unit") != EEG_UNIT:
         return "source unit and source_unit provenance must be uV"
     if window.metadata.get("unit_evidence_level") != VENDOR_CONFIRMED:

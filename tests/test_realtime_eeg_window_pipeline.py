@@ -5,6 +5,7 @@ from bci_dayloop.realtime.buffer import BufferOverflowError
 from bci_dayloop.realtime.channel_units import EEG_UNIT, VENDOR_CONFIRMED
 from bci_dayloop.realtime.contracts import EEGChunk, EventMarker
 from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline, RealtimePipelineError
+from bci_dayloop.runtime.types import InputContract
 
 
 def _chunk(
@@ -64,6 +65,45 @@ def test_window_counts_for_under_exact_and_four_point_five_seconds() -> None:
     assert exact.expected_windows == exact.emitted_windows == 1
     assert len(extended_results) == 2
     assert extended.expected_windows == extended.emitted_windows == 2
+
+
+@pytest.mark.parametrize("window_seconds", (1.0, 2.0, 3.0, 4.0))
+def test_pipeline_can_be_built_from_an_approved_package_window_contract(
+    window_seconds: float,
+) -> None:
+    contract = InputContract(
+        channel_names=("C3", "C4"),
+        sample_rate=200.0,
+        window_sec=window_seconds,
+        num_samples=int(window_seconds * 200),
+        input_unit="uV",
+        tensor_layout="BCTP",
+        strict_window_duration=True,
+        model_input_keys=("signal",),
+    )
+    pipeline = RealtimeEEGWindowPipeline.from_runtime_input_contract(contract)
+
+    assert pipeline.window_samples == int(window_seconds * 1000)
+    assert pipeline.step_samples == 500
+    assert pipeline.capacity_samples >= pipeline.window_samples + 500
+
+
+@pytest.mark.parametrize("window_seconds", (0.5, 5.0))
+def test_pipeline_rejects_unapproved_package_window_contract(
+    window_seconds: float,
+) -> None:
+    contract = InputContract(
+        channel_names=("C3",),
+        sample_rate=200.0,
+        window_sec=window_seconds,
+        num_samples=int(window_seconds * 200),
+        input_unit="uV",
+        tensor_layout="BCTP",
+        strict_window_duration=True,
+        model_input_keys=("signal",),
+    )
+    with pytest.raises(RealtimePipelineError, match="BLOCKED"):
+        RealtimeEEGWindowPipeline.from_runtime_input_contract(contract)
 
 
 def test_packet_partitioning_preserves_fixed_window_and_step_contract() -> None:

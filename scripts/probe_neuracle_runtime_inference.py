@@ -36,6 +36,7 @@ from bci_dayloop.realtime.runtime_policy import (
     RealtimeModelPolicyRegistry,
     RealtimePolicyError,
 )
+from bci_dayloop.realtime.window_contract import REALTIME_STEP_SECONDS
 
 
 def _health_summary(health: Mapping[str, object]) -> dict[str, object]:
@@ -159,8 +160,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8712, type=int)
     parser.add_argument("--expected-sfreq", default=1000.0, type=float)
-    parser.add_argument("--window-sec", default=4.0, type=float)
-    parser.add_argument("--step-sec", default=0.5, type=float)
+    parser.add_argument(
+        "--window-sec",
+        default=None,
+        type=float,
+        help="Optional assertion; must exactly match the Runtime Package window_sec.",
+    )
+    parser.add_argument("--step-sec", default=REALTIME_STEP_SECONDS, type=float)
     parser.add_argument("--output-dir", default=ROOT / "runs" / "stage2b" / "neuracle_runtime_inference", type=Path)
     parser.add_argument("--no-save-waveform", action="store_true")
     args = parser.parse_args(argv)
@@ -170,11 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     source: NeuracleJellyFishSource | None = None
     package: LoadedRuntimePackage | None = None
     policy: RealtimeModelPolicy | None = None
-    pipeline = RealtimeEEGWindowPipeline(
-        sampling_rate=args.expected_sfreq,
-        window_seconds=args.window_sec,
-        step_seconds=args.step_sec,
-    )
+    pipeline: RealtimeEEGWindowPipeline | None = None
     prepared_latencies: list[float] = []
     inference_latencies: list[float] = []
     total_latencies: list[float] = []
@@ -182,6 +184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary: dict[str, object] = {
         "status": "failed",
         "duration_sec": args.duration_sec,
+        "window_sec": None,
+        "step_sec": args.step_sec,
         "package": None,
         "package_id": None,
         "model_type": None,
@@ -228,10 +232,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("Runtime Package test head is not allowed for a live inference probe")
         policy = RealtimeModelPolicyRegistry.create(package)
         summary["realtime_policy_id"] = policy.policy_id
-        if package.step_sec != args.step_sec:
+        package_window_sec = package.runtime_model.input_contract.window_sec
+        summary["window_sec"] = package_window_sec
+        if (
+            args.window_sec is not None
+            and not math.isclose(args.window_sec, package_window_sec, abs_tol=0.0)
+        ):
+            raise RealtimePolicyError(
+                "--window-sec must match the Runtime Package window_sec. BLOCKED."
+            )
+        if not math.isclose(args.step_sec, REALTIME_STEP_SECONDS, abs_tol=0.0):
+            raise RealtimePolicyError(
+                "Stage 2B realtime --step-sec must be exactly 0.5. BLOCKED."
+            )
+        if not math.isclose(package.step_sec, REALTIME_STEP_SECONDS, abs_tol=0.0):
             raise RealtimePolicyError(
                 "Runtime Package step_sec must match --step-sec. BLOCKED."
             )
+        pipeline = RealtimeEEGWindowPipeline.from_runtime_input_contract(
+            package.runtime_model.input_contract,
+            sampling_rate=args.expected_sfreq,
+            step_seconds=args.step_sec,
+        )
         summary["compatibility_status"] = "passed"
 
         bridge = RealtimeRuntimeBridge(
@@ -346,16 +368,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary.update(
             {
                 "received_packets": int(pre_health.get("received_packets", 0)),
-                "received_samples": pipeline.accepted_eeg_sample_count,
+                "received_samples": (
+                    pipeline.accepted_eeg_sample_count if pipeline else 0
+                ),
                 "missing_packets": int(pre_health.get("missing_packets", 0)),
-                "emitted_windows": pipeline.emitted_windows,
-                "pipeline_failed_windows": pipeline.failed_windows,
+                "emitted_windows": pipeline.emitted_windows if pipeline else 0,
+                "pipeline_failed_windows": pipeline.failed_windows if pipeline else 0,
                 "failed_windows": (
-                    pipeline.failed_windows
+                    (pipeline.failed_windows if pipeline else 0)
                     + int(summary["model_input_failure_count"])
                     + int(summary["prediction_failure_count"])
                 ),
-                "gap_count": pipeline.timestamp_gap_count,
+                "gap_count": pipeline.timestamp_gap_count if pipeline else 0,
                 "duplicate_packets": int(pre_health.get("duplicate_packets", 0)),
                 "out_of_order_packets": int(pre_health.get("out_of_order_packets", 0)),
                 "prepare_latency": _latency_summary(prepared_latencies),
@@ -369,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             and package is not None
             and policy is not None
             and package.is_test_head is False
+            and pipeline is not None
             and pipeline.failed_windows == 0
             and pipeline.timestamp_gap_count == 0
             and pre_health.get("missing_packets", 0) == 0
@@ -388,7 +413,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         finally:
-            pipeline.close()
+            if pipeline is not None:
+                pipeline.close()
     return exit_code if summary["status"] == "passed" else exit_code or 2
 
 

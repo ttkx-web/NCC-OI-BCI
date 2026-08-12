@@ -6,6 +6,7 @@ import { PredictionCard } from "@/components/status/prediction-card";
 import { KeyValue, MetricCard, PageHeader, SectionCard, StatusBadge } from "@/components/ui/design-system";
 import { consoleApi } from "@/lib/api/client";
 import { connectRun } from "@/lib/websocket/run-stream";
+import { useRuntimeStatus } from "@/components/runtime/run-status-provider";
 import type { ModelSummary, RunEvent, RunState } from "@/types/api";
 
 type LiveState = {
@@ -23,6 +24,7 @@ const initial: LiveState = { state: "idle", runId: null, blocked: false, reason:
 const tone = (state: string) => state === "running" ? "running" : state === "failed" ? "danger" : state === "stopped" ? "idle" : "warning" as const;
 
 export default function LivePage() {
+  const { registerActiveRun } = useRuntimeStatus();
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [modelId, setModelId] = useState("");
   const [device, setDevice] = useState<"cpu" | "cuda">("cuda");
@@ -58,10 +60,11 @@ export default function LivePage() {
     try {
       const created = await consoleApi.startLive({ model_id: modelId, source: "neuracle_jellyfish", compute_device: device, confidence_threshold: 0.55 });
       setLive({ ...initial, state: "starting", runId: created.run_id }); subscribe(created.run_id);
+      registerActiveRun(created.run_id);
     } catch (value) { setError(value instanceof Error ? value.message : "无法启动 Live 运行"); }
   }
   async function stop() { if (live.runId) { await consoleApi.stopRun(live.runId); } }
-  async function restart() { if (live.runId) { await consoleApi.restartRun(live.runId); } else { await start(); } }
+  async function restart() { if (live.runId) { await consoleApi.restartRun(live.runId); registerActiveRun(live.runId); } else { await start(); } }
   const h = live.health;
 
   return <>

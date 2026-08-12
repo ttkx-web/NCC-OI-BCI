@@ -135,7 +135,9 @@ class CBraModConfig:
 
     # 仅在 missing_channel_policy="spherical_spline" 时生效。
     # 这是最低质量门槛，不是设备通道数；必须由训练/部署协议明确记录。
-    min_observed_channels: int = 2
+    # None 表示要求全部 config.n_channels 个 target 通道。
+    # spherical_spline 设备适配包必须显式设置此阈值。
+    min_observed_channels: int | None = None
 
     # 插值矩阵的 Tikhonov 正则项，固定记录到模型包，保证可复现。
     spline_alpha: float = 1e-5
@@ -173,31 +175,6 @@ class CBraModConfig:
             Path(self.checkpoint_path),
         )
 
-        required_observed = (
-            self.n_channels
-            if self.min_observed_channels is None
-            else int(self.min_observed_channels)
-        )
-
-        if not 1 <= required_observed <= self.n_channels:
-            raise ValueError(
-                "min_observed_channels must be in "
-                f"[1, {self.n_channels}], got "
-                f"{required_observed}."
-            )
-
-        if (
-                self.missing_channel_policy == "error"
-                and required_observed != self.n_channels
-        ):
-            raise ValueError(
-                "missing_channel_policy='error' requires "
-                "min_observed_channels == n_channels."
-            )
-
-        if self.spline_alpha <= 0:
-            raise ValueError("spline_alpha must be positive.")
-
         if self.classifier_path is not None:
             object.__setattr__(
                 self,
@@ -226,6 +203,7 @@ class CBraModConfig:
                 f"len(standard_channels)="
                 f"{len(self.standard_channels)}."
             )
+
         if self.missing_channel_policy not in {
             "error",
             "spherical_spline",
@@ -241,24 +219,39 @@ class CBraModConfig:
             else int(self.min_observed_channels)
         )
 
+        if not (
+            1
+            <= required_observed_channels
+            <= self.n_channels
+        ):
+            raise ValueError(
+                "min_observed_channels must be None or an "
+                f"integer in [1, {self.n_channels}], got "
+                f"{self.min_observed_channels!r}."
+            )
+
+        if (
+            self.missing_channel_policy == "error"
+            and required_observed_channels != self.n_channels
+        ):
+            raise ValueError(
+                "missing_channel_policy='error' requires "
+                "min_observed_channels to be None or equal "
+                "to n_channels."
+            )
+
+        if self.spline_alpha <= 0:
+            raise ValueError(
+                "spline_alpha must be positive."
+            )
+
+
         if not 1 <= required_observed_channels <= self.n_channels:
             raise ValueError(
                 "min_observed_channels must be in "
                 f"[1, {self.n_channels}], got "
                 f"{required_observed_channels}."
             )
-
-        if (
-                self.missing_channel_policy == "error"
-                and required_observed_channels != self.n_channels
-        ):
-            raise ValueError(
-                "missing_channel_policy='error' requires "
-                "min_observed_channels to be None or n_channels."
-            )
-
-        if self.spline_alpha <= 0:
-            raise ValueError("spline_alpha must be positive.")
 
         normalized_names = tuple(
             channel.strip().upper()
@@ -336,30 +329,6 @@ class CBraModConfig:
         if self.zscore_eps <= 0:
             raise ValueError(
                 "zscore_eps must be positive."
-            )
-
-        if self.missing_channel_policy not in {
-            "error",
-            "spherical_spline",
-        }:
-            raise ValueError(
-                "Unsupported missing_channel_policy: "
-                f"{self.missing_channel_policy!r}."
-            )
-
-        if not (
-            2 <= self.min_observed_channels
-            <= self.n_channels
-        ):
-            raise ValueError(
-                "min_observed_channels must be in "
-                f"[2, {self.n_channels}], got "
-                f"{self.min_observed_channels}."
-            )
-
-        if self.spline_alpha <= 0:
-            raise ValueError(
-                "spline_alpha must be positive."
             )
 
         if self.head_type not in {"official_mlp", "linear"}:

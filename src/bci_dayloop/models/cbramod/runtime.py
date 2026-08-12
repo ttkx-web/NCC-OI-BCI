@@ -520,6 +520,9 @@ def build_cbramod_runtime(
     filter_order: int = 4,
     reference_mode: str = "none",
     normalization: str = "none",
+    missing_channel_policy: str = "error",
+    min_observed_channels: int | None = None,
+    spline_alpha: float = 1e-5,
 
     head_type: str = "official_mlp",
     head_hidden_dim_1: int = 800,
@@ -587,6 +590,9 @@ def build_cbramod_runtime(
         filter_order=filter_order,
         reference_mode=reference_mode,
         normalization=normalization,
+        missing_channel_policy=missing_channel_policy,
+        min_observed_channels=min_observed_channels,
+        spline_alpha=spline_alpha,
 
         num_classes=len(normalized_class_names),
         head_type=head_type,

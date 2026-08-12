@@ -1029,6 +1029,8 @@ def _load_cbramod_package(
             "match preprocessing transform standard_channels."
         )
 
+    # 旧模型包使用 allow_missing_channels；它无法表达新的
+    # spherical_spline 完整协议，不能静默迁移。
     if (
         "missing_channel_policy" not in transform
         and bool(
@@ -1039,12 +1041,10 @@ def _load_cbramod_package(
         )
     ):
         raise ValueError(
-            "This is a legacy CBraMod package with "
-            "allow_missing_channels=true. Its old completion "
-            "semantics cannot be safely mapped to the new "
-            "spherical_spline protocol. Re-export the package "
-            "with missing_channel_policy, "
-            "min_observed_channels, and spline_alpha."
+            "Legacy CBraMod package uses "
+            "allow_missing_channels=true. Re-export it with "
+            "missing_channel_policy, min_observed_channels, "
+            "and spline_alpha."
         )
 
     config = CBraModConfig(
@@ -1098,12 +1098,6 @@ def _load_cbramod_package(
             ) is None
             else int(
                 transform["min_observed_channels"]
-            )
-        ),
-        unknown_channel_policy=str(
-            transform.get(
-                "unknown_channel_policy",
-                "ignore",
             )
         ),
         spline_alpha=float(

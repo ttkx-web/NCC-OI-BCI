@@ -822,10 +822,13 @@ class CBraModAdapter(BaseModelAdapter):
                     "error",
                 )
             ),
-            min_observed_channels=int(
-                preprocessing.get(
-                    "min_observed_channels",
-                    2,
+            min_observed_channels=(
+                None
+                if preprocessing.get(
+                    "min_observed_channels"
+                ) is None
+                else int(
+                    preprocessing["min_observed_channels"]
                 )
             ),
             spline_alpha=float(

@@ -1,21 +1,17 @@
 name: bci-dayloop
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
 dependencies:
   - python=3.11
-  - pytorch=2.0.1
-  - torchvision=0.15.2
-  - torchaudio=2.0.2
-  - pytorch-cuda=11.8
   - numpy=1.26.4
   - scipy>=1.11
   - h5py>=3.10
   - pyyaml>=6.0
   - mne>=1.6
   - scikit-learn>=1.4
-  - pandas>=2.0
-  - streamlit>=1.39
-  - pytest>=8.0
+  - pyedflib>=0.1.36
   - pip
+
+# This is the portable, CPU-neutral base environment. Install the approved
+# CUDA-specific PyTorch wheel separately after activation; do not pin a CUDA
+# toolkit or wheel index in this file. See docs/server_deployment.md.

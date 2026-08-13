@@ -11,17 +11,17 @@ dependencies = [
   "h5py>=3.10",
   "mne>=1.6",
   "numpy==1.26.4",
-  "pandas>=2.0",
+  "pyedflib>=0.1.36",
   "PyYAML>=6.0",
   "scikit-learn>=1.4",
   "scipy>=1.11",
-  "streamlit>=1.39",
-  "torch>=2.0.1,<2.1",
-  "torchvision==0.15.2",
-  "torchaudio==2.0.2",
+  # CUDA wheel selection is platform-specific; see docs/server_deployment.md.
+  "torch>=2.5",
 ]
 
 [project.optional-dependencies]
+data = ["moabb>=1.1"]
+ui = ["pandas>=2.0", "streamlit>=1.39"]
 dev = ["pytest>=8.0"]
 
 [tool.setuptools]

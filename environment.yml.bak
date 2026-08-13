@@ -1,3 +1,5 @@
+# Archived historical environment definition. Do not use for deployment;
+# environment.yml and docs/server_deployment.md are authoritative.
 name: bci-dayloop
 channels:
   - pytorch

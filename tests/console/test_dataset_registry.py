@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from app.services.dataset_service import DatasetRegistry
@@ -17,3 +18,17 @@ def test_dataset_discovery_returns_metadata_without_local_path(dataset_file: Pat
     payload = json.dumps(items[0].model_dump())
     assert str(dataset_file) not in payload
     assert ":\\" not in payload
+
+
+def test_invalid_dataset_logs_safe_discovery_reason(dataset_file: Path, caplog) -> None:
+    invalid = dataset_file.parent / "invalid.h5"
+    invalid.write_text("not hdf5", encoding="utf-8")
+    registry = DatasetRegistry(dataset_file.parents[2])
+
+    with caplog.at_level(logging.WARNING):
+        assert len(registry.list()) == 1
+
+    message = caplog.text
+    assert "skipped dataset file" in message
+    assert "invalid.h5" in message
+    assert str(dataset_file.parents[2]) not in message

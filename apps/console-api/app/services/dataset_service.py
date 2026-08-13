@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,9 @@ from pathlib import Path
 import h5py
 
 from app.schemas.datasets import DatasetSummary
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +38,15 @@ class DatasetRegistry:
             for path in self.root.rglob(pattern):
                 try:
                     entry = self._read(path.resolve())
-                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    relative_path = path.relative_to(self.root).as_posix()
+                    reason = str(error).replace(str(self.root), "<dataset-root>")
+                    logger.warning(
+                        "skipped dataset file file=%s reason=%s: %s",
+                        relative_path,
+                        type(error).__name__,
+                        reason,
+                    )
                     continue
                 entries[(entry.summary.id, entry.summary.subject_id.lower())] = entry
         self._entries = entries

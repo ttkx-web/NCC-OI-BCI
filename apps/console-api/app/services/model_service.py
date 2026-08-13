@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from bci_dayloop.packages.loader import load_runtime_package
 
 from app.schemas.models import ModelSummary
 
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_RUNTIME_TYPES = {"model_50m", "labram", "cbramod"}
 DISPLAY_NAMES = {"model_50m": "50M", "labram": "LaBraM", "cbramod": "CBraMod"}
@@ -75,6 +78,20 @@ class ModelRegistry:
         self._runtime_verifier = runtime_verifier or self._verify_runtime
         self._verification_cache: dict[Path, bool] = {}
 
+    def _diagnostic_path(self, path: Path) -> str:
+        for root in self.roots:
+            try:
+                return path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+        return path.name
+
+    def _diagnostic_reason(self, error: Exception) -> str:
+        reason = str(error)
+        for root in self.roots:
+            reason = reason.replace(str(root), "<model-root>")
+        return reason
+
     def _verify_runtime(self, package_path: Path) -> bool:
         """Use the sole Runtime Package loader; never infer validity from YAML."""
         cached = self._verification_cache.get(package_path)
@@ -82,7 +99,13 @@ class ModelRegistry:
             return cached
         try:
             load_runtime_package(package_path, device="cpu", verify_hashes=True)
-        except Exception:
+        except Exception as error:
+            logger.warning(
+                "runtime package verification failed package=%s reason=%s: %s",
+                self._diagnostic_path(package_path),
+                type(error).__name__,
+                self._diagnostic_reason(error),
+            )
             verified = False
         else:
             verified = True
@@ -97,7 +120,13 @@ class ModelRegistry:
             for manifest in root.rglob("package.yaml"):
                 try:
                     entry = self._read(root, manifest)
-                except (OSError, TypeError, ValueError, yaml.YAMLError, json.JSONDecodeError):
+                except (OSError, TypeError, ValueError, yaml.YAMLError, json.JSONDecodeError) as error:
+                    logger.warning(
+                        "skipped runtime package manifest=%s reason=%s: %s",
+                        self._diagnostic_path(manifest),
+                        type(error).__name__,
+                        self._diagnostic_reason(error),
+                    )
                     continue
                 entries[entry.summary.id] = entry
         self._entries = entries

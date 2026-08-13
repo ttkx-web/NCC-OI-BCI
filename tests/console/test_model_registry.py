@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from app.services.model_service import ModelRegistry
@@ -20,9 +21,13 @@ def test_model_package_discovery_is_stable_and_privacy_safe(runtime_package: Pat
     assert ":\\" not in serialized
 
 
-def test_invalid_model_package_is_ignored(runtime_package: Path) -> None:
+def test_invalid_model_package_is_ignored_with_safe_diagnostics(runtime_package: Path, caplog) -> None:
     invalid = runtime_package.parents[2] / "invalid" / "v1"
     invalid.mkdir(parents=True)
     (invalid / "package.yaml").write_text("schema_version: 1\n", encoding="utf-8")
     registry = ModelRegistry([runtime_package.parents[3]], runtime_verifier=lambda _path: True)
-    assert len(registry.list()) == 1
+    with caplog.at_level(logging.WARNING):
+        assert len(registry.list()) == 1
+    assert "skipped runtime package" in caplog.text
+    assert "invalid/v1/package.yaml" in caplog.text
+    assert str(runtime_package.parents[3]) not in caplog.text

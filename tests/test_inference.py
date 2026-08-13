@@ -519,3 +519,117 @@ def test_decoder_accepts_dict_model_input_from_transform():
         0.85
     )
 
+def test_decoder_applies_online_handler_after_prediction():
+    runtime_model = build_fixed_runtime(
+        channel_names=("C3", "C4"),
+        sample_rate=200.0,
+        window_sec=1.0,
+        probabilities=(
+            0.25,
+            0.25,
+            0.25,
+            0.25,
+        ),
+        error_message=(
+            "Static backend must not be called."
+        ),
+    )
+
+    predictor = RecordingPreparedPredictor(
+        probabilities=(
+            0.05,
+            0.80,
+            0.10,
+            0.05,
+        )
+    )
+
+    handler_calls = []
+
+    def online_handler(
+        observation,
+        true_label,
+    ):
+        # 能看到 call_count == 1，
+        # 说明预测已经完成。
+        assert predictor.call_count == 1
+        assert true_label == 1
+        assert (
+            observation.output.predicted_class
+            == 1
+        )
+
+        handler_calls.append(
+            observation.observation_id
+        )
+
+        return OnlineUpdateResult(
+            strategy_name="neuroonline",
+            applied=True,
+            update_step=4,
+            model_revision=(
+                "neuroonline-4"
+            ),
+            samples_used=16,
+            latency_ms=2.5,
+        )
+
+    decoder = SlidingWindowDecoder(
+        runtime_model=runtime_model,
+        predictor=predictor,
+        online_observation_handler=(
+            online_handler
+        ),
+        class_names=(
+            "left_hand",
+            "right_hand",
+            "feet",
+            "tongue",
+        ),
+        channel_names=("C3", "C4"),
+        sample_rate=200.0,
+        input_unit="uV",
+        window_sec=1.0,
+        step_sec=1.0,
+    )
+
+    samples = (
+        np.random.default_rng(123)
+        .normal(size=(2, 200))
+        .astype(np.float32)
+    )
+
+    result = decoder.push(
+        samples,
+        trial_id=9,
+        expected_class_id=1,
+    )
+
+    assert result is not None
+    assert len(handler_calls) == 1
+
+    # 当前预测使用更新前版本。
+    assert (
+        result.model_revision
+        == "test-revision-3"
+    )
+    assert result.online_update_step == 3
+
+    # 当前预测完成后发生了更新。
+    assert (
+        result.online_update_applied
+        is True
+    )
+
+    update = (
+        result.model_diagnostics[
+            "online_update"
+        ]
+    )
+
+    assert update["applied"] is True
+    assert (
+        update["model_revision"]
+        == "neuroonline-4"
+    )
+

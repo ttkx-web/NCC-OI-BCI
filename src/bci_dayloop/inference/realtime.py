@@ -15,6 +15,11 @@ from bci_dayloop.control.commands import command_for_prediction
 from bci_dayloop.inference.observability import JsonlWindowLogger, LatencyBreakdown, PipelineRunStats
 from collections.abc import Callable, Iterator, Sequence
 
+from bci_dayloop.runtime.adaptation_types import (
+    OnlineObservation,
+    OnlineUpdateResult,
+)
+
 from bci_dayloop.runtime.model import (
     RuntimeModel,
 )
@@ -26,6 +31,10 @@ from bci_dayloop.inference.predictor import (
     PreparedPredictor,
 )
 
+OnlineObservationHandler = Callable[
+    [OnlineObservation, int | None],
+    OnlineUpdateResult | None,
+]
 
 class StopEvent(Protocol):
     def is_set(self) -> bool: ...
@@ -81,7 +90,10 @@ class SlidingWindowDecoder:
         sample_rate: float,
         input_unit: str,
         predictor: (
-            PreparedPredictor | None
+                PreparedPredictor | None
+        ) = None,
+        online_observation_handler: (
+                OnlineObservationHandler | None
         ) = None,
         window_sec: float | None = None,
         step_sec: float = 0.5,
@@ -113,6 +125,12 @@ class SlidingWindowDecoder:
 
         self.predictor = (
             resolved_predictor
+        )
+
+        # 普通模式为 None；
+        # NeuroOnline 模式为预测后的 observation/feedback/update 回调。
+        self.online_observation_handler = (
+            online_observation_handler
         )
 
         self.class_names = tuple(
@@ -334,6 +352,24 @@ class SlidingWindowDecoder:
                 - model_started
             ) * 1000.0
 
+            # 记录“本次预测真正使用”的模型版本。
+            # 必须在在线更新之前读取。
+            prediction_model_revision = str(
+                getattr(
+                    self.predictor,
+                    "model_revision",
+                    "base",
+                )
+            )
+
+            prediction_update_step = int(
+                getattr(
+                    self.predictor,
+                    "update_step",
+                    0,
+                )
+            )
+
             probability_tensor = (
                 output.probabilities
                 .detach()
@@ -408,25 +444,48 @@ class SlidingWindowDecoder:
                 self.command_map,
             )
 
-            total_ms = (
-                time.perf_counter()
-                - total_started
-            ) * 1000.0
+            # 到这里，本窗口的预测已经完全完成。
+            # 后续标签只能更新下一窗口使用的参数，
+            # 不会反过来改变当前窗口的 prediction。
+            prediction_total_ms = (
+                                          time.perf_counter()
+                                          - total_started
+                                  ) * 1000.0
 
-            model_revision = str(
-                getattr(
-                    self.predictor,
-                    "model_revision",
-                    "base",
-                )
-            )
+            update_result: OnlineUpdateResult | None = None
 
-            online_update_step = int(
-                getattr(
-                    self.predictor,
-                    "update_step",
-                    0,
+            if self.online_observation_handler is not None:
+                observation = OnlineObservation(
+                    observation_id=(
+                        f"decoder-window-{window_id}"
+                    ),
+                    prepared_input=prepared,
+                    output=output,
+                    timestamp_sec=time.time(),
+                    metadata={
+                        "trial_id": trial_id,
+                        "window_id": window_id,
+                    },
                 )
+
+                update_result = (
+                    self.online_observation_handler(
+                        observation,
+                        expected_class_id,
+                    )
+                )
+
+                if update_result is not None:
+                    # asdict 已经在 realtime.py 顶部导入。
+                    model_diagnostics[
+                        "online_update"
+                    ] = asdict(update_result)
+
+            total_ms = prediction_total_ms
+
+            online_update_applied = (
+                    update_result is not None
+                    and update_result.applied
             )
 
             result = DecodeResult(
@@ -454,16 +513,18 @@ class SlidingWindowDecoder:
                     model_diagnostics
                 ),
 
+                # 这两个字段表示产生当前预测时使用的版本。
                 model_revision=(
-                    model_revision
+                    prediction_model_revision
                 ),
                 online_update_step=(
-                    online_update_step
+                    prediction_update_step
                 ),
 
-                # 当前步骤只负责预测。
-                # feedback/update 接入后再决定是否标记为 True。
-                online_update_applied=False,
+                # 表示当前预测结束后是否触发了一次更新。
+                online_update_applied=(
+                    online_update_applied
+                ),
             )
 
         except Exception as error:

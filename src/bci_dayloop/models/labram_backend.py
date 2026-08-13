@@ -391,6 +391,36 @@ class LaBraMBackend(ModelBackend):
 
         return logits
 
+    def set_online_mode(
+            self,
+            *,
+            training: bool,
+            train_backbone: bool = False,
+    ) -> None:
+        """
+        设置 LaBraM NeuroOnline 前向模式。
+        """
+
+        if training and train_backbone:
+            for parameter in (
+                    self.adapter.encoder.parameters()
+            ):
+                parameter.requires_grad = True
+
+            self.adapter.encoder.train()
+
+        else:
+            for parameter in (
+                    self.adapter.encoder.parameters()
+            ):
+                parameter.requires_grad = False
+
+            self.adapter.encoder.eval()
+
+        self.adapter.head.train(
+            mode=training
+        )
+
     def predict_tensor(
         self,
         model_input: ModelTensor,

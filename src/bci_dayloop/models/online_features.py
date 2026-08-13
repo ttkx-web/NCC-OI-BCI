@@ -91,3 +91,26 @@ class OnlineTrainableFeatureBackend(
         转换成 [B,num_classes] logits。
         """
         ...
+
+    def set_online_mode(
+            self,
+            *,
+            training: bool,
+            train_backbone: bool = False,
+    ) -> None:
+        """
+        设置在线前向所需的模型状态。
+
+        training=False:
+            backbone.eval()
+            classifier.eval()
+
+        training=True, train_backbone=False:
+            backbone.eval() 且冻结
+            classifier.train()
+
+        training=True, train_backbone=True:
+            backbone.train()
+            classifier.train()
+        """
+        ...

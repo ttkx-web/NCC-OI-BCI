@@ -457,6 +457,25 @@ class CBraModBackend(ModelBackend):
 
         return features
 
+    def set_online_mode(
+            self,
+            *,
+            training: bool,
+            train_backbone: bool = False,
+    ) -> None:
+        """
+        设置 CBrAmod NeuroOnline 前向模式。
+        """
+
+        if training and train_backbone:
+            self.backbone.unfreeze()
+        else:
+            self.backbone.freeze()
+
+        self.classifier.train(
+            mode=training
+        )
+
     def get_trainable_parameters(
         self,
         scope: str,

@@ -22,6 +22,10 @@ from bci_dayloop.runtime.types import (
     RawEEGWindow,
 )
 
+from bci_dayloop.inference.predictor import (
+    PreparedPredictor,
+)
+
 
 class StopEvent(Protocol):
     def is_set(self) -> bool: ...
@@ -76,6 +80,9 @@ class SlidingWindowDecoder:
         *,
         sample_rate: float,
         input_unit: str,
+        predictor: (
+            PreparedPredictor | None
+        ) = None,
         window_sec: float | None = None,
         step_sec: float = 0.5,
         confidence_threshold: float = 0.55,
@@ -84,6 +91,29 @@ class SlidingWindowDecoder:
         jsonl_logger: JsonlWindowLogger | None = None,
     ) -> None:
         self.runtime_model = runtime_model
+
+        if predictor is None:
+            # 默认保持原来的静态 Runtime 路径。
+            resolved_predictor: (
+                PreparedPredictor
+            ) = runtime_model
+
+        else:
+            if not isinstance(
+                predictor,
+                PreparedPredictor,
+            ):
+                raise TypeError(
+                    "predictor must implement "
+                    "PreparedPredictor, got "
+                    f"{type(predictor).__name__}."
+                )
+
+            resolved_predictor = predictor
+
+        self.predictor = (
+            resolved_predictor
+        )
 
         self.class_names = tuple(
             str(name) for name in class_names
@@ -275,7 +305,7 @@ class SlidingWindowDecoder:
             model_started = time.perf_counter()
 
             output = (
-                self.runtime_model.predict_prepared(
+                self.predictor.predict_prepared(
                     prepared,
                     return_features=False,
                 )
@@ -292,6 +322,11 @@ class SlidingWindowDecoder:
 
             model_diagnostics = dict(
                 output.diagnostics
+            )
+
+            model_diagnostics.setdefault(
+                "predictor",
+                type(self.predictor).__name__,
             )
 
             model_ms = (
@@ -378,6 +413,22 @@ class SlidingWindowDecoder:
                 - total_started
             ) * 1000.0
 
+            model_revision = str(
+                getattr(
+                    self.predictor,
+                    "model_revision",
+                    "base",
+                )
+            )
+
+            online_update_step = int(
+                getattr(
+                    self.predictor,
+                    "update_step",
+                    0,
+                )
+            )
+
             result = DecodeResult(
                 prediction=prediction,
                 confidence=confidence,
@@ -402,6 +453,17 @@ class SlidingWindowDecoder:
                 model_diagnostics=(
                     model_diagnostics
                 ),
+
+                model_revision=(
+                    model_revision
+                ),
+                online_update_step=(
+                    online_update_step
+                ),
+
+                # 当前步骤只负责预测。
+                # feedback/update 接入后再决定是否标记为 True。
+                online_update_applied=False,
             )
 
         except Exception as error:

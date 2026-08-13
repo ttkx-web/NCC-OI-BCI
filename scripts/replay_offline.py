@@ -227,6 +227,7 @@ def build_pipeline_controller(
         else None
     )
 
+
     decoder = SlidingWindowDecoder(
         runtime_model=(
             runtime_package.runtime_model

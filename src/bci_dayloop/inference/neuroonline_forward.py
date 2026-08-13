@@ -261,3 +261,62 @@ class NeuroOnlineForward:
                 ),
             },
         )
+
+def build_neuroonline_forward(
+    *,
+    runtime_model: RuntimeModel,
+    num_subject_codes: int = 32,
+    num_attention_heads: int = 4,
+    dropout: float = 0.1,
+) -> NeuroOnlineForward:
+    """
+    根据 RuntimeModel 的 backend 特征规格，
+    创建匹配的 NeuroOnlineGenerator 和前向桥接器。
+
+    Generator 在这里创建一次，后续应持续复用。
+    """
+
+    backend = runtime_model.backend
+
+    if not isinstance(
+        backend,
+        OnlineTrainableFeatureBackend,
+    ):
+        raise TypeError(
+            "Runtime backend does not support "
+            "NeuroOnline token adaptation: "
+            f"{type(backend).__name__}."
+        )
+
+    feature_spec = (
+        backend.online_feature_spec
+    )
+
+    generator = NeuroOnlineGenerator(
+        feature_spec=feature_spec,
+        num_subject_codes=(
+            num_subject_codes
+        ),
+        num_attention_heads=(
+            num_attention_heads
+        ),
+        dropout=dropout,
+    ).to(
+        backend.device
+    )
+
+    # 新创建后先进入推理模式。
+    #
+    # 真正在线更新时，再由训练逻辑切换成
+    # generator.train()。
+    generator.eval()
+
+    backend.set_online_mode(
+        training=False,
+        train_backbone=False,
+    )
+
+    return NeuroOnlineForward(
+        runtime_model=runtime_model,
+        generator=generator,
+    )

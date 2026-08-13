@@ -711,7 +711,9 @@ class Model50MBackbone(nn.Module):
             parameter.requires_grad = False
 
         self._frozen = True
-        self.model.eval()
+        # 同时更新 wrapper 和内部 checkpoint 模型的 module mode，确保
+        # 在线冻结时不会出现 wrapper.training 与 model.training 不一致。
+        self.train(False)
         return self
 
     def unfreeze(self) -> "Model50MBackbone":
@@ -719,7 +721,7 @@ class Model50MBackbone(nn.Module):
             parameter.requires_grad = True
 
         self._frozen = False
-        self.model.train()
+        self.train(True)
         return self
 
     def train(self, mode: bool = True) -> "Model50MBackbone":

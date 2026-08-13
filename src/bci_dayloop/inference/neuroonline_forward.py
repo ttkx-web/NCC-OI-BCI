@@ -8,6 +8,7 @@ from bci_dayloop.models.neuroonline import (
     NeuroOnlineGenerator,
 )
 from bci_dayloop.models.online_features import (
+    OnlineTokenContextFeatureBackend,
     OnlineTrainableFeatureBackend,
 )
 from bci_dayloop.runtime.model import (
@@ -110,15 +111,35 @@ class NeuroOnlineForward:
         训练和预测由外层方法分别控制。
         """
 
-        original_tokens = (
-            self.backend
-            .encode_online_tokens(
-                model_input,
-                train_backbone=(
-                    train_backbone
-                ),
+        token_valid_mask: torch.Tensor | None = None
+
+        # 50M 的原始聚合依赖每个样本的 token_valid_mask。该扩展把 mask
+        # 与这次 token 提取结果显式传递，避免 backend 保存跨调用状态。
+        if isinstance(
+            self.backend,
+            OnlineTokenContextFeatureBackend,
+        ):
+            token_context = (
+                self.backend
+                .encode_online_token_context(
+                    model_input,
+                    train_backbone=train_backbone,
+                )
             )
-        )
+            original_tokens = token_context.tokens
+            token_valid_mask = (
+                token_context.token_valid_mask
+            )
+        else:
+            original_tokens = (
+                self.backend
+                .encode_online_tokens(
+                    model_input,
+                    train_backbone=(
+                        train_backbone
+                    ),
+                )
+            )
 
         (
             alpha,
@@ -135,12 +156,23 @@ class NeuroOnlineForward:
             + beta
         )
 
-        logits = (
-            self.backend
-            .classify_online_tokens(
-                adapted_tokens
+        if token_valid_mask is None:
+            logits = (
+                self.backend
+                .classify_online_tokens(
+                    adapted_tokens
+                )
             )
-        )
+        else:
+            logits = (
+                self.backend
+                .classify_online_tokens(
+                    adapted_tokens,
+                    token_valid_mask=(
+                        token_valid_mask
+                    ),
+                )
+            )
 
         expected_logits_shape = (
             original_tokens.shape[0],

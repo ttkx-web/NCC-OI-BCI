@@ -43,6 +43,77 @@ class OnlineFeatureSpec:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class OnlineTokenContext:
+    """
+    一次在线 token 提取的无状态上下文。
+
+    大多数 backend 只需要 ``tokens``。50M 的原始分类聚合还依赖
+    每个样本的 token_valid_mask，因此将 mask 与本次提取结果显式绑定，
+    避免通过 backend 的跨调用可变状态保存它。
+    """
+
+    tokens: torch.Tensor
+    token_valid_mask: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tokens, torch.Tensor):
+            raise TypeError(
+                "tokens must be torch.Tensor, got "
+                f"{type(self.tokens).__name__}."
+            )
+
+        if self.tokens.ndim != 3:
+            raise ValueError(
+                "tokens must have shape [B,N,D], got "
+                f"{tuple(self.tokens.shape)}."
+            )
+
+        if self.token_valid_mask is None:
+            return
+
+        if not isinstance(self.token_valid_mask, torch.Tensor):
+            raise TypeError(
+                "token_valid_mask must be torch.Tensor, got "
+                f"{type(self.token_valid_mask).__name__}."
+            )
+
+        expected_shape = self.tokens.shape[:2]
+
+        if tuple(self.token_valid_mask.shape) != expected_shape:
+            raise ValueError(
+                "token_valid_mask must have shape "
+                f"{expected_shape}, got "
+                f"{tuple(self.token_valid_mask.shape)}."
+            )
+
+
+@runtime_checkable
+class OnlineTokenContextFeatureBackend(Protocol):
+    """
+    可选扩展：分类时还需要 token 级附加上下文的 backend。
+
+    该协议不替换 OnlineTrainableFeatureBackend。NeuroOnlineForward 仅在
+    backend 实现本协议时使用它，故现有 LaBraM 和 CBraMod 不受影响。
+    """
+
+    def encode_online_token_context(
+        self,
+        model_input: ModelTensor,
+        *,
+        train_backbone: bool = False,
+    ) -> OnlineTokenContext:
+        ...
+
+    def classify_online_tokens(
+        self,
+        tokens: torch.Tensor,
+        *,
+        token_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        ...
+
+
 @runtime_checkable
 class OnlineTrainableFeatureBackend(
     Protocol

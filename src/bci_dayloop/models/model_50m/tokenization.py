@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 import torch
@@ -9,11 +9,12 @@ import torch
 try:
     # 作为 package 导入时
     from .config import Model50MConfig
-    from .preprocessing import PreprocessResult
 except ImportError:
     # 直接运行当前文件时
     from config import Model50MConfig
-    from preprocessing import PreprocessResult
+
+if TYPE_CHECKING:
+    from .preprocessing import PreprocessResult
 
 
 @dataclass(frozen=True, slots=True)

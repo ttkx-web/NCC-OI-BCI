@@ -4,7 +4,7 @@
 
 当前主线任务为 **BNCI2014_001 四分类运动想象**，核心模型为公司 **50M EEG 基座模型**；LaBraM 作为已接入的公开基线。项目已经完成从离线数据、Runtime Model Package、Replay/Streamlit，到 **Neuracle JellyFish 实时采集 → 4 秒滑窗 → 50M 推理** 的统一链路。
 
-> 当前状态：Unified Runtime 已完成；50M、LaBraM 与 CBraMod 已接入统一 Package/Runtime；Stage 1A 个体化分类头已实现；Stage 2A 自采 Neuracle 离线数据处理已实现；Stage 2B 真实设备实时采集、Trigger、连续滑窗与 50M 实时推理闭环已实现。**NeuroOnline V1 已完成离线/伪实时接入，并支持 50M、LaBraM、CBraMod 的冻结 Backbone + Generator + 分类头在线更新与严格 sequential 对比评估**；Rest-Tune 仍待实现。
+> 当前状态：Unified Runtime 已完成；50M 与 LaBraM 已接入统一 Package/Runtime；Stage 1A 个体化分类头已实现；Stage 2A 自采 Neuracle 离线数据处理已实现；Stage 2B 真实设备实时采集、Trigger、连续滑窗与 50M 实时推理闭环已实现。Rest-Tune 与 NeuroOnline 目前仅保留接口/基础类型，真实算法仍待开发。
 
 ---
 
@@ -23,7 +23,7 @@ BNCI2014_001 四分类运动想象：
 
 - **50M**：公司 EEG 基座模型，当前实时部署主模型；
 - **LaBraM**：已完成统一 Runtime 接入的公开基线；
-- **CBraMod**：已完成统一 Runtime 与 NeuroOnline token 接口接入的公开基线；
+- **CBraMod**：计划作为下一阶段基线接入；
 - BIOT / REVE：按后续实验需要再扩展。
 
 ---
@@ -41,7 +41,7 @@ BNCI2014_001 四分类运动想象：
 | Stage 2B | Neuracle JellyFish 真实实时接入、Trigger、4s Window、50M 推理 | 已实现 |
 | Stage 3 | 实时 Pipeline 与个体化策略统一 | 计划中 |
 | Rest-Tune | 离线个体化 Backbone/Head 适配 | 接口已预留，算法待实现 |
-| NeuroOnline V1 | 冻结 Backbone，使用真实标签在线更新 Generator + Head | 已实现（50M / LaBraM / CBraMod，离线与 sequential 评估） |
+| NeuroOnline | 基于在线反馈的持续适配 | 接口已预留，算法待实现 |
 
 ---
 
@@ -69,8 +69,7 @@ PreparedModelInput
         v
 ModelBackend
 ├── Model50MBackend
-├── LaBraMBackend
-└── CBraModBackend
+└── LaBraMBackend
         |
         v
 RuntimeModel
@@ -207,7 +206,6 @@ output = runtime_model.predict_prepared(prepared)
 ```text
 model.type = model_50m
 model.type = labram
-model.type = cbramod
 ```
 
 统一入口：
@@ -635,51 +633,25 @@ Total P50 / P95 latency
 
 ## 16. CLI Replay
 
-普通静态 Replay：
-
 ```bash
 python scripts/replay_offline.py \
   --config configs/stage1/replay_population_4s.yaml \
   --data data/processed/bnci2014_001/subject_01.h5 \
   --model-package <runtime-package> \
   --device cpu \
-  --online-strategy none \
   --max-windows 20 \
   --replay-speed 100
 ```
 
-启用 NeuroOnline：
-
-```bash
-python scripts/replay_offline.py \
-  --config configs/stage1/replay_population_4s.yaml \
-  --data data/processed/bnci2014_001/subject_01.h5 \
-  --model-package <runtime-package> \
-  --device cpu \
-  --online-strategy neuroonline \
-  --max-windows 100 \
-  --replay-speed 100
-```
-
-CLI 参数 `--online-strategy` 会覆盖 YAML 中的 `online.strategy`。当前可选：
-
-```text
-none
-neuroonline
-```
-
-CLI Replay 主要用于验证：
+CLI Replay 用于验证：
 
 - Runtime Package 加载；
 - 连续滑窗；
 - prediction / confidence；
-- NeuroOnline observation → ground-truth feedback → update 链路；
 - preprocessing / model / total latency；
 - JSONL 与 summary。
 
-> `replay_offline.py` 是连续滑窗/伪实时 smoke test，不建议拿它作为 NeuroOnline 正式准确率比较协议。正式比较静态模型与 NeuroOnline 时，使用第 20 节的 `evaluate_neuroonline_sequential.py`。
-
-不涉及在线适配的正式静态分类性能仍可使用 `evaluate_runtime_package.py`。
+正式分类性能优先使用 `evaluate_runtime_package.py`。
 
 ---
 
@@ -830,321 +802,42 @@ Stage 2B Probe 不持久化 EEG waveform。
 
 ---
 
-## 20. Personalization / NeuroOnline
+## 20. Personalization / Adaptation
 
-### 20.1 当前适配能力
-
-已实现：
+### 20.1 已实现
 
 - Population Head；
 - Personal Head；
 - Personal Model Package；
 - Personal Model Registry；
 - Population vs Personal Replay；
-- `OfflineAdaptationStrategy` / `OnlineAdaptationStrategy` 基础接口；
-- `NoOfflineAdaptation` / `NoOnlineAdaptation`；
-- **NeuroOnline V1**：支持 50M、LaBraM、CBraMod；
-- NeuroOnline 的 Generator、在线 feedback buffer、optimizer/update、严格 sequential 评估与 gain 汇总。
+- `OfflineAdaptationStrategy` 基础接口；
+- `OnlineAdaptationStrategy` 基础接口；
+- `NoOfflineAdaptation` / `NoOnlineAdaptation`。
 
-尚未实现：
+### 20.2 尚未实现
 
 - Rest-Tune 真实训练策略；
-- reward-only NeuroOnline；
-- 伪标签 NeuroOnline；
-- 在线 Backbone 更新；
-- Rest-Tune + NeuroOnline 联合策略；
-- NeuroOnline 直接接入 Stage 2B JellyFish 真设备闭环。
+- NeuroOnline buffer / feedback update；
+- 在线 optimizer / rollback；
+- Rest-Tune + NeuroOnline 联合策略。
 
-### 20.2 NeuroOnline V1 做什么
-
-当前 V1 的更新范围固定为：
+当前推荐开发顺序：
 
 ```text
-PreparedModelInput
-        |
-        v
-Frozen Backbone
-        |
-        v
-[B, N, D] online tokens
-        |
-        v
-NeuroOnline Generator
-        |
-        v
-Classification Head
-        |
-        v
-Prediction
-        |
-        v
-真实标签反馈（prediction 之后才可见）
-        |
-        v
-更新 Generator + Classification Head
+50M / LaBraM / CBraMod baseline
+        ↓
+2s / 3s / 4s 性能与 latency benchmark
+        ↓
+选择 Demo 主模型与窗口
+        ↓
+NeuroOnline v0
+frozen backbone + supervised online head update
+        ↓
+Rest-Tune
+        ↓
+Rest-Tune + NeuroOnline
 ```
-
-核心约束：
-
-- **Backbone 始终冻结**；
-- 只更新 **Generator + classification head**；
-- 只接受真实类别标签；
-- 不使用当前预测作为伪标签；
-- 不支持 reward-only update；
-- 每个 online session 创建一个 `NeuroOnlineStrategy`，Generator 在该 session 内持续保留；
-- 50M 会保留其 token valid mask 语义，LaBraM / CBraMod 使用统一 `[B,N,D]` token 接口。
-
-当前实现 NeuroOnline token 接口的 Backend：
-
-```text
-Model50MBackend
-LaBraMBackend
-CBraModBackend
-```
-
-核心代码：
-
-```text
-src/bci_dayloop/models/neuroonline.py
-src/bci_dayloop/models/online_features.py
-src/bci_dayloop/inference/neuroonline_forward.py
-src/bci_dayloop/inference/neuroonline_strategy.py
-```
-
-### 20.3 配置 NeuroOnline
-
-现有 50M / LaBraM / CBraMod Replay 配置中均可使用：
-
-```yaml
-online:
-  strategy: neuroonline
-
-  neuroonline:
-    num_subject_codes: 32
-    num_attention_heads: 4
-    dropout: 0.1
-
-    learning_rate: 0.0001
-    weight_decay: 0.0
-    max_grad_norm: 1.0
-
-    warmup_feedback: 32
-    update_interval: 16
-    recent_buffer_size: 64
-    batch_size: 16
-    epochs_per_update: 1
-
-    max_pending_observations: 256
-    seed: 42
-```
-
-主要参数：
-
-| 参数 | 含义 |
-|---|---|
-| `num_subject_codes` | Generator 内可学习 subject code 数量 |
-| `num_attention_heads` | Generator attention head 数量 |
-| `dropout` | Generator dropout |
-| `learning_rate` | Generator + Head 在线 optimizer 学习率 |
-| `weight_decay` | 在线 optimizer weight decay |
-| `max_grad_norm` | 在线更新 gradient clipping |
-| `warmup_feedback` | 收到至少多少个真实标签后允许第一次更新 |
-| `update_interval` | 第一次更新后，每新增多少个真实标签触发一次更新 |
-| `recent_buffer_size` | 最近有标签样本 buffer 的最大长度；必须 `>= warmup_feedback` |
-| `batch_size` | 每次在线训练的小批量大小 |
-| `epochs_per_update` | 每次触发更新时，在 recent buffer 上训练多少轮 |
-| `max_pending_observations` | 尚未收到反馈的 prediction 最多缓存多少条 |
-| `seed` | Generator 初始化与 batch shuffle 随机种子 |
-
-例如默认参数 `warmup_feedback=32` 时：
-
-```text
-trial 1 ... 32:
-    使用初始模型预测
-    每次预测后提交真实标签
-
-trial 32 prediction 后:
-    第一次 NeuroOnline update
-
-trial 33:
-    第一次使用更新后的参数进行预测
-```
-
-因此，如果使用 `--max-trials` 做快速测试，**必须让它大于 `warmup_feedback` 才能观察到更新后模型的预测**。
-
-### 20.4 用 Replay 验证 NeuroOnline 链路
-
-50M population package 示例：
-
-```bash
-python scripts/replay_offline.py \
-  --config configs/stage1/replay_population_4s.yaml \
-  --data data/processed/bnci2014_001/subject_01.h5 \
-  --model-package model_packages/stage1/bnci2014_001/subject_01/population/4s_flatten/v1 \
-  --device cpu \
-  --online-strategy neuroonline \
-  --max-windows 100 \
-  --replay-speed 100
-```
-
-LaBraM 可使用：
-
-```text
-configs/stage0/day1_bnci_s01.yaml
-```
-
-CBraMod 可使用：
-
-```text
-configs/stage1/replay_cbramod_4s.yaml
-```
-
-`replay_offline.py` 中每个窗口的因果顺序为：
-
-```text
-predict
-  -> observe
-  -> submit ground-truth feedback
-  -> maybe_update
-  -> next window
-```
-
-离线 NeuroOnline Replay 要求每个窗口都能获得真实标签，否则会 fail closed；不会自动退化成伪标签。
-
-### 20.5 正式比较有 / 无 NeuroOnline
-
-正式 accuracy / bACC / Macro-F1 对比推荐：
-
-```bash
-python scripts/evaluate_neuroonline_sequential.py \
-  --config configs/stage1/replay_population_4s.yaml \
-  --data data/processed/bnci2014_001/subject_01.h5 \
-  --model-package model_packages/stage1/bnci2014_001/subject_01/population/4s_flatten/v1 \
-  --session 1test \
-  --device cpu \
-  --online-strategy both \
-  --output-dir runs/neuroonline/50m_subject01
-```
-
-`--online-strategy` 支持：
-
-```text
-none         只跑静态模型
-neuroonline  只跑 NeuroOnline
-both         静态模型和 NeuroOnline 各跑一遍，并自动计算 gain
-```
-
-该 evaluator 的协议是**固定的严格 4 秒 sequential trial protocol**：
-
-- source HDF5 trial 必须是 `[N,C,T]`；
-- 每个 source trial 必须恰好 **4 秒**；
-- Runtime Package 的输入窗口也必须是 **4 秒**；
-- HDF5 trial 顺序原样保留，**不 shuffle**；
-- `step_sec = 4s`，每个 source trial 只产生一次 prediction；
-- 不使用 `ReplayAcquirer`；
-- 不使用连续流拼接；
-- 不使用 `SlidingWindowDecoder`；
-- prediction 时 label 不可见；
-- prediction 完成后才提交该 trial 的真实标签，并检查是否触发 update；
-- `both` 模式下 static 和 NeuroOnline 会分别重新加载 Runtime Package，避免两条实验路径共享被更新过的模型状态。
-
-这比 `replay_offline.py` 更适合回答：
-
-> 在完全相同、严格按 trial 顺序的输入下，NeuroOnline 相比静态 Runtime Model 是否真正提升分类性能？
-
-常用附加参数：
-
-```bash
---max-trials 288
---block-size 32
---rolling-window 32
---print-every 32
-```
-
-其中：
-
-- `block-size`：summary 中分段统计的 trial 数；
-- `rolling-window`：逐 trial rolling bACC 的窗口；
-- `print-every`：终端每多少个 trial 打印一次进度。
-
-### 20.6 Sequential 输出怎么看
-
-默认输出目录：
-
-```text
-<project.run_dir>/neuroonline_sequential/<UTC timestamp>/
-```
-
-或通过 `--output-dir` 指定。
-
-输出：
-
-```text
-summary.json
-trial_predictions.csv
-trial_predictions.jsonl
-```
-
-`summary.json` 重点字段：
-
-```text
-static.metrics.overall
-static.metrics.warmup_predictions
-static.metrics.post_warmup
-static.metrics.after_first_update
-
-neuroonline.metrics.overall
-neuroonline.metrics.warmup_predictions
-neuroonline.metrics.post_warmup
-neuroonline.metrics.after_first_update
-
-neuroonline.updates
-gains
-identity_initialization_check
-```
-
-每个 metrics section 都包含：
-
-```text
-accuracy
-balanced_accuracy
-macro_f1
-confusion_matrix
-per_class
-```
-
-建议 NeuroOnline 实验至少同时报告：
-
-1. `overall`：整段 sequential session 的总体表现；
-2. `post_warmup`：warmup 结束后的表现；
-3. `after_first_update`：真正已经使用 NeuroOnline 更新后参数的 trial 表现；
-4. `gains.*.balanced_accuracy_gain`：相对 static 的 bACC 增益；
-5. update 次数、update latency 与每次 update 使用的样本数。
-
-`both` 模式还会检查 **第一次参数更新前 static 与 NeuroOnline prediction 是否一致**，用于验证 Generator 的 identity initialization / 新旧前向等价性。若这里不一致，应先排查实现，而不是直接解释后续 gain。
-
-### 20.7 汇总多个 NeuroOnline 实验
-
-多个模型 / 数据集跑完后，可把每个 sequential run 的 `summary.json` 汇总成宽表：
-
-```bash
-python scripts/summarize_neuroonline_gains.py \
-  --input 50m=runs/neuroonline/50m_subject01/summary.json \
-  --input labram=runs/neuroonline/labram_subject01/summary.json \
-  --input cbramod=runs/neuroonline/cbramod_subject01/summary.json \
-  --output runs/neuroonline/neuroonline_gains.csv
-```
-
-输出列包括 `overall`、`post_warmup`、`after_first_update` 三个阶段的：
-
-```text
-accuracy_gain
-balanced_accuracy_gain
-macro_f1_gain
-```
-
-后续迁移到 Workload / SEED 时，建议继续复用相同的 causal protocol 与 summary schema，但要注意：**当前 `evaluate_neuroonline_sequential.py` 将 `window_sec=4.0`、`step_sec=4.0` 固定在代码中**。如果新数据集使用 2 秒等其他 trial 长度，应先把 sequential evaluator 的窗口契约参数化，再接入新数据集；不要通过静默 padding、拼接或另写一套 NeuroOnline 逻辑绕过这一约束。
-
 
 ---
 
@@ -1181,35 +874,7 @@ python -m pytest -q \
   tests/test_probe_neuracle_runtime_inference.py
 ```
 
-### 21.4 NeuroOnline 专项
-
-```bash
-python -m pytest -q \
-  tests/test_neuroonline_forward.py \
-  tests/test_labram_online_features.py \
-  tests/test_cbramod_online_features.py \
-  tests/test_model_50m_online_features.py \
-  tests/test_model_50m_neuroonline_equivalence.py \
-  tests/test_model_50m_neuroonline_update.py \
-  tests/test_evaluate_neuroonline_sequential.py \
-  tests/test_model_50m_sequential_evaluation.py \
-  tests/test_replay_offline_cli.py \
-  tests/test_summarize_neuroonline_gains.py
-```
-
-重点验收：
-
-```text
-static path 与 NeuroOnline identity initialization 在第一次 update 前等价
-Backbone 保持冻结
-Generator + Head 可更新
-50M token_valid_mask 保留
-LaBraM / CBraMod online token path 可用
-sequential evaluator 严格保持 trial 顺序
-summary / gain 输出可复现
-```
-
-### 21.5 全量
+### 21.4 全量
 
 ```bash
 python -m pytest -q
@@ -1231,10 +896,7 @@ python -m pytest -q
 [ ] python -m pytest -q
 [ ] 50M Runtime Package 可导出并重新加载
 [ ] LaBraM Runtime Package 可导出并重新加载
-[ ] CBraMod Runtime Package 可导出并重新加载
 [ ] trial-aligned evaluator 可输出 Accuracy/BAcc/Macro-F1/Confusion Matrix
-[ ] NeuroOnline identity initialization 在第一次 update 前与 static path 等价
-[ ] NeuroOnline sequential `both` 可输出 static / neuroonline / gains
 [ ] CLI Replay 正常
 [ ] Streamlit Start / Stop / Restart 正常
 [ ] Stage 2B source/window/runtime inference 专项测试通过
@@ -1252,8 +914,7 @@ python -m pytest -q
 - Stage 2B 当前实时推理入口只允许 **50M**；LaBraM 尚未接入真实 JellyFish Probe；
 - Stage 2B 当前批准的 Runtime Gate 固定为 **4s / 1000Hz source → 4s / 100Hz 50M**；2s/3s 实时 Contract 尚需扩展；
 - Stage 1A 个体化目前只训练任务 Head；
-- NeuroOnline V1 当前是 **supervised online adaptation**：需要 prediction 后获得真实类别标签；不支持 reward-only / 伪标签；
-- NeuroOnline 当前已接入离线 Replay / sequential evaluator，但尚未接入 Stage 2B JellyFish 真设备闭环；
+- Rest-Tune 与 NeuroOnline 只有接口，尚未形成算法闭环；
 - Streamlit 当前仍以 HDF5 Replay 为主，不直接消费 JellyFish 实时 Source；
 - 实时 Trigger 当前进入窗口 metadata / prediction record，但任务级 Trigger code → class label 映射应由具体实验协议定义，不能在设备层硬编码；
 - macOS 上 LaBraM/宽 Linear Head 优先使用 CPU，当前环境下 MPS 可能不稳定；
@@ -1326,11 +987,11 @@ registries/**
 
 当前框架层已经进入相对稳定阶段。后续模型端优先：
 
-1. 继续优化 50M 在 BNCI2014_001 四分类运动想象上的 baseline；
-2. 使用统一 sequential protocol 稳定复现 50M / LaBraM / CBraMod 的 static vs NeuroOnline 结果；
-3. 将 Workload / SEED 接入同一 HDF5 trial contract，并复用现有 NeuroOnline evaluator；
-4. 比较不同数据集、模型上的 overall / post-warmup / after-first-update gain 与 update latency；
-5. 将 NeuroOnline 从离线/伪实时验证推进到 Stage 2B 真设备 feedback 闭环；
+1. 固定 50M / LaBraM baseline；
+2. 接入 CBraMod；
+3. 比较 2s / 3s / 4s 窗口下的 BAcc、Macro-F1、prepare latency、inference P50/P95；
+4. 选择单被试 Demo 主模型与窗口长度；
+5. 实现 NeuroOnline v0；
 6. 再推进 Rest-Tune 与 Rest-Tune + NeuroOnline。
 
 设备端继续负责 JellyFish、数据连续性、时间戳与 Trigger；模型端从 `RealtimeWindow / RawEEGWindow` 之后负责窗口配置、Runtime、模型、适配与评估。

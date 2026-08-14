@@ -12,6 +12,8 @@ _EXPORTS = {
     "EEGHDF5": (".hdf5_dataset", "EEGHDF5"),
     "HDF5Metadata": (".hdf5_dataset", "HDF5Metadata"),
     "write_hdf5": (".hdf5_dataset", "write_hdf5"),
+    "WorkloadHDF5": (".workload", "WorkloadHDF5"),
+    "prepare_workload_subject": (".workload", "prepare_workload_subject"),
     "NeuracleBDFReader": (".neuracle_bdf", "NeuracleBDFReader"),
     "annotations_to_events": (".neuracle_bdf", "annotations_to_events"),
     "parse_neuracle_marker": (".neuracle_bdf", "parse_neuracle_marker"),

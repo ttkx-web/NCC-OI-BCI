@@ -35,7 +35,13 @@ export default function LivePage() {
 
   useEffect(() => {
     consoleApi.models().then(items => {
-      const verified = items.filter(item => item.runtime_verified && ["model_50m", "labram", "cbramod"].includes(item.model_type));
+      const verified = items.filter(item =>
+        item.runtime_verified
+        && item.live_verified
+        && item.window_sec === 4
+        && item.step_sec === 0.5
+        && ["model_50m", "labram", "cbramod"].includes(item.model_type)
+      );
       setModels(verified); setModelId(verified[0]?.id ?? "");
     }).catch(value => setError(value instanceof Error ? value.message : "无法读取模型"));
     return () => socket.current?.close();

@@ -152,6 +152,8 @@ class RunService:
         model = self.models.get_entry(request.model_id)
         if not model.summary.runtime_verified:
             raise ValueError("Selected Runtime Package has not passed runtime verification")
+        if not model.summary.live_verified:
+            raise ValueError("Selected Runtime Package is not approved for formal Live")
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         record = RunRecord(id=run_id, request=request, created_at=time.time(), run_type="live")
         record.broker.publish(state_event(run_id, RunState.STARTING.value))

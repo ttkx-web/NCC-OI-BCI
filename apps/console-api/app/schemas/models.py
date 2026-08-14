@@ -17,6 +17,7 @@ class ModelSummary(ConsoleModel):
     target_channels: int
     schema_version: int
     runtime_verified: bool
+    live_verified: bool
     package_version: str
     balanced_accuracy: float | None = None
     macro_f1: float | None = None

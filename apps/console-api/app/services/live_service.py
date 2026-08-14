@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -21,6 +22,29 @@ from app.schemas.events import (
     window_event,
 )
 from app.schemas.runs import RunState
+from app.config import Settings, settings
+
+
+PUBLIC_DEVICE_HEALTH_FIELDS = frozenset({
+    "state",
+    "connected",
+    "metadata_ready",
+    "channel_count",
+    "sampling_rate",
+    "received_packets",
+    "malformed_packets",
+    "missing_packets",
+    "duplicate_packets",
+    "out_of_order_packets",
+    "reconnect_count",
+    "last_packet_age_sec",
+    "stream_unit",
+    "eeg_unit",
+    "unit_evidence_level",
+    "raw_model_safe",
+    "eeg_model_safe",
+    "model_safe",
+})
 
 
 class LiveRuntimeController:
@@ -37,10 +61,12 @@ class LiveRuntimeController:
         model: Any,
         *,
         source_factory: Callable[[], Any] | None = None,
+        console_settings: Settings | None = None,
     ) -> None:
         self.record = record
         self.model = model
         self.source_factory = source_factory
+        self.settings = console_settings or settings
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._source: Any | None = None
@@ -97,7 +123,36 @@ class LiveRuntimeController:
 
     def _source_health(self) -> dict[str, object]:
         health = self._source.health() if self._source is not None else {}
-        return dict(health) if isinstance(health, Mapping) else {}
+        if not isinstance(health, Mapping):
+            return {}
+        return {key: health[key] for key in PUBLIC_DEVICE_HEALTH_FIELDS if key in health}
+
+    def _create_source(self) -> Any:
+        if self.source_factory is not None:
+            return self.source_factory()
+        from bci_dayloop.realtime.neuracle_jellyfish import (
+            NeuracleJellyFishConfig,
+            NeuracleJellyFishSource,
+        )
+
+        return NeuracleJellyFishSource(NeuracleJellyFishConfig(
+            host=self.settings.neuracle_jellyfish_host,
+            port=self.settings.neuracle_jellyfish_port,
+            expected_sampling_rate=1000.0,
+        ))
+
+    def _connect_source(self, package: Any) -> bool:
+        try:
+            self._source = self._create_source()
+            self._source.connect()
+        except Exception:
+            self._block(
+                package,
+                code="DEVICE_UNREACHABLE",
+                message="JellyFish 服务不可达，预测已阻断",
+            )
+            return False
+        return True
 
     @staticmethod
     def _health_failure(health: Mapping[str, object]) -> tuple[str, str] | None:
@@ -122,10 +177,6 @@ class LiveRuntimeController:
 
             from bci_dayloop.packages.loader import load_runtime_package
             from bci_dayloop.realtime.channel_units import select_verified_eeg_channels
-            from bci_dayloop.realtime.neuracle_jellyfish import (
-                NeuracleJellyFishConfig,
-                NeuracleJellyFishSource,
-            )
             from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline
             from bci_dayloop.realtime.runtime_bridge import RealtimeRuntimeBridge
             from bci_dayloop.realtime.runtime_policy import RealtimeModelPolicyRegistry
@@ -134,14 +185,16 @@ class LiveRuntimeController:
             if device == "cuda" and not torch.cuda.is_available():
                 raise RuntimeError("CUDA is unavailable")
             package = load_runtime_package(self.model.package_path, device=device, verify_hashes=True)
+            if not math.isclose(package.window_sec, 4.0, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("Live Runtime Package window_sec must be exactly 4.0")
+            if not math.isclose(package.step_sec, 0.5, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("Live Runtime Package step_sec must be exactly 0.5")
             policy = RealtimeModelPolicyRegistry.create(package)
             pipeline = RealtimeEEGWindowPipeline.from_runtime_input_contract(package.runtime_model.input_contract)
             bridge = RealtimeRuntimeBridge(package.runtime_model, policy=policy)
             self._emit_contract(package, safe=False, reason="等待首个通过审计的模型输入窗口")
-            self._source = self.source_factory() if self.source_factory else NeuracleJellyFishSource(
-                NeuracleJellyFishConfig(expected_sampling_rate=1000.0)
-            )
-            self._source.connect()
+            if not self._connect_source(package):
+                return
             health = self._source_health()
             self.record.broker.publish(device_health_event(self.record.id, health=health))
             failure = self._health_failure(health)

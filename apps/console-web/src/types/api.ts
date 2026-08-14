@@ -21,6 +21,7 @@ export interface ModelSummary {
   target_channels: number;
   schema_version: number;
   runtime_verified: boolean;
+  live_verified: boolean;
   package_version: string;
   balanced_accuracy: number | null;
   macro_f1: number | null;

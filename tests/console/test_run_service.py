@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.schemas.events import state_event
-from app.schemas.runs import ReplayCreate, RunState
+from app.schemas.runs import LiveCreate, ReplayCreate, RunState
 from app.services.dataset_service import DatasetRegistry
 from app.services.model_service import ModelRegistry
 from app.services.run_service import RunService
@@ -83,3 +83,19 @@ def test_replay_rejects_invalid_model(runtime_package: Path, dataset_file: Path)
     service, _ = _service(runtime_package, dataset_file)
     with pytest.raises(LookupError):
         service.create_replay(_request("model_missing"))
+
+
+def test_live_rejects_runtime_package_without_formal_live_verification(
+    runtime_package: Path,
+    dataset_file: Path,
+) -> None:
+    models = ModelRegistry(
+        [runtime_package.parents[3]],
+        runtime_verifier=lambda _path: True,
+        live_verifier=lambda _path: False,
+    )
+    model_id = models.list()[0].id
+    service = RunService(DatasetRegistry(dataset_file.parents[2]), models)
+
+    with pytest.raises(ValueError, match="not approved for formal Live"):
+        service.create_live(LiveCreate(model_id=model_id, compute_device="cpu"))

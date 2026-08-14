@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, Iterable
 import yaml
 
 from bci_dayloop.packages.loader import load_runtime_package
+from bci_dayloop.realtime.runtime_policy import RealtimeModelPolicyRegistry
 
 from app.schemas.models import ModelSummary
 
@@ -19,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_RUNTIME_TYPES = {"model_50m", "labram", "cbramod"}
 DISPLAY_NAMES = {"model_50m": "50M", "labram": "LaBraM", "cbramod": "CBraMod"}
+FORMAL_LIVE_WINDOW_SEC = 4.0
+FORMAL_LIVE_STEP_SEC = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,11 +76,19 @@ def _safe_file(package_path: Path, value: Any) -> Path:
 
 
 class ModelRegistry:
-    def __init__(self, roots: Iterable[Path], *, runtime_verifier: Any | None = None) -> None:
+    def __init__(
+        self,
+        roots: Iterable[Path],
+        *,
+        runtime_verifier: Any | None = None,
+        live_verifier: Any | None = None,
+    ) -> None:
         self.roots = tuple(Path(root).resolve() for root in roots)
         self._entries: dict[str, ModelEntry] = {}
         self._runtime_verifier = runtime_verifier or self._verify_runtime
+        self._live_verifier = live_verifier or self._verify_live
         self._verification_cache: dict[Path, bool] = {}
+        self._live_verification_cache: dict[Path, bool] = {}
 
     def _diagnostic_path(self, path: Path) -> str:
         for root in self.roots:
@@ -110,6 +122,31 @@ class ModelRegistry:
         else:
             verified = True
         self._verification_cache[package_path] = verified
+        return verified
+
+    def _verify_live(self, package_path: Path) -> bool:
+        """Verify realtime compatibility with the sole loader and policy registry."""
+        cached = self._live_verification_cache.get(package_path)
+        if cached is not None:
+            return cached
+        try:
+            package = load_runtime_package(package_path, device="cpu", verify_hashes=True)
+            if not math.isclose(package.window_sec, FORMAL_LIVE_WINDOW_SEC, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("Live Runtime Package window_sec must be exactly 4.0")
+            if not math.isclose(package.step_sec, FORMAL_LIVE_STEP_SEC, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("Live Runtime Package step_sec must be exactly 0.5")
+            RealtimeModelPolicyRegistry.create(package)
+        except Exception as error:
+            logger.info(
+                "runtime package is not eligible for formal Live package=%s reason=%s: %s",
+                self._diagnostic_path(package_path),
+                type(error).__name__,
+                self._diagnostic_reason(error),
+            )
+            verified = False
+        else:
+            verified = True
+        self._live_verification_cache[package_path] = verified
         return verified
 
     def refresh(self) -> None:
@@ -165,6 +202,11 @@ class ModelRegistry:
         if not isinstance(channel_names, list) or not channel_names or not isinstance(class_names, list) or not class_names:
             raise ValueError("Runtime Package channel and class contracts are required")
         subject_id = _subject_id(package_path, offline)
+        runtime_verified = model_type in SUPPORTED_RUNTIME_TYPES and bool(self._runtime_verifier(package_path))
+        formal_live_contract = (
+            math.isclose(float(contract["window_sec"]), FORMAL_LIVE_WINDOW_SEC, rel_tol=0.0, abs_tol=1e-9)
+            and math.isclose(float(runtime.get("step_sec", 0.5)), FORMAL_LIVE_STEP_SEC, rel_tol=0.0, abs_tol=1e-9)
+        )
         summary = ModelSummary(
             id=model_id,
             model_name=DISPLAY_NAMES.get(model_type, str(model.get("name", model_type))),
@@ -178,7 +220,12 @@ class ModelRegistry:
             sample_rate=float(contract["sample_rate"]),
             target_channels=len(channel_names),
             schema_version=2,
-            runtime_verified=(model_type in SUPPORTED_RUNTIME_TYPES and bool(self._runtime_verifier(package_path))),
+            runtime_verified=runtime_verified,
+            live_verified=(
+                runtime_verified
+                and formal_live_contract
+                and bool(self._live_verifier(package_path))
+            ),
             package_version=version,
             balanced_accuracy=_metric(metrics, "balanced_accuracy"),
             macro_f1=_metric(metrics, "macro_f1"),

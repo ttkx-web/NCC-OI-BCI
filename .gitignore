@@ -32,6 +32,7 @@ node_modules/
 .next/
 out/
 .env.local
+apps/console-web/next-env.d.ts
 
 .venv/
 venv/

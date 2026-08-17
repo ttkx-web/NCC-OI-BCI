@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Train a Stage-1 LOSO population linear head on BNCI2014_001.
+Train a Stage-1 LOSO population classification head on BNCI2014_001.
 
 Protocol
 --------
@@ -26,7 +26,7 @@ windows by concatenating trials only within the same:
 
 It never concatenates trials across subjects, sessions, or labels.
 
-The 50M backbone is frozen. Only the linear classification head is trained.
+The 50M backbone is frozen. Only the configured classification head is trained.
 """
 
 import argparse
@@ -60,7 +60,7 @@ from bci_dayloop.models.model_50m.config import (
 )
 
 # Reuse the already validated Stage-0.5 preprocessing, window construction,
-# frozen-feature extraction, and linear-head training helpers.
+# frozen-feature extraction, and classification-head training helpers.
 from train_50m_linear_head import (
     EpochMetrics,
     WindowSet,
@@ -866,7 +866,7 @@ def save_population_feature_cache(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a frozen-50M LOSO population linear head on "
+            "Train a frozen-50M LOSO population classification head on "
             "multi-subject BNCI2014_001 HDF5 files."
         )
     )
@@ -1020,6 +1020,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--head-batch-size", type=int, default=32)
     parser.add_argument("--head-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--head-type",
+        choices=("linear", "mlp"),
+        default="linear",
+        help="Classification head architecture. Default keeps the existing Linear Probe.",
+    )
+    parser.add_argument(
+        "--head-hidden-dim",
+        type=int,
+        default=512,
+        help="Hidden dimension for --head-type mlp.",
+    )
+    parser.add_argument(
+        "--head-dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability for --head-type mlp.",
+    )
+    parser.add_argument(
+        "--head-norm",
+        choices=("none", "layernorm", "batchnorm"),
+        default="none",
+        help="Input normalization for --head-type mlp.",
+    )
     parser.add_argument("--momentum", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=15)
@@ -1065,6 +1089,14 @@ def main() -> None:
         raise ValueError("--epochs must be positive.")
     if args.head_batch_size <= 0 or args.feature_batch_size <= 0:
         raise ValueError("Batch sizes must be positive.")
+    if args.head_hidden_dim <= 0:
+        raise ValueError("--head-hidden-dim must be positive.")
+    if not 0.0 <= args.head_dropout < 1.0:
+        raise ValueError("--head-dropout must be in [0, 1).")
+    if args.head_type == "linear" and args.head_norm != "none":
+        raise ValueError("--head-norm is only supported with --head-type mlp.")
+    if args.head_type == "linear" and args.head_dropout != 0.0:
+        raise ValueError("--head-dropout is only supported with --head-type mlp.")
     if args.patience < 0:
         raise ValueError("--patience must be >= 0.")
     if args.feature_log_every <= 0:
@@ -1330,6 +1362,10 @@ def main() -> None:
         aggregation=args.aggregation,
         num_classes=num_classes,
         model_n_time_patches=args.model_n_time_patches,
+        head_type=args.head_type,
+        head_hidden_dim=args.head_hidden_dim,
+        head_dropout=args.head_dropout,
+        head_norm=args.head_norm,
     )
 
     preprocessing_contract = {
@@ -1372,6 +1408,12 @@ def main() -> None:
     print("  output layer idx:", config.output_layer_idx)
     print("  aggregation:", config.aggregation)
     print("  classifier input dim:", config.classifier_input_dim)
+    print("  backbone frozen:", True)
+    print("  head type:", config.head_type)
+    if config.head_type == "mlp":
+        print("  head hidden dim:", config.head_hidden_dim)
+        print("  head norm:", config.head_norm)
+        print("  head dropout:", config.head_dropout)
     print("  preprocessing hash:", preprocessing_hash)
     print()
 
@@ -1455,10 +1497,24 @@ def main() -> None:
             preprocessing_hash=preprocessing_hash,
         )
 
+    head_train_batch_size = min(args.head_batch_size, len(train_features))
+    if (
+        config.head_type == "mlp"
+        and config.head_norm == "batchnorm"
+        and (
+            head_train_batch_size < 2
+            or len(train_features) % head_train_batch_size == 1
+        )
+    ):
+        raise ValueError(
+            "MLP BatchNorm requires every training batch to contain at least "
+            "two samples. Adjust --head-batch-size or the training split."
+        )
+
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_features,
-        batch_size=min(args.head_batch_size, len(train_features)),
+        batch_size=head_train_batch_size,
         shuffle=True,
         generator=generator,
         num_workers=0,
@@ -1475,7 +1531,7 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Train only the linear head.
+    # Train only the configured classification head.
     # ------------------------------------------------------------------
 
     optimizer = torch.optim.AdamW(
@@ -1483,6 +1539,20 @@ def main() -> None:
         lr=args.head_lr,
         weight_decay=args.weight_decay,
     )
+    backbone_parameter_ids = {id(parameter) for parameter in backbone.parameters()}
+    head_parameters = list(classifier.head.parameters())
+    head_parameter_ids = {id(parameter) for parameter in head_parameters}
+    optimizer_parameter_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    if not head_parameter_ids or optimizer_parameter_ids != head_parameter_ids:
+        raise RuntimeError("Optimizer parameters must be exactly the classification head.")
+    if backbone_parameter_ids & optimizer_parameter_ids:
+        raise RuntimeError("Frozen backbone parameters were added to the optimizer.")
+    if any(not parameter.requires_grad for parameter in head_parameters):
+        raise RuntimeError("Classification head parameters must require gradients.")
     criterion = nn.CrossEntropyLoss()
 
     best_value = (
@@ -1498,12 +1568,19 @@ def main() -> None:
 
     training_start = time.perf_counter()
 
-    print("Training population linear head with AdamW")
+    print("Training population classification head with AdamW")
     print(
         f"epochs={args.epochs}, lr={args.head_lr}, "
         f"momentum={args.momentum}, "
         f"weight_decay={args.weight_decay}, "
         f"best_metric={args.metric_for_best}"
+    )
+    print(
+        f"head_type={config.head_type}, "
+        f"head_hidden_dim={config.head_hidden_dim}, "
+        f"head_norm={config.head_norm}, "
+        f"head_dropout={config.head_dropout}, "
+        f"head_trainable_parameters={sum(parameter.numel() for parameter in head_parameters)}"
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -1722,7 +1799,11 @@ def main() -> None:
         extra_metadata={
             "task": "BNCI2014_001_motor_imagery",
             "dataset": metadata.dataset_name,
-            "mode": "population_loso_linear_probe",
+            "mode": (
+                "population_loso_linear_probe"
+                if config.head_type == "linear"
+                else "population_loso_mlp_head"
+            ),
             "stage": "stage1",
             "target_subject": target_subject,
             "excluded_subjects": [target_subject],
@@ -1741,6 +1822,13 @@ def main() -> None:
             "preprocessing_hash": preprocessing_hash,
             "freeze_backbone": True,
             "trainable_backbone_parameters": 0,
+            "head_type": config.head_type,
+            "head_hidden_dim": int(config.head_hidden_dim),
+            "head_dropout": float(config.head_dropout),
+            "head_norm": config.head_norm,
+            "head_trainable_parameters": sum(
+                parameter.numel() for parameter in classifier.head.parameters()
+            ),
             "optimizer": "AdamW",
             "head_lr": float(args.head_lr),
             "momentum": float(args.momentum),
@@ -1781,7 +1869,11 @@ def main() -> None:
     report = {
         "status": "completed",
         "stage": "stage1",
-        "experiment": "population_loso_linear_probe",
+        "experiment": (
+            "population_loso_linear_probe"
+            if config.head_type == "linear"
+            else "population_loso_mlp_head"
+        ),
         "warning": (
             "Temporary 10-second baseline: each derived window contains one "
             "subject, one session, and one class, but may cross original "
@@ -1862,6 +1954,10 @@ def main() -> None:
             "output_layer_idx": config.output_layer_idx,
             "aggregation": config.aggregation,
             "classifier_input_dim": config.classifier_input_dim,
+            "head_type": config.head_type,
+            "head_hidden_dim": config.head_hidden_dim,
+            "head_dropout": config.head_dropout,
+            "head_norm": config.head_norm,
             "feature_cache_dtype": args.feature_cache_dtype,
             "preprocessing_contract": preprocessing_contract,
             "preprocessing_hash": preprocessing_hash,
@@ -1874,6 +1970,10 @@ def main() -> None:
             "best_epoch": best_epoch,
             "metric_for_best": args.metric_for_best,
             "head_lr": args.head_lr,
+            "head_type": config.head_type,
+            "head_hidden_dim": config.head_hidden_dim,
+            "head_dropout": config.head_dropout,
+            "head_norm": config.head_norm,
             "momentum": args.momentum,
             "weight_decay": args.weight_decay,
             "patience": args.patience,
@@ -1904,6 +2004,13 @@ def main() -> None:
         "unseen_target_final_test": target_metrics.to_dict(),
         "classifier_checkpoint": str(saved_path),
         "report": str(report_path),
+        "head_type": config.head_type,
+        "head_hidden_dim": config.head_hidden_dim,
+        "head_dropout": config.head_dropout,
+        "head_norm": config.head_norm,
+        "head_lr": args.head_lr,
+        "weight_decay": args.weight_decay,
+        "seed": args.seed,
     }
     atomic_write_json(run_dir / "summary.json", summary)
 

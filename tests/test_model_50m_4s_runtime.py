@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 
 from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
@@ -21,7 +22,14 @@ def _checkpoint_files(tmp_path: Path) -> tuple[Path, Path]:
     backbone = tmp_path / "model_deploy.pt"
     classifier = tmp_path / "head.pt"
     backbone.write_bytes(b"backbone")
-    classifier.write_bytes(b"classifier")
+    torch.save(
+        {
+            "format_version": 1,
+            "head_state_dict": {},
+            "metadata": {},
+        },
+        classifier,
+    )
     return backbone, classifier
 
 
@@ -160,7 +168,10 @@ def test_build_runtime_requires_existing_checkpoint_files(
     tmp_path: Path,
 ) -> None:
     existing = tmp_path / "existing.pt"
-    existing.write_bytes(b"x")
+    torch.save(
+        {"format_version": 1, "head_state_dict": {}, "metadata": {}},
+        existing,
+    )
 
     with pytest.raises(
         FileNotFoundError,
@@ -192,6 +203,57 @@ def test_build_runtime_requires_existing_checkpoint_files(
             model_n_time_patches=10,
         )
 
+
+def test_build_runtime_infers_mlp_head_from_checkpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backbone, classifier = _checkpoint_files(tmp_path)
+    torch.save(
+        {
+            "format_version": 2,
+            "head_state_dict": {},
+            "metadata": {
+                "head_type": "mlp",
+                "head_hidden_dim": 32,
+                "head_dropout": 0.2,
+                "head_norm": "layernorm",
+            },
+        },
+        classifier,
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeAdapter:
+        def __init__(self, *, config: Model50MConfig, **kwargs: Any) -> None:
+            captured["config"] = config
+
+    class FakePreprocessor:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["preprocessor"] = kwargs
+
+    monkeypatch.setattr(runtime_module, "Model50MAdapter", FakeAdapter)
+    monkeypatch.setattr(runtime_module, "Model50MPipelinePreprocessor", FakePreprocessor)
+
+    runtime = runtime_module.build_50m_runtime(
+        checkpoint_path=backbone,
+        classifier_path=classifier,
+        channel_names=("C3",),
+        sample_rate=250.0,
+        input_unit="uV",
+        class_names=CLASS_NAMES,
+        target_sample_rate=100.0,
+        window_seconds=4.0,
+        patch_seconds=1.0,
+        patch_stride_seconds=1.0,
+        output_layer_idx=8,
+        aggregation="flatten",
+    )
+
+    assert runtime.config.head_type == "mlp"
+    assert runtime.config.head_hidden_dim == 32
+    assert runtime.config.head_dropout == 0.2
+    assert runtime.config.head_norm == "layernorm"
 
 def test_build_runtime_from_metadata_forwards_4s_contract(
     monkeypatch: pytest.MonkeyPatch,

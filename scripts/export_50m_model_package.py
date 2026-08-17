@@ -19,6 +19,9 @@ from bci_dayloop.data.hdf5_dataset import EEGHDF5
 from bci_dayloop.models.model_50m.runtime import (
     build_50m_runtime_from_metadata,
 )
+from bci_dayloop.models.model_50m.classifier import (
+    classifier_head_config_from_metadata,
+)
 from bci_dayloop.utils.config import dump_json, dump_yaml, load_yaml
 from bci_dayloop.packages.exporter import (
     export_50m_runtime_package,
@@ -527,6 +530,7 @@ def main() -> None:
         raise TypeError(
             "Classifier metadata must be a dictionary."
         )
+    head_config = classifier_head_config_from_metadata(classifier_metadata)
 
     dataset = EEGHDF5(data_path)
     metadata = dataset.metadata
@@ -551,6 +555,7 @@ def main() -> None:
     print("data:", data_path)
     print("checkpoint:", checkpoint_path)
     print("classifier:", classifier_path)
+    print("head architecture:", head_config)
     print("output:", output_path)
     print("class_names:", class_names)
     print("command_map:", command_map)
@@ -587,6 +592,10 @@ def main() -> None:
             aggregation=str(
                 classifier_metadata["aggregation"]
             ),
+            head_type=head_config["head_type"],
+            head_hidden_dim=head_config["head_hidden_dim"],
+            head_dropout=head_config["head_dropout"],
+            head_norm=head_config["head_norm"],
         )
 
         saved_package = export_50m_runtime_package(
@@ -665,6 +674,7 @@ def main() -> None:
             "checkpoint_sha256": sha256_file(checkpoint_path),
             "classifier_path": str(classifier_path),
             "classifier_sha256": sha256_file(classifier_path),
+            "head": head_config,
             "class_names": list(class_names),
             "label_map": label_map,
             "command_map": command_map,

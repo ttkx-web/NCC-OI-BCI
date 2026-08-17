@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import parametrize
 
 from bci_dayloop.models.model_50m.backbone import Model50MBackbone
 from bci_dayloop.models.model_50m.classifier import (
@@ -14,9 +15,14 @@ from bci_dayloop.models.model_50m.classifier import (
 )
 from bci_dayloop.models.model_50m.config import Model50MConfig
 from bci_dayloop.models.model_50m.finetuning import (
+    resolve_backbone_adaptation,
     resolve_embedding_layer,
     resolve_trainable_block_indices,
     uses_frozen_feature_cache,
+)
+from bci_dayloop.models.model_50m.lora import (
+    inject_lora_adapters,
+    lora_state_dict,
 )
 from bci_dayloop.models.model_50m.tokenization import Model50MBatchedInput
 
@@ -123,6 +129,26 @@ def test_feature_cache_is_only_allowed_for_frozen_backbone() -> None:
     assert not uses_frozen_feature_cache(unfreeze_last_n_blocks=1)
 
 
+def test_legacy_adaptation_resolution_preserves_frozen_and_partial_modes() -> None:
+    assert resolve_backbone_adaptation(
+        requested=None,
+        unfreeze_last_n_blocks=0,
+    ) == "frozen"
+    assert resolve_backbone_adaptation(
+        requested=None,
+        unfreeze_last_n_blocks=2,
+    ) == "partial"
+    assert resolve_backbone_adaptation(
+        requested="lora",
+        unfreeze_last_n_blocks=0,
+    ) == "lora"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        resolve_backbone_adaptation(
+            requested="lora",
+            unfreeze_last_n_blocks=1,
+        )
+
+
 def test_frozen_baseline_keeps_all_backbone_parameters_frozen() -> None:
     classifier = make_classifier()
     classifier.backbone.set_trainable_encoder_blocks(())
@@ -205,6 +231,152 @@ def test_partial_finetune_checkpoint_restores_backbone_and_head(
     torch.manual_seed(9)
     restored = make_classifier()
     restored.backbone.set_trainable_encoder_blocks((2,))
+    load_classifier_checkpoint(restored, path, strict_metadata=True)
+    restored.eval()
+    torch.testing.assert_close(restored(make_batch()), expected_logits)
+
+
+def test_lora_initial_injection_is_an_exact_identity() -> None:
+    torch.manual_seed(11)
+    classifier = make_classifier()
+    classifier.eval()
+    baseline = classifier(make_batch()).detach()
+
+    report = inject_lora_adapters(
+        classifier.backbone,
+        block_indices=(1, 2),
+        target_modules=("q", "v"),
+        rank=2,
+        alpha=4.0,
+        dropout=0.0,
+    )
+    classifier.eval()
+
+    assert report.block_indices == (1, 2)
+    torch.testing.assert_close(classifier(make_batch()), baseline, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("last_n_blocks", "expected_blocks"),
+    [(1, {8}), (2, {7, 8})],
+)
+def test_lora_selects_effective_blocks_before_embedding_layer(
+    last_n_blocks: int,
+    expected_blocks: set[int],
+) -> None:
+    config = make_config()
+    config = Model50MConfig(
+        **{
+            **{
+                field: getattr(config, field)
+                for field in config.__dataclass_fields__
+            },
+            "depth": 12,
+            "output_layer_idx": 8,
+        }
+    )
+    backbone = Model50MBackbone(config=config, load_checkpoint=False, freeze=True)
+    selected = resolve_trainable_block_indices(
+        embedding_layer=9,
+        unfreeze_last_n_blocks=last_n_blocks,
+    )
+    inject_lora_adapters(
+        backbone,
+        block_indices=selected,
+        target_modules=("q", "v"),
+        rank=2,
+        alpha=4.0,
+        dropout=0.0,
+    )
+
+    for index, layer in enumerate(backbone.model.encoder.encoder.layers):
+        injected = parametrize.is_parametrized(layer.self_attn, "in_proj_weight")
+        assert injected is (index in expected_blocks)
+
+
+def test_lora_only_adapters_and_head_receive_gradients() -> None:
+    classifier = make_classifier()
+    report = inject_lora_adapters(
+        classifier.backbone,
+        block_indices=(1, 2),
+        target_modules=("q", "v"),
+        rank=2,
+        alpha=4.0,
+        dropout=0.0,
+    )
+    classifier.train()
+    loss = F.cross_entropy(classifier(make_batch()), torch.tensor([0, 1]))
+    loss.backward()
+
+    assert all(
+        not parameter.requires_grad
+        for name, parameter in classifier.backbone.model.named_parameters()
+        if ".lora_" not in name
+    )
+    assert all(
+        parameter.requires_grad
+        for adapter in report.adapter_modules
+        for parameter in adapter.parameters()
+    )
+    assert any(
+        parameter.grad is not None
+        for adapter in report.adapter_modules
+        for parameter in adapter.parameters()
+    )
+    assert any(parameter.grad is not None for parameter in classifier.head.parameters())
+
+
+def test_lora_checkpoint_restores_adapters_and_head(tmp_path: Path) -> None:
+    torch.manual_seed(17)
+    source = make_classifier()
+    base_state = {
+        key: value.detach().clone()
+        for key, value in source.backbone.model.state_dict().items()
+    }
+    report = inject_lora_adapters(
+        source.backbone,
+        block_indices=(2,),
+        target_modules=("q", "v"),
+        rank=2,
+        alpha=4.0,
+        dropout=0.0,
+    )
+    source.train()
+    optimizer = torch.optim.AdamW(
+        list(source.head.parameters())
+        + [
+            parameter
+            for adapter in report.adapter_modules
+            for parameter in adapter.parameters()
+        ],
+        lr=1e-2,
+    )
+    optimizer.zero_grad()
+    F.cross_entropy(source(make_batch()), torch.tensor([0, 1])).backward()
+    optimizer.step()
+    source.eval()
+    expected_logits = source(make_batch()).detach()
+
+    path = save_classifier_checkpoint(
+        source,
+        tmp_path / "lora.pt",
+        extra_metadata={
+            "backbone_adaptation": "lora",
+            "lora_block_indices": [2],
+            "lora_target_modules": ["q", "v"],
+            "lora_rank": 2,
+            "lora_alpha": 4.0,
+            "lora_dropout": 0.0,
+        },
+        lora_state_dict=lora_state_dict(source.backbone.model),
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    assert payload["format_version"] == 4
+    assert set(payload["lora_state_dict"]) == set(lora_state_dict(source.backbone.model))
+
+    torch.manual_seed(19)
+    restored = make_classifier()
+    restored.backbone.model.load_state_dict(base_state, strict=True)
     load_classifier_checkpoint(restored, path, strict_metadata=True)
     restored.eval()
     torch.testing.assert_close(restored(make_batch()), expected_logits)

@@ -59,9 +59,16 @@ from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
 )
 from bci_dayloop.models.model_50m.finetuning import (
+    resolve_backbone_adaptation,
     resolve_embedding_layer,
     resolve_trainable_block_indices,
     uses_frozen_feature_cache,
+)
+from bci_dayloop.models.model_50m.lora import (
+    inject_lora_adapters,
+    lora_state_dict,
+    load_lora_state_dict,
+    normalize_lora_target_modules,
 )
 from bci_dayloop.models.model_50m.preprocessing import Model50MPreprocessor
 from bci_dayloop.models.model_50m.tokenization import (
@@ -1195,6 +1202,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--backbone-adaptation",
+        choices=("frozen", "partial", "lora"),
+        default=None,
+        help=(
+            "Backbone adaptation regime. When omitted, legacy "
+            "--unfreeze-last-n-blocks behavior is preserved."
+        ),
+    )
+    parser.add_argument(
         "--unfreeze-last-n-blocks",
         type=int,
         default=0,
@@ -1212,6 +1228,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "number such as 9."
         ),
     )
+    parser.add_argument(
+        "--lora-last-n-blocks",
+        type=int,
+        default=2,
+        help="Effective blocks ending at the embedding layer for LoRA.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        nargs="+",
+        default=("q", "v"),
+        help=(
+            "Fused attention projection slices for LoRA. The 50M backbone "
+            "supports q, k, and v; default: q v."
+        ),
+    )
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--lora-lr", type=float, default=5e-4)
     parser.add_argument(
         "--head-type",
         choices=("linear", "mlp"),
@@ -1293,6 +1328,17 @@ def main() -> None:
         raise ValueError("--backbone-lr must be positive.")
     if args.unfreeze_last_n_blocks < 0:
         raise ValueError("--unfreeze-last-n-blocks must be >= 0.")
+    if args.lora_last_n_blocks < 1:
+        raise ValueError("--lora-last-n-blocks must be >= 1.")
+    if args.lora_rank <= 0:
+        raise ValueError("--lora-rank must be positive.")
+    if args.lora_alpha <= 0:
+        raise ValueError("--lora-alpha must be positive.")
+    if not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError("--lora-dropout must be in [0, 1).")
+    if args.lora_lr <= 0:
+        raise ValueError("--lora-lr must be positive.")
+    normalize_lora_target_modules(args.lora_target_modules)
     if args.patience < 0:
         raise ValueError("--patience must be >= 0.")
     if args.feature_log_every <= 0:
@@ -1576,13 +1622,31 @@ def main() -> None:
             config,
             output_layer_idx=embedding_layer - 1,
         )
-    trainable_block_indices = resolve_trainable_block_indices(
-        embedding_layer=embedding_layer,
+    backbone_adaptation = resolve_backbone_adaptation(
+        requested=args.backbone_adaptation,
         unfreeze_last_n_blocks=args.unfreeze_last_n_blocks,
     )
-    partial_finetuning_enabled = bool(trainable_block_indices)
+    partial_finetuning_enabled = backbone_adaptation == "partial"
+    lora_enabled = backbone_adaptation == "lora"
+    requires_live_backbone_forward = (
+        partial_finetuning_enabled or lora_enabled
+    )
+    if partial_finetuning_enabled:
+        trainable_block_indices = resolve_trainable_block_indices(
+            embedding_layer=embedding_layer,
+            unfreeze_last_n_blocks=args.unfreeze_last_n_blocks,
+        )
+    elif lora_enabled:
+        trainable_block_indices = resolve_trainable_block_indices(
+            embedding_layer=embedding_layer,
+            unfreeze_last_n_blocks=args.lora_last_n_blocks,
+        )
+    else:
+        trainable_block_indices = ()
     feature_cache_enabled = uses_frozen_feature_cache(
-        unfreeze_last_n_blocks=args.unfreeze_last_n_blocks,
+        unfreeze_last_n_blocks=(
+            0 if backbone_adaptation == "frozen" else 1
+        ),
     )
 
     preprocessing_contract = {
@@ -1626,7 +1690,15 @@ def main() -> None:
     print("  embedding layer requested:", args.embedding_layer)
     print("  embedding layer resolved (1-based):", embedding_layer)
     print("  embedding layer internal index:", config.output_layer_idx)
+    print("  backbone adaptation:", backbone_adaptation)
     print("  unfreeze last N blocks:", args.unfreeze_last_n_blocks)
+    if lora_enabled:
+        print("  LoRA last N effective blocks:", args.lora_last_n_blocks)
+        print("  LoRA target modules:", list(args.lora_target_modules))
+        print("  LoRA rank:", args.lora_rank)
+        print("  LoRA alpha:", args.lora_alpha)
+        print("  LoRA scale:", args.lora_alpha / args.lora_rank)
+        print("  LoRA dropout:", args.lora_dropout)
     print(
         "  trainable backbone blocks (1-based):",
         [index + 1 for index in trainable_block_indices],
@@ -1661,8 +1733,21 @@ def main() -> None:
         backbone=backbone,
     )
     # Model50MClassifier initializes as a frozen probe. Configure the
-    # explicit partial-finetune scope only after constructing the classifier.
-    backbone.set_trainable_encoder_blocks(trainable_block_indices)
+    # explicit adaptation scope only after constructing the classifier.
+    lora_report = None
+    if requires_live_backbone_forward:
+        backbone.set_trainable_encoder_blocks(trainable_block_indices)
+    elif lora_enabled:
+        lora_report = inject_lora_adapters(
+            backbone,
+            block_indices=trainable_block_indices,
+            target_modules=args.lora_target_modules,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+    else:
+        backbone.set_trainable_encoder_blocks(())
     classifier.eval()
     model_load_seconds = time.perf_counter() - load_start
 
@@ -1671,19 +1756,56 @@ def main() -> None:
         for block_index in trainable_block_indices
         for parameter in backbone.model.encoder.encoder.layers[block_index].parameters()
     }
+    lora_parameters = (
+        [
+            parameter
+            for adapter in lora_report.adapter_modules
+            for parameter in adapter.parameters()
+            if parameter.requires_grad
+        ]
+        if lora_report is not None
+        else []
+    )
+    lora_parameter_ids = {id(parameter) for parameter in lora_parameters}
     trainable_backbone_parameters = [
         parameter
         for parameter in backbone.parameters()
-        if parameter.requires_grad
+        if parameter.requires_grad and id(parameter) not in lora_parameter_ids
     ]
-    if {id(parameter) for parameter in trainable_backbone_parameters} != (
+    original_backbone_parameter_count = sum(
+        parameter.numel()
+        for parameter in backbone.parameters()
+        if id(parameter) not in lora_parameter_ids
+    )
+    trainable_lora_parameter_count = sum(
+        parameter.numel() for parameter in lora_parameters
+    )
+    trainable_head_parameter_count = sum(
+        parameter.numel() for parameter in classifier.head.parameters()
+    )
+    trainable_original_backbone_parameter_count = sum(
+        parameter.numel() for parameter in trainable_backbone_parameters
+    )
+    total_model_parameter_count = sum(
+        parameter.numel() for parameter in classifier.parameters()
+    )
+    total_trainable_parameter_count = (
+        trainable_original_backbone_parameter_count
+        + trainable_lora_parameter_count
+        + trainable_head_parameter_count
+    )
+    if partial_finetuning_enabled and (
+        {id(parameter) for parameter in trainable_backbone_parameters} != (
         selected_block_parameter_ids
+        )
     ):
         raise RuntimeError(
             "Backbone trainable parameters do not exactly match the selected "
             "encoder blocks."
         )
-    if tuple(backbone.trainable_encoder_block_indices) != trainable_block_indices:
+    if partial_finetuning_enabled and (
+        tuple(backbone.trainable_encoder_block_indices) != trainable_block_indices
+    ):
         raise RuntimeError(
             "Backbone did not retain the requested trainable encoder blocks."
         )
@@ -1693,15 +1815,28 @@ def main() -> None:
         f"{model_load_seconds:.2f}s."
     )
     print("Feature cache enabled:", feature_cache_enabled)
-    if partial_finetuning_enabled:
+    if requires_live_backbone_forward:
         print(
             "Feature cache disabled because backbone fine-tuning is enabled."
         )
+    if lora_enabled:
+        print("Feature cache disabled because LoRA backbone adaptation is enabled.")
     print("Trainable backbone parameters:", backbone.trainable_parameters)
     print("Trainable classifier parameters:", classifier.trainable_parameters)
     print("Head trainable:", all(parameter.requires_grad for parameter in classifier.head.parameters()))
     print("Head LR:", args.head_lr)
     print("Backbone LR:", args.backbone_lr if partial_finetuning_enabled else None)
+    print("LoRA LR:", args.lora_lr if lora_enabled else None)
+    print("Total model parameters:", total_model_parameter_count)
+    print("Original backbone parameters:", original_backbone_parameter_count)
+    print("Original backbone trainable params:", trainable_original_backbone_parameter_count)
+    print("LoRA trainable params:", trainable_lora_parameter_count)
+    print("Head trainable params:", trainable_head_parameter_count)
+    print("Total trainable params:", total_trainable_parameter_count)
+    print(
+        "Trainable percentage:",
+        100.0 * total_trainable_parameter_count / total_model_parameter_count,
+    )
     print("Weight decay:", args.weight_decay)
     print()
 
@@ -1713,7 +1848,7 @@ def main() -> None:
         args.feature_cache_dtype
     )
 
-    if partial_finetuning_enabled:
+    if requires_live_backbone_forward:
         train_features = tokenize_windows_for_finetuning(
             window_set=train_build.bundle.window_set,
             metadata=metadata,
@@ -1766,7 +1901,7 @@ def main() -> None:
 
     if args.save_feature_cache and not feature_cache_enabled:
         print(
-            "Skipping --save-feature-cache: partial fine-tuning uses "
+            "Skipping --save-feature-cache: backbone adaptation uses "
             "token inputs and cannot use detached backbone features."
         )
     if args.save_feature_cache and feature_cache_enabled:
@@ -1829,6 +1964,13 @@ def main() -> None:
                 "lr": args.backbone_lr,
             }
         )
+    if lora_parameters:
+        optimizer_groups.append(
+            {
+                "params": lora_parameters,
+                "lr": args.lora_lr,
+            }
+        )
     optimizer = torch.optim.AdamW(
         optimizer_groups,
         weight_decay=args.weight_decay,
@@ -1841,20 +1983,28 @@ def main() -> None:
         for parameter in group["params"]
     }
     expected_optimizer_parameter_ids = (
-        head_parameter_ids | {id(parameter) for parameter in trainable_backbone_parameters}
+        head_parameter_ids
+        | {id(parameter) for parameter in trainable_backbone_parameters}
+        | lora_parameter_ids
     )
     if not head_parameter_ids or optimizer_parameter_ids != expected_optimizer_parameter_ids:
         raise RuntimeError(
             "Optimizer parameters must be exactly the classification head "
             "and selected trainable backbone blocks."
         )
-    if not partial_finetuning_enabled and backbone_parameter_ids & optimizer_parameter_ids:
+    if not partial_finetuning_enabled and not lora_enabled and (
+        backbone_parameter_ids & optimizer_parameter_ids
+    ):
         raise RuntimeError("Frozen backbone parameters were added to the optimizer.")
     if partial_finetuning_enabled and (
         backbone_parameter_ids & optimizer_parameter_ids
         != {id(parameter) for parameter in trainable_backbone_parameters}
     ):
         raise RuntimeError("Optimizer backbone scope differs from selected blocks.")
+    if lora_enabled and (
+        backbone_parameter_ids & optimizer_parameter_ids != lora_parameter_ids
+    ):
+        raise RuntimeError("Optimizer LoRA scope differs from injected adapters.")
     if any(not parameter.requires_grad for parameter in head_parameters):
         raise RuntimeError("Classification head parameters must require gradients.")
     criterion = nn.CrossEntropyLoss()
@@ -1867,6 +2017,7 @@ def main() -> None:
     best_epoch = -1
     best_head_state: dict[str, torch.Tensor] | None = None
     best_backbone_state: dict[str, torch.Tensor] | None = None
+    best_lora_state: dict[str, torch.Tensor] | None = None
     best_val_metrics: EpochMetrics | None = None
     epochs_without_improvement = 0
     epoch_rows: list[dict[str, Any]] = []
@@ -1877,6 +2028,7 @@ def main() -> None:
     print(
         f"epochs={args.epochs}, head_lr={args.head_lr}, "
         f"backbone_lr={args.backbone_lr if partial_finetuning_enabled else None}, "
+        f"lora_lr={args.lora_lr if lora_enabled else None}, "
         f"momentum={args.momentum}, "
         f"weight_decay={args.weight_decay}, "
         f"best_metric={args.metric_for_best}"
@@ -1886,14 +2038,15 @@ def main() -> None:
         f"head_hidden_dim={config.head_hidden_dim}, "
         f"head_norm={config.head_norm}, "
         f"head_dropout={config.head_dropout}, "
-        f"head_trainable_parameters={sum(parameter.numel() for parameter in head_parameters)}, "
-        f"backbone_trainable_parameters={sum(parameter.numel() for parameter in trainable_backbone_parameters)}"
+        f"head_trainable_parameters={trainable_head_parameter_count}, "
+        f"backbone_trainable_parameters={trainable_original_backbone_parameter_count}, "
+        f"lora_trainable_parameters={trainable_lora_parameter_count}"
     )
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
 
-        if partial_finetuning_enabled:
+        if requires_live_backbone_forward:
             train_metrics = run_finetune_epoch(
                 classifier=classifier,
                 loader=train_loader,
@@ -1911,7 +2064,7 @@ def main() -> None:
                 optimizer=optimizer,
             )
         with torch.no_grad():
-            if partial_finetuning_enabled:
+            if requires_live_backbone_forward:
                 val_metrics = run_finetune_epoch(
                     classifier=classifier,
                     loader=val_loader,
@@ -1958,6 +2111,10 @@ def main() -> None:
                         key: value.detach().cpu()
                         for key, value in classifier.backbone.model.state_dict().items()
                     }
+                )
+            if lora_enabled:
+                best_lora_state = deepcopy(
+                    lora_state_dict(classifier.backbone.model)
                 )
             best_val_metrics = val_metrics
             epochs_without_improvement = 0
@@ -2011,10 +2168,12 @@ def main() -> None:
     classifier.head.load_state_dict(best_head_state, strict=True)
     if best_backbone_state is not None:
         classifier.backbone.model.load_state_dict(best_backbone_state, strict=True)
+    if best_lora_state is not None:
+        load_lora_state_dict(classifier.backbone.model, best_lora_state)
     classifier.eval()
 
     with torch.no_grad():
-        if partial_finetuning_enabled:
+        if requires_live_backbone_forward:
             selected_val_metrics_raw = run_finetune_epoch(
                 classifier=classifier,
                 loader=val_loader,
@@ -2085,7 +2244,7 @@ def main() -> None:
         right_name="target final test",
     )
 
-    if partial_finetuning_enabled:
+    if requires_live_backbone_forward:
         target_features = tokenize_windows_for_finetuning(
             window_set=target_build.bundle.window_set,
             metadata=metadata,
@@ -2106,7 +2265,7 @@ def main() -> None:
             log_every=args.feature_log_every,
         )
 
-    if args.save_feature_cache and not partial_finetuning_enabled:
+    if args.save_feature_cache and feature_cache_enabled:
         save_population_feature_cache(
             dataset=target_features,
             bundle=target_build.bundle,
@@ -2128,7 +2287,7 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        if partial_finetuning_enabled:
+        if requires_live_backbone_forward:
             target_metrics_raw = run_finetune_epoch(
                 classifier=classifier,
                 loader=target_loader,
@@ -2162,12 +2321,16 @@ def main() -> None:
             "task": "BNCI2014_001_motor_imagery",
             "dataset": metadata.dataset_name,
             "mode": (
-                "population_loso_partial_finetune"
-                if partial_finetuning_enabled
+                "population_loso_lora"
+                if lora_enabled
                 else (
-                    "population_loso_linear_probe"
-                    if config.head_type == "linear"
-                    else "population_loso_mlp_head"
+                    "population_loso_partial_finetune"
+                    if partial_finetuning_enabled
+                    else (
+                        "population_loso_linear_probe"
+                        if config.head_type == "linear"
+                        else "population_loso_mlp_head"
+                    )
                 )
             ),
             "stage": "stage1",
@@ -2186,6 +2349,7 @@ def main() -> None:
             "class_names": class_names,
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
+            "backbone_adaptation": backbone_adaptation,
             "freeze_backbone": not partial_finetuning_enabled,
             "trainable_backbone_parameters": sum(
                 parameter.numel() for parameter in trainable_backbone_parameters
@@ -2195,8 +2359,26 @@ def main() -> None:
             "embedding_layer_internal_index": int(config.output_layer_idx),
             "unfreeze_last_n_blocks": int(args.unfreeze_last_n_blocks),
             "unfrozen_block_indices": [
-                int(index) for index in trainable_block_indices
+                int(index) for index in (
+                    trainable_block_indices if partial_finetuning_enabled else ()
+                )
             ],
+            "lora_last_n_blocks": (
+                int(args.lora_last_n_blocks) if lora_enabled else None
+            ),
+            "lora_block_indices": [
+                int(index) for index in (
+                    trainable_block_indices if lora_enabled else ()
+                )
+            ],
+            "lora_target_modules": (
+                list(normalize_lora_target_modules(args.lora_target_modules))
+                if lora_enabled
+                else []
+            ),
+            "lora_rank": int(args.lora_rank) if lora_enabled else None,
+            "lora_alpha": float(args.lora_alpha) if lora_enabled else None,
+            "lora_dropout": float(args.lora_dropout) if lora_enabled else None,
             "head_type": config.head_type,
             "head_hidden_dim": int(config.head_hidden_dim),
             "head_dropout": float(config.head_dropout),
@@ -2207,6 +2389,11 @@ def main() -> None:
             "optimizer": "AdamW",
             "head_lr": float(args.head_lr),
             "backbone_lr": float(args.backbone_lr),
+            "lora_lr": float(args.lora_lr) if lora_enabled else None,
+            "trainable_lora_parameters": sum(
+                parameter.numel() for parameter in lora_parameters
+            ),
+            "trainable_total_parameters": total_trainable_parameter_count,
             "momentum": float(args.momentum),
             "weight_decay": float(args.weight_decay),
             "seed": int(args.seed),
@@ -2236,6 +2423,11 @@ def main() -> None:
             if partial_finetuning_enabled
             else None
         ),
+        lora_state_dict=(
+            lora_state_dict(classifier.backbone.model)
+            if lora_enabled
+            else None
+        ),
     )
 
     metrics_csv = run_dir / "epoch_metrics.csv"
@@ -2251,12 +2443,16 @@ def main() -> None:
         "status": "completed",
         "stage": "stage1",
         "experiment": (
-            "population_loso_partial_finetune"
-            if partial_finetuning_enabled
+            "population_loso_lora"
+            if lora_enabled
             else (
-                "population_loso_linear_probe"
-                if config.head_type == "linear"
-                else "population_loso_mlp_head"
+                "population_loso_partial_finetune"
+                if partial_finetuning_enabled
+                else (
+                    "population_loso_linear_probe"
+                    if config.head_type == "linear"
+                    else "population_loso_mlp_head"
+                )
             )
         ),
         "warning": (
@@ -2340,6 +2536,27 @@ def main() -> None:
                 int(index + 1) for index in trainable_block_indices
             ],
             "feature_cache_enabled": feature_cache_enabled,
+            "backbone_adaptation": backbone_adaptation,
+            "lora_last_n_blocks": (
+                int(args.lora_last_n_blocks) if lora_enabled else None
+            ),
+            "lora_blocks": [
+                int(index + 1) for index in (
+                    trainable_block_indices if lora_enabled else ()
+                )
+            ],
+            "lora_target_modules": (
+                list(normalize_lora_target_modules(args.lora_target_modules))
+                if lora_enabled
+                else []
+            ),
+            "lora_rank": int(args.lora_rank) if lora_enabled else None,
+            "lora_alpha": float(args.lora_alpha) if lora_enabled else None,
+            "lora_dropout": float(args.lora_dropout) if lora_enabled else None,
+            "trainable_lora_params": sum(
+                parameter.numel() for parameter in lora_parameters
+            ),
+            "trainable_total_params": total_trainable_parameter_count,
             "target_sample_rate": config.target_sample_rate,
             "target_num_points": config.target_num_points,
             "num_tokens": config.num_tokens,
@@ -2364,6 +2581,28 @@ def main() -> None:
             "metric_for_best": args.metric_for_best,
             "head_lr": args.head_lr,
             "backbone_lr": args.backbone_lr,
+            "lora_lr": args.lora_lr if lora_enabled else None,
+            "backbone_adaptation": backbone_adaptation,
+            "lora_last_n_blocks": (
+                args.lora_last_n_blocks if lora_enabled else None
+            ),
+            "lora_blocks": [
+                int(index + 1) for index in (
+                    trainable_block_indices if lora_enabled else ()
+                )
+            ],
+            "lora_target_modules": (
+                list(normalize_lora_target_modules(args.lora_target_modules))
+                if lora_enabled
+                else []
+            ),
+            "lora_rank": args.lora_rank if lora_enabled else None,
+            "lora_alpha": args.lora_alpha if lora_enabled else None,
+            "lora_dropout": args.lora_dropout if lora_enabled else None,
+            "trainable_lora_params": sum(
+                parameter.numel() for parameter in lora_parameters
+            ),
+            "trainable_total_params": total_trainable_parameter_count,
             "unfreeze_last_n_blocks": args.unfreeze_last_n_blocks,
             "embedding_layer": embedding_layer,
             "embedding_layer_internal_index": config.output_layer_idx,
@@ -2415,6 +2654,7 @@ def main() -> None:
         "head_dropout": config.head_dropout,
         "head_norm": config.head_norm,
         "head_lr": args.head_lr,
+        "backbone_adaptation": backbone_adaptation,
         "backbone_lr": args.backbone_lr,
         "embedding_layer": embedding_layer,
         "embedding_layer_internal_index": config.output_layer_idx,
@@ -2428,6 +2668,25 @@ def main() -> None:
         "trainable_head_params": sum(
             parameter.numel() for parameter in head_parameters
         ),
+        "lora_last_n_blocks": args.lora_last_n_blocks if lora_enabled else None,
+        "lora_blocks": [
+            int(index + 1) for index in (
+                trainable_block_indices if lora_enabled else ()
+            )
+        ],
+        "lora_target_modules": (
+            list(normalize_lora_target_modules(args.lora_target_modules))
+            if lora_enabled
+            else []
+        ),
+        "lora_rank": args.lora_rank if lora_enabled else None,
+        "lora_alpha": args.lora_alpha if lora_enabled else None,
+        "lora_dropout": args.lora_dropout if lora_enabled else None,
+        "lora_lr": args.lora_lr if lora_enabled else None,
+        "trainable_lora_params": sum(
+            parameter.numel() for parameter in lora_parameters
+        ),
+        "trainable_total_params": total_trainable_parameter_count,
         "weight_decay": args.weight_decay,
         "seed": args.seed,
     }

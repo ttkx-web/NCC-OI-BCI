@@ -710,10 +710,12 @@ def save_classifier_checkpoint(
     *,
     extra_metadata: Mapping[str, Any] | None = None,
     backbone_state_dict: Mapping[str, torch.Tensor] | None = None,
+    lora_state_dict: Mapping[str, torch.Tensor] | None = None,
 ) -> Path:
     """
     默认只保存任务分类头，不重复保存 50M Backbone。partial fine-tuning
-    调用方可显式提供 ``backbone_state_dict``，使 checkpoint 能完整恢复。
+    调用方可显式提供 ``backbone_state_dict``；LoRA 调用方则保存独立的
+    ``lora_state_dict``，避免重复保存冻结 backbone。
 
     文件内容：
         format_version
@@ -740,8 +742,18 @@ def save_classifier_checkpoint(
     if extra_metadata is not None:
         metadata.update(dict(extra_metadata))
 
+    if backbone_state_dict is not None and lora_state_dict is not None:
+        raise ValueError(
+            "A classifier checkpoint cannot contain both a full fine-tuned "
+            "backbone_state_dict and lora_state_dict."
+        )
+
     payload = {
-        "format_version": 3 if backbone_state_dict is not None else 2,
+        "format_version": (
+            4
+            if lora_state_dict is not None
+            else (3 if backbone_state_dict is not None else 2)
+        ),
         "head_state_dict": {
             key: value.detach().cpu()
             for key, value in (
@@ -754,6 +766,11 @@ def save_classifier_checkpoint(
         payload["backbone_state_dict"] = {
             key: value.detach().cpu()
             for key, value in backbone_state_dict.items()
+        }
+    if lora_state_dict is not None:
+        payload["lora_state_dict"] = {
+            key: value.detach().cpu()
+            for key, value in lora_state_dict.items()
         }
 
     temporary_path = Path(
@@ -941,6 +958,12 @@ def load_classifier_checkpoint(
         )
 
     saved_backbone_state = checkpoint.get("backbone_state_dict")
+    saved_lora_state = checkpoint.get("lora_state_dict")
+    if saved_backbone_state is not None and saved_lora_state is not None:
+        raise ValueError(
+            "Classifier checkpoint cannot contain both backbone_state_dict "
+            "and lora_state_dict."
+        )
     if saved_backbone_state is not None:
         if not isinstance(saved_backbone_state, Mapping):
             raise TypeError(
@@ -956,6 +979,40 @@ def load_classifier_checkpoint(
                 "Failed to load the fine-tuned 50M backbone state from "
                 "the classifier checkpoint."
             ) from error
+
+    if saved_lora_state is not None:
+        if not isinstance(saved_lora_state, Mapping):
+            raise TypeError(
+                "Classifier checkpoint lora_state_dict must be a mapping."
+            )
+        required_lora_metadata = (
+            "lora_block_indices",
+            "lora_target_modules",
+            "lora_rank",
+            "lora_alpha",
+            "lora_dropout",
+        )
+        missing_lora_metadata = [
+            key for key in required_lora_metadata if key not in metadata
+        ]
+        if missing_lora_metadata:
+            raise KeyError(
+                "LoRA classifier checkpoint metadata is missing "
+                f"{missing_lora_metadata}."
+            )
+        from .lora import inject_lora_adapters, load_lora_state_dict
+
+        report = inject_lora_adapters(
+            classifier.backbone,
+            block_indices=metadata["lora_block_indices"],
+            target_modules=metadata["lora_target_modules"],
+            rank=int(metadata["lora_rank"]),
+            alpha=float(metadata["lora_alpha"]),
+            dropout=float(metadata["lora_dropout"]),
+        )
+        if tuple(report.block_indices) != tuple(metadata["lora_block_indices"]):
+            raise RuntimeError("Loaded LoRA block indices differ from checkpoint metadata.")
+        load_lora_state_dict(classifier.backbone.model, saved_lora_state)
 
     try:
         classifier.head.load_state_dict(

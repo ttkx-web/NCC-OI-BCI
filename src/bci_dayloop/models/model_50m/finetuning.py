@@ -55,3 +55,33 @@ def uses_frozen_feature_cache(*, unfreeze_last_n_blocks: int) -> bool:
     if unfreeze_last_n_blocks < 0:
         raise ValueError("--unfreeze-last-n-blocks must be >= 0.")
     return unfreeze_last_n_blocks == 0
+
+
+def resolve_backbone_adaptation(
+    *,
+    requested: str | None,
+    unfreeze_last_n_blocks: int,
+) -> str:
+    """Resolve new adaptation CLI while preserving legacy partial commands."""
+    if unfreeze_last_n_blocks < 0:
+        raise ValueError("--unfreeze-last-n-blocks must be >= 0.")
+    if requested is None:
+        return "partial" if unfreeze_last_n_blocks > 0 else "frozen"
+    if requested not in {"frozen", "partial", "lora"}:
+        raise ValueError(f"Unsupported backbone adaptation: {requested!r}.")
+    if requested == "frozen" and unfreeze_last_n_blocks != 0:
+        raise ValueError(
+            "--unfreeze-last-n-blocks must be 0 when "
+            "--backbone-adaptation=frozen."
+        )
+    if requested == "partial" and unfreeze_last_n_blocks == 0:
+        raise ValueError(
+            "--backbone-adaptation=partial requires "
+            "--unfreeze-last-n-blocks >= 1."
+        )
+    if requested == "lora" and unfreeze_last_n_blocks != 0:
+        raise ValueError(
+            "LoRA and partial fine-tuning are mutually exclusive; use "
+            "--lora-last-n-blocks and leave --unfreeze-last-n-blocks at 0."
+        )
+    return requested

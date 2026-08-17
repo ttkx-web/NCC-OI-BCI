@@ -1767,11 +1767,21 @@ def main() -> None:
         else []
     )
     lora_parameter_ids = {id(parameter) for parameter in lora_parameters}
-    trainable_backbone_parameters = [
-        parameter
-        for parameter in backbone.parameters()
-        if parameter.requires_grad and id(parameter) not in lora_parameter_ids
-    ]
+    if lora_enabled:
+        # Keep this guard local to the training entrypoint as well as the
+        # injector. Some PyTorch parametrization versions expose additional
+        # original parameters after registration; they must never enter the
+        # LoRA optimizer group.
+        for parameter in backbone.parameters():
+            if id(parameter) not in lora_parameter_ids:
+                parameter.requires_grad = False
+        trainable_backbone_parameters: list[torch.nn.Parameter] = []
+    else:
+        trainable_backbone_parameters = [
+            parameter
+            for parameter in backbone.parameters()
+            if parameter.requires_grad and id(parameter) not in lora_parameter_ids
+        ]
     original_backbone_parameter_count = sum(
         parameter.numel()
         for parameter in backbone.parameters()

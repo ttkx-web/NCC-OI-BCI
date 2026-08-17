@@ -2001,10 +2001,24 @@ def main() -> None:
         != {id(parameter) for parameter in trainable_backbone_parameters}
     ):
         raise RuntimeError("Optimizer backbone scope differs from selected blocks.")
-    if lora_enabled and (
-        backbone_parameter_ids & optimizer_parameter_ids != lora_parameter_ids
-    ):
-        raise RuntimeError("Optimizer LoRA scope differs from injected adapters.")
+    if lora_enabled:
+        missing_lora_parameter_ids = (
+            lora_parameter_ids - optimizer_parameter_ids
+        )
+        unexpected_original_backbone_parameter_ids = (
+            (backbone_parameter_ids - lora_parameter_ids)
+            & optimizer_parameter_ids
+        )
+        if (
+            missing_lora_parameter_ids
+            or unexpected_original_backbone_parameter_ids
+        ):
+            raise RuntimeError(
+                "Optimizer LoRA scope differs from injected adapters: "
+                f"missing_lora={len(missing_lora_parameter_ids)}, "
+                "unexpected_original_backbone="
+                f"{len(unexpected_original_backbone_parameter_ids)}."
+            )
     if any(not parameter.requires_grad for parameter in head_parameters):
         raise RuntimeError("Classification head parameters must require gradients.")
     criterion = nn.CrossEntropyLoss()

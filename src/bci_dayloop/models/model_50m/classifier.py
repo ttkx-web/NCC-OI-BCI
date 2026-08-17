@@ -431,9 +431,11 @@ class Model50MClassifier(nn.Module):
     ) -> "Model50MClassifier":
         super().train(mode)
 
-        # Linear probe 时，Backbone 必须始终为 eval，
-        # 避免 Dropout 造成同一 EEG 输入特征不一致。
-        self.backbone.eval()
+        # The Backbone owns its own freeze/partial-finetune mode policy.
+        # In the frozen baseline this still keeps every backbone module in
+        # eval; partial fine-tuning enables train mode only for selected
+        # encoder blocks.
+        self.backbone.train(mode)
 
         # 只有分类头跟随训练状态。
         self.head.train(mode)
@@ -707,9 +709,11 @@ def save_classifier_checkpoint(
     checkpoint_path: Path | str,
     *,
     extra_metadata: Mapping[str, Any] | None = None,
+    backbone_state_dict: Mapping[str, torch.Tensor] | None = None,
 ) -> Path:
     """
-    只保存任务分类头，不重复保存 50M Backbone。
+    默认只保存任务分类头，不重复保存 50M Backbone。partial fine-tuning
+    调用方可显式提供 ``backbone_state_dict``，使 checkpoint 能完整恢复。
 
     文件内容：
         format_version
@@ -737,7 +741,7 @@ def save_classifier_checkpoint(
         metadata.update(dict(extra_metadata))
 
     payload = {
-        "format_version": 2,
+        "format_version": 3 if backbone_state_dict is not None else 2,
         "head_state_dict": {
             key: value.detach().cpu()
             for key, value in (
@@ -746,6 +750,11 @@ def save_classifier_checkpoint(
         },
         "metadata": metadata,
     }
+    if backbone_state_dict is not None:
+        payload["backbone_state_dict"] = {
+            key: value.detach().cpu()
+            for key, value in backbone_state_dict.items()
+        }
 
     temporary_path = Path(
         f"{checkpoint_path}.tmp"
@@ -930,6 +939,23 @@ def load_classifier_checkpoint(
             metadata=metadata,
             config=classifier.config,
         )
+
+    saved_backbone_state = checkpoint.get("backbone_state_dict")
+    if saved_backbone_state is not None:
+        if not isinstance(saved_backbone_state, Mapping):
+            raise TypeError(
+                "Classifier checkpoint backbone_state_dict must be a mapping."
+            )
+        try:
+            classifier.backbone.model.load_state_dict(
+                saved_backbone_state,
+                strict=True,
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Failed to load the fine-tuned 50M backbone state from "
+                "the classifier checkpoint."
+            ) from error
 
     try:
         classifier.head.load_state_dict(

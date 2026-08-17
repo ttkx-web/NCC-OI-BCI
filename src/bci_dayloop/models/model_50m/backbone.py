@@ -5,7 +5,7 @@ import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -669,6 +669,7 @@ class Model50MBackbone(nn.Module):
 
         self.load_report: BackboneLoadReport | None = None
         self._frozen = False
+        self._trainable_encoder_block_indices: tuple[int, ...] = ()
 
         if load_checkpoint:
             self.load_report = load_backbone_checkpoint(
@@ -711,6 +712,7 @@ class Model50MBackbone(nn.Module):
             parameter.requires_grad = False
 
         self._frozen = True
+        self._trainable_encoder_block_indices = ()
         # 同时更新 wrapper 和内部 checkpoint 模型的 module mode，确保
         # 在线冻结时不会出现 wrapper.training 与 model.training 不一致。
         self.train(False)
@@ -721,16 +723,62 @@ class Model50MBackbone(nn.Module):
             parameter.requires_grad = True
 
         self._frozen = False
+        self._trainable_encoder_block_indices = tuple(range(self.config.depth))
         self.train(True)
+        return self
+
+    @property
+    def trainable_encoder_block_indices(self) -> tuple[int, ...]:
+        """0-based encoder blocks whose parameters are trainable."""
+        return self._trainable_encoder_block_indices
+
+    def set_trainable_encoder_blocks(
+        self,
+        block_indices: Sequence[int],
+    ) -> "Model50MBackbone":
+        """Freeze the backbone except for the specified encoder blocks.
+
+        This is intentionally narrower than :meth:`unfreeze`: patch/token
+        embeddings and all blocks outside ``block_indices`` remain frozen.
+        ``forward`` also stops using ``torch.no_grad`` when at least one block
+        is trainable, preserving the autograd graph needed by those blocks.
+        """
+        normalized_indices = tuple(sorted({int(index) for index in block_indices}))
+        invalid_indices = [
+            index
+            for index in normalized_indices
+            if not 0 <= index < self.config.depth
+        ]
+        if invalid_indices:
+            raise ValueError(
+                "Encoder block indices must be in "
+                f"[0, {self.config.depth - 1}], got {invalid_indices}."
+            )
+
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        for index in normalized_indices:
+            for parameter in self.model.encoder.encoder.layers[index].parameters():
+                parameter.requires_grad = True
+
+        self._trainable_encoder_block_indices = normalized_indices
+        self._frozen = not normalized_indices
+        self.train(self.training)
         return self
 
     def train(self, mode: bool = True) -> "Model50MBackbone":
         super().train(mode)
 
-        # Linear probe 时 Backbone 必须始终保持 eval，
-        # 避免 Dropout 在特征提取时开启。
+        # Frozen linear probe keeps the entire backbone deterministic. During
+        # partial fine-tuning only the explicitly selected encoder blocks
+        # follow train/eval mode; all other backbone modules remain in eval.
         if self._frozen:
+            super().train(False)
             self.model.eval()
+        elif self._trainable_encoder_block_indices:
+            self.model.eval()
+            for index in self._trainable_encoder_block_indices:
+                self.model.encoder.encoder.layers[index].train(mode)
 
         return self
 

@@ -37,7 +37,7 @@ import random
 import subprocess
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -58,6 +58,17 @@ from bci_dayloop.models.model_50m.config import (
     STANDARD_64_CHANNELS,
     Model50MConfig,
 )
+from bci_dayloop.models.model_50m.finetuning import (
+    resolve_embedding_layer,
+    resolve_trainable_block_indices,
+    uses_frozen_feature_cache,
+)
+from bci_dayloop.models.model_50m.preprocessing import Model50MPreprocessor
+from bci_dayloop.models.model_50m.tokenization import (
+    Model50MBatchedInput,
+    Model50MTokenizer,
+    stack_model50m_tokens,
+)
 
 # Reuse the already validated Stage-0.5 preprocessing, window construction,
 # frozen-feature extraction, and classification-head training helpers.
@@ -66,6 +77,7 @@ from train_50m_linear_head import (
     WindowSet,
     build_same_label_concat_windows,
     class_counts,
+    confusion_to_metrics,
     extract_frozen_features,
     feature_cache_dtype_from_name,
     json_default,
@@ -131,6 +143,158 @@ class ExtendedMetrics:
             "confusion_matrix": self.confusion_matrix,
             "per_class": self.per_class,
         }
+
+
+def tokenize_windows_for_finetuning(
+    *,
+    window_set: WindowSet,
+    metadata: HDF5Metadata,
+    config: Model50MConfig,
+    preprocess_batch_size: int,
+    split_name: str,
+    log_every: int,
+) -> TensorDataset:
+    """Stage token inputs on CPU while keeping every backbone forward live.
+
+    Preprocessing/tokenization are fixed input transformations. Unlike the
+    frozen feature cache, this dataset stores no backbone embeddings, so each
+    training batch still executes the selected backbone layer with autograd.
+    """
+    if preprocess_batch_size <= 0:
+        raise ValueError("preprocess_batch_size must be positive.")
+
+    preprocessor = Model50MPreprocessor(config)
+    tokenizer = Model50MTokenizer(config)
+    token_input_chunks: list[torch.Tensor] = []
+    channel_index_chunks: list[torch.Tensor] = []
+    time_index_chunks: list[torch.Tensor] = []
+    token_mask_chunks: list[torch.Tensor] = []
+    channel_mask_chunks: list[torch.Tensor] = []
+    label_chunks: list[torch.Tensor] = []
+    split_start = time.perf_counter()
+
+    for batch_start in range(0, len(window_set.windows), preprocess_batch_size):
+        batch_end = min(batch_start + preprocess_batch_size, len(window_set.windows))
+        tokenized_samples = []
+        for raw_window in window_set.windows[batch_start:batch_end]:
+            processed = preprocessor(
+                signal=raw_window,
+                channel_names=metadata.channel_names,
+                original_sample_rate=metadata.sample_rate,
+                input_unit=metadata.unit,
+            )
+            tokenized_samples.append(tokenizer(processed))
+
+        batch = stack_model50m_tokens(tokenized_samples)
+        token_input_chunks.append(batch.token_inputs.contiguous())
+        channel_index_chunks.append(batch.token_channel_indices.contiguous())
+        time_index_chunks.append(batch.token_time_indices.contiguous())
+        token_mask_chunks.append(batch.token_valid_mask.contiguous())
+        channel_mask_chunks.append(batch.channel_valid_mask.contiguous())
+        label_chunks.append(
+            torch.from_numpy(window_set.labels[batch_start:batch_end].copy()).long()
+        )
+
+        batch_number = batch_start // preprocess_batch_size + 1
+        if (
+            batch_number == 1
+            or batch_end == len(window_set.windows)
+            or batch_number % log_every == 0
+        ):
+            print(
+                f"[TokenInputs] split={split_name} batch={batch_number} "
+                f"samples={batch_end}/{len(window_set.windows)}",
+                flush=True,
+            )
+
+    dataset = TensorDataset(
+        torch.cat(token_input_chunks, dim=0).contiguous(),
+        torch.cat(channel_index_chunks, dim=0).contiguous(),
+        torch.cat(time_index_chunks, dim=0).contiguous(),
+        torch.cat(token_mask_chunks, dim=0).contiguous(),
+        torch.cat(channel_mask_chunks, dim=0).contiguous(),
+        torch.cat(label_chunks, dim=0).contiguous(),
+    )
+    if len(dataset) != len(window_set.windows):
+        raise RuntimeError(
+            f"{split_name}: token input count {len(dataset)} does not match "
+            f"window count {len(window_set.windows)}."
+        )
+    print(
+        f"[TokenInputs] completed split={split_name} samples={len(dataset)} "
+        f"time={time.perf_counter() - split_start:.1f}s",
+        flush=True,
+    )
+    return dataset
+
+
+def run_finetune_epoch(
+    *,
+    classifier: Model50MClassifier,
+    loader: DataLoader,
+    criterion: nn.Module,
+    num_classes: int,
+    optimizer: torch.optim.Optimizer | None,
+) -> EpochMetrics:
+    """Run an epoch that recomputes backbone features from token inputs."""
+    is_train = optimizer is not None
+    classifier.train(is_train)
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.long)
+
+    for (
+        token_inputs,
+        token_channel_indices,
+        token_time_indices,
+        token_valid_mask,
+        channel_valid_mask,
+        labels,
+    ) in loader:
+        batch = Model50MBatchedInput(
+            token_inputs=token_inputs,
+            token_channel_indices=token_channel_indices,
+            token_time_indices=token_time_indices,
+            token_valid_mask=token_valid_mask,
+            channel_valid_mask=channel_valid_mask,
+        ).to(classifier.device, non_blocking=True)
+        labels = labels.to(
+            device=classifier.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+
+        logits = classifier(batch)
+        loss = criterion(logits, labels)
+        if is_train:
+            loss.backward()
+            optimizer.step()
+
+        predictions = logits.argmax(dim=-1)
+        batch_size = int(labels.numel())
+        total_loss += float(loss.item()) * batch_size
+        total_correct += int((predictions == labels).sum().item())
+        total_count += batch_size
+        flat_indices = labels.detach().cpu() * num_classes + predictions.detach().cpu()
+        confusion += torch.bincount(
+            flat_indices,
+            minlength=num_classes * num_classes,
+        ).reshape(num_classes, num_classes)
+
+    if total_count <= 0:
+        raise RuntimeError("Empty token-input loader.")
+
+    balanced_accuracy, per_class_recall = confusion_to_metrics(confusion)
+    return EpochMetrics(
+        loss=total_loss / total_count,
+        accuracy=total_correct / total_count,
+        balanced_accuracy=balanced_accuracy,
+        confusion_matrix=confusion.tolist(),
+        per_class_recall=per_class_recall,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +1030,8 @@ def save_population_feature_cache(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a frozen-50M LOSO population classification head on "
+            "Train a frozen or partially fine-tuned 50M LOSO population "
+            "classification head on "
             "multi-subject BNCI2014_001 HDF5 files."
         )
     )
@@ -1021,6 +1186,33 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-batch-size", type=int, default=32)
     parser.add_argument("--head-lr", type=float, default=1e-3)
     parser.add_argument(
+        "--backbone-lr",
+        type=float,
+        default=1e-4,
+        help=(
+            "Learning rate for encoder blocks selected by "
+            "--unfreeze-last-n-blocks."
+        ),
+    )
+    parser.add_argument(
+        "--unfreeze-last-n-blocks",
+        type=int,
+        default=0,
+        help=(
+            "Number of 1-based encoder blocks ending at the selected "
+            "embedding layer to train. 0 keeps the frozen baseline."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-layer",
+        default="auto",
+        help=(
+            "Embedding layer used by the downstream head: 'auto' resolves "
+            "the existing --output-layer-idx, or supply a 1-based block "
+            "number such as 9."
+        ),
+    )
+    parser.add_argument(
         "--head-type",
         choices=("linear", "mlp"),
         default="linear",
@@ -1097,6 +1289,10 @@ def main() -> None:
         raise ValueError("--head-norm is only supported with --head-type mlp.")
     if args.head_type == "linear" and args.head_dropout != 0.0:
         raise ValueError("--head-dropout is only supported with --head-type mlp.")
+    if args.backbone_lr <= 0:
+        raise ValueError("--backbone-lr must be positive.")
+    if args.unfreeze_last_n_blocks < 0:
+        raise ValueError("--unfreeze-last-n-blocks must be >= 0.")
     if args.patience < 0:
         raise ValueError("--patience must be >= 0.")
     if args.feature_log_every <= 0:
@@ -1182,7 +1378,7 @@ def main() -> None:
     backbone_sha256 = sha256_file(checkpoint_path)
 
     print("=" * 88)
-    print("Stage 1: frozen-50M LOSO population-head training")
+    print("Stage 1: 50M LOSO population-head training")
     print("=" * 88)
     print("target subject:", target_subject)
     print("population subjects:", population_subjects)
@@ -1368,6 +1564,27 @@ def main() -> None:
         head_norm=args.head_norm,
     )
 
+    embedding_layer = resolve_embedding_layer(
+        requested=str(args.embedding_layer),
+        output_layer_idx=config.output_layer_idx,
+        depth=config.depth,
+    )
+    # A manual CLI layer is user-facing 1-based; Model50MConfig and the
+    # backbone remain 0-based internally.
+    if int(config.output_layer_idx) != embedding_layer - 1:
+        config = replace(
+            config,
+            output_layer_idx=embedding_layer - 1,
+        )
+    trainable_block_indices = resolve_trainable_block_indices(
+        embedding_layer=embedding_layer,
+        unfreeze_last_n_blocks=args.unfreeze_last_n_blocks,
+    )
+    partial_finetuning_enabled = bool(trainable_block_indices)
+    feature_cache_enabled = uses_frozen_feature_cache(
+        unfreeze_last_n_blocks=args.unfreeze_last_n_blocks,
+    )
+
     preprocessing_contract = {
         "target_sample_rate": float(config.target_sample_rate),
         "window_seconds": float(config.window_seconds),
@@ -1406,9 +1623,25 @@ def main() -> None:
     print("  target shape:", (config.n_channels, config.target_num_points))
     print("  token shape:", (config.num_tokens, config.patch_num_points))
     print("  output layer idx:", config.output_layer_idx)
+    print("  embedding layer requested:", args.embedding_layer)
+    print("  embedding layer resolved (1-based):", embedding_layer)
+    print("  embedding layer internal index:", config.output_layer_idx)
+    print("  unfreeze last N blocks:", args.unfreeze_last_n_blocks)
+    print(
+        "  trainable backbone blocks (1-based):",
+        [index + 1 for index in trainable_block_indices],
+    )
+    print(
+        "  frozen backbone blocks (1-based):",
+        [
+            index + 1
+            for index in range(config.depth)
+            if index not in trainable_block_indices
+        ],
+    )
     print("  aggregation:", config.aggregation)
     print("  classifier input dim:", config.classifier_input_dim)
-    print("  backbone frozen:", True)
+    print("  backbone frozen:", not partial_finetuning_enabled)
     print("  head type:", config.head_type)
     if config.head_type == "mlp":
         print("  head hidden dim:", config.head_hidden_dim)
@@ -1427,23 +1660,49 @@ def main() -> None:
         config=config,
         backbone=backbone,
     )
+    # Model50MClassifier initializes as a frozen probe. Configure the
+    # explicit partial-finetune scope only after constructing the classifier.
+    backbone.set_trainable_encoder_blocks(trainable_block_indices)
     classifier.eval()
     model_load_seconds = time.perf_counter() - load_start
 
-    for parameter in classifier.backbone.parameters():
-        parameter.requires_grad = False
-    if backbone.trainable_parameters != 0:
+    selected_block_parameter_ids = {
+        id(parameter)
+        for block_index in trainable_block_indices
+        for parameter in backbone.model.encoder.encoder.layers[block_index].parameters()
+    }
+    trainable_backbone_parameters = [
+        parameter
+        for parameter in backbone.parameters()
+        if parameter.requires_grad
+    ]
+    if {id(parameter) for parameter in trainable_backbone_parameters} != (
+        selected_block_parameter_ids
+    ):
         raise RuntimeError(
-            "Backbone is not fully frozen: "
-            f"trainable parameters={backbone.trainable_parameters}."
+            "Backbone trainable parameters do not exactly match the selected "
+            "encoder blocks."
+        )
+    if tuple(backbone.trainable_encoder_block_indices) != trainable_block_indices:
+        raise RuntimeError(
+            "Backbone did not retain the requested trainable encoder blocks."
         )
 
     print(
         f"Backbone loaded on {classifier.device} in "
         f"{model_load_seconds:.2f}s."
     )
+    print("Feature cache enabled:", feature_cache_enabled)
+    if partial_finetuning_enabled:
+        print(
+            "Feature cache disabled because backbone fine-tuning is enabled."
+        )
     print("Trainable backbone parameters:", backbone.trainable_parameters)
     print("Trainable classifier parameters:", classifier.trainable_parameters)
+    print("Head trainable:", all(parameter.requires_grad for parameter in classifier.head.parameters()))
+    print("Head LR:", args.head_lr)
+    print("Backbone LR:", args.backbone_lr if partial_finetuning_enabled else None)
+    print("Weight decay:", args.weight_decay)
     print()
 
     # ------------------------------------------------------------------
@@ -1454,28 +1713,46 @@ def main() -> None:
         args.feature_cache_dtype
     )
 
-    train_features = extract_frozen_features(
-        window_set=train_build.bundle.window_set,
-        metadata=metadata,
-        config=config,
-        classifier=classifier,
-        preprocess_batch_size=args.feature_batch_size,
-        cache_dtype=cache_dtype,
-        split_name="population_train",
-        log_every=args.feature_log_every,
-    )
-    val_features = extract_frozen_features(
-        window_set=val_build.bundle.window_set,
-        metadata=metadata,
-        config=config,
-        classifier=classifier,
-        preprocess_batch_size=args.feature_batch_size,
-        cache_dtype=cache_dtype,
-        split_name="population_validation",
-        log_every=args.feature_log_every,
-    )
+    if partial_finetuning_enabled:
+        train_features = tokenize_windows_for_finetuning(
+            window_set=train_build.bundle.window_set,
+            metadata=metadata,
+            config=config,
+            preprocess_batch_size=args.feature_batch_size,
+            split_name="population_train",
+            log_every=args.feature_log_every,
+        )
+        val_features = tokenize_windows_for_finetuning(
+            window_set=val_build.bundle.window_set,
+            metadata=metadata,
+            config=config,
+            preprocess_batch_size=args.feature_batch_size,
+            split_name="population_validation",
+            log_every=args.feature_log_every,
+        )
+    else:
+        train_features = extract_frozen_features(
+            window_set=train_build.bundle.window_set,
+            metadata=metadata,
+            config=config,
+            classifier=classifier,
+            preprocess_batch_size=args.feature_batch_size,
+            cache_dtype=cache_dtype,
+            split_name="population_train",
+            log_every=args.feature_log_every,
+        )
+        val_features = extract_frozen_features(
+            window_set=val_build.bundle.window_set,
+            metadata=metadata,
+            config=config,
+            classifier=classifier,
+            preprocess_batch_size=args.feature_batch_size,
+            cache_dtype=cache_dtype,
+            split_name="population_validation",
+            log_every=args.feature_log_every,
+        )
 
-    if args.save_feature_cache:
+    if args.save_feature_cache and feature_cache_enabled:
         save_population_feature_cache(
             dataset=train_features,
             bundle=train_build.bundle,
@@ -1486,6 +1763,13 @@ def main() -> None:
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
         )
+
+    if args.save_feature_cache and not feature_cache_enabled:
+        print(
+            "Skipping --save-feature-cache: partial fine-tuning uses "
+            "token inputs and cannot use detached backbone features."
+        )
+    if args.save_feature_cache and feature_cache_enabled:
         save_population_feature_cache(
             dataset=val_features,
             bundle=val_build.bundle,
@@ -1531,26 +1815,46 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Train only the configured classification head.
+    # Train the classification head, plus explicitly selected backbone blocks.
     # ------------------------------------------------------------------
 
+    head_parameters = list(classifier.head.parameters())
+    optimizer_groups: list[dict[str, Any]] = [
+        {"params": head_parameters, "lr": args.head_lr},
+    ]
+    if trainable_backbone_parameters:
+        optimizer_groups.append(
+            {
+                "params": trainable_backbone_parameters,
+                "lr": args.backbone_lr,
+            }
+        )
     optimizer = torch.optim.AdamW(
-        classifier.head.parameters(),
-        lr=args.head_lr,
+        optimizer_groups,
         weight_decay=args.weight_decay,
     )
     backbone_parameter_ids = {id(parameter) for parameter in backbone.parameters()}
-    head_parameters = list(classifier.head.parameters())
     head_parameter_ids = {id(parameter) for parameter in head_parameters}
     optimizer_parameter_ids = {
         id(parameter)
         for group in optimizer.param_groups
         for parameter in group["params"]
     }
-    if not head_parameter_ids or optimizer_parameter_ids != head_parameter_ids:
-        raise RuntimeError("Optimizer parameters must be exactly the classification head.")
-    if backbone_parameter_ids & optimizer_parameter_ids:
+    expected_optimizer_parameter_ids = (
+        head_parameter_ids | {id(parameter) for parameter in trainable_backbone_parameters}
+    )
+    if not head_parameter_ids or optimizer_parameter_ids != expected_optimizer_parameter_ids:
+        raise RuntimeError(
+            "Optimizer parameters must be exactly the classification head "
+            "and selected trainable backbone blocks."
+        )
+    if not partial_finetuning_enabled and backbone_parameter_ids & optimizer_parameter_ids:
         raise RuntimeError("Frozen backbone parameters were added to the optimizer.")
+    if partial_finetuning_enabled and (
+        backbone_parameter_ids & optimizer_parameter_ids
+        != {id(parameter) for parameter in trainable_backbone_parameters}
+    ):
+        raise RuntimeError("Optimizer backbone scope differs from selected blocks.")
     if any(not parameter.requires_grad for parameter in head_parameters):
         raise RuntimeError("Classification head parameters must require gradients.")
     criterion = nn.CrossEntropyLoss()
@@ -1562,6 +1866,7 @@ def main() -> None:
     )
     best_epoch = -1
     best_head_state: dict[str, torch.Tensor] | None = None
+    best_backbone_state: dict[str, torch.Tensor] | None = None
     best_val_metrics: EpochMetrics | None = None
     epochs_without_improvement = 0
     epoch_rows: list[dict[str, Any]] = []
@@ -1570,7 +1875,8 @@ def main() -> None:
 
     print("Training population classification head with AdamW")
     print(
-        f"epochs={args.epochs}, lr={args.head_lr}, "
+        f"epochs={args.epochs}, head_lr={args.head_lr}, "
+        f"backbone_lr={args.backbone_lr if partial_finetuning_enabled else None}, "
         f"momentum={args.momentum}, "
         f"weight_decay={args.weight_decay}, "
         f"best_metric={args.metric_for_best}"
@@ -1580,29 +1886,48 @@ def main() -> None:
         f"head_hidden_dim={config.head_hidden_dim}, "
         f"head_norm={config.head_norm}, "
         f"head_dropout={config.head_dropout}, "
-        f"head_trainable_parameters={sum(parameter.numel() for parameter in head_parameters)}"
+        f"head_trainable_parameters={sum(parameter.numel() for parameter in head_parameters)}, "
+        f"backbone_trainable_parameters={sum(parameter.numel() for parameter in trainable_backbone_parameters)}"
     )
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
 
-        train_metrics = run_head_epoch(
-            head=classifier.head,
-            loader=train_loader,
-            criterion=criterion,
-            device=classifier.device,
-            num_classes=num_classes,
-            optimizer=optimizer,
-        )
-        with torch.no_grad():
-            val_metrics = run_head_epoch(
+        if partial_finetuning_enabled:
+            train_metrics = run_finetune_epoch(
+                classifier=classifier,
+                loader=train_loader,
+                criterion=criterion,
+                num_classes=num_classes,
+                optimizer=optimizer,
+            )
+        else:
+            train_metrics = run_head_epoch(
                 head=classifier.head,
-                loader=val_loader,
+                loader=train_loader,
                 criterion=criterion,
                 device=classifier.device,
                 num_classes=num_classes,
-                optimizer=None,
+                optimizer=optimizer,
             )
+        with torch.no_grad():
+            if partial_finetuning_enabled:
+                val_metrics = run_finetune_epoch(
+                    classifier=classifier,
+                    loader=val_loader,
+                    criterion=criterion,
+                    num_classes=num_classes,
+                    optimizer=None,
+                )
+            else:
+                val_metrics = run_head_epoch(
+                    head=classifier.head,
+                    loader=val_loader,
+                    criterion=criterion,
+                    device=classifier.device,
+                    num_classes=num_classes,
+                    optimizer=None,
+                )
 
         train_extended = extend_metrics(
             train_metrics,
@@ -1627,6 +1952,13 @@ def main() -> None:
                     for key, value in classifier.head.state_dict().items()
                 }
             )
+            if partial_finetuning_enabled:
+                best_backbone_state = deepcopy(
+                    {
+                        key: value.detach().cpu()
+                        for key, value in classifier.backbone.model.state_dict().items()
+                    }
+                )
             best_val_metrics = val_metrics
             epochs_without_improvement = 0
         else:
@@ -1677,17 +2009,28 @@ def main() -> None:
         raise RuntimeError("No best population-head state was recorded.")
 
     classifier.head.load_state_dict(best_head_state, strict=True)
+    if best_backbone_state is not None:
+        classifier.backbone.model.load_state_dict(best_backbone_state, strict=True)
     classifier.eval()
 
     with torch.no_grad():
-        selected_val_metrics_raw = run_head_epoch(
-            head=classifier.head,
-            loader=val_loader,
-            criterion=criterion,
-            device=classifier.device,
-            num_classes=num_classes,
-            optimizer=None,
-        )
+        if partial_finetuning_enabled:
+            selected_val_metrics_raw = run_finetune_epoch(
+                classifier=classifier,
+                loader=val_loader,
+                criterion=criterion,
+                num_classes=num_classes,
+                optimizer=None,
+            )
+        else:
+            selected_val_metrics_raw = run_head_epoch(
+                head=classifier.head,
+                loader=val_loader,
+                criterion=criterion,
+                device=classifier.device,
+                num_classes=num_classes,
+                optimizer=None,
+            )
     selected_val_metrics = extend_metrics(
         selected_val_metrics_raw,
         class_names=class_names,
@@ -1742,18 +2085,28 @@ def main() -> None:
         right_name="target final test",
     )
 
-    target_features = extract_frozen_features(
-        window_set=target_build.bundle.window_set,
-        metadata=metadata,
-        config=config,
-        classifier=classifier,
-        preprocess_batch_size=args.feature_batch_size,
-        cache_dtype=cache_dtype,
-        split_name="target_final_test",
-        log_every=args.feature_log_every,
-    )
+    if partial_finetuning_enabled:
+        target_features = tokenize_windows_for_finetuning(
+            window_set=target_build.bundle.window_set,
+            metadata=metadata,
+            config=config,
+            preprocess_batch_size=args.feature_batch_size,
+            split_name="target_final_test",
+            log_every=args.feature_log_every,
+        )
+    else:
+        target_features = extract_frozen_features(
+            window_set=target_build.bundle.window_set,
+            metadata=metadata,
+            config=config,
+            classifier=classifier,
+            preprocess_batch_size=args.feature_batch_size,
+            cache_dtype=cache_dtype,
+            split_name="target_final_test",
+            log_every=args.feature_log_every,
+        )
 
-    if args.save_feature_cache:
+    if args.save_feature_cache and not partial_finetuning_enabled:
         save_population_feature_cache(
             dataset=target_features,
             bundle=target_build.bundle,
@@ -1775,14 +2128,23 @@ def main() -> None:
     )
 
     with torch.no_grad():
-        target_metrics_raw = run_head_epoch(
-            head=classifier.head,
-            loader=target_loader,
-            criterion=criterion,
-            device=classifier.device,
-            num_classes=num_classes,
-            optimizer=None,
-        )
+        if partial_finetuning_enabled:
+            target_metrics_raw = run_finetune_epoch(
+                classifier=classifier,
+                loader=target_loader,
+                criterion=criterion,
+                num_classes=num_classes,
+                optimizer=None,
+            )
+        else:
+            target_metrics_raw = run_head_epoch(
+                head=classifier.head,
+                loader=target_loader,
+                criterion=criterion,
+                device=classifier.device,
+                num_classes=num_classes,
+                optimizer=None,
+            )
     target_metrics = extend_metrics(
         target_metrics_raw,
         class_names=class_names,
@@ -1800,9 +2162,13 @@ def main() -> None:
             "task": "BNCI2014_001_motor_imagery",
             "dataset": metadata.dataset_name,
             "mode": (
-                "population_loso_linear_probe"
-                if config.head_type == "linear"
-                else "population_loso_mlp_head"
+                "population_loso_partial_finetune"
+                if partial_finetuning_enabled
+                else (
+                    "population_loso_linear_probe"
+                    if config.head_type == "linear"
+                    else "population_loso_mlp_head"
+                )
             ),
             "stage": "stage1",
             "target_subject": target_subject,
@@ -1820,8 +2186,17 @@ def main() -> None:
             "class_names": class_names,
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
-            "freeze_backbone": True,
-            "trainable_backbone_parameters": 0,
+            "freeze_backbone": not partial_finetuning_enabled,
+            "trainable_backbone_parameters": sum(
+                parameter.numel() for parameter in trainable_backbone_parameters
+            ),
+            "embedding_layer_requested": str(args.embedding_layer),
+            "embedding_layer_resolved": int(embedding_layer),
+            "embedding_layer_internal_index": int(config.output_layer_idx),
+            "unfreeze_last_n_blocks": int(args.unfreeze_last_n_blocks),
+            "unfrozen_block_indices": [
+                int(index) for index in trainable_block_indices
+            ],
             "head_type": config.head_type,
             "head_hidden_dim": int(config.head_hidden_dim),
             "head_dropout": float(config.head_dropout),
@@ -1831,6 +2206,7 @@ def main() -> None:
             ),
             "optimizer": "AdamW",
             "head_lr": float(args.head_lr),
+            "backbone_lr": float(args.backbone_lr),
             "momentum": float(args.momentum),
             "weight_decay": float(args.weight_decay),
             "seed": int(args.seed),
@@ -1855,6 +2231,11 @@ def main() -> None:
             ),
             "git_commit": git_commit,
         },
+        backbone_state_dict=(
+            classifier.backbone.model.state_dict()
+            if partial_finetuning_enabled
+            else None
+        ),
     )
 
     metrics_csv = run_dir / "epoch_metrics.csv"
@@ -1870,9 +2251,13 @@ def main() -> None:
         "status": "completed",
         "stage": "stage1",
         "experiment": (
-            "population_loso_linear_probe"
-            if config.head_type == "linear"
-            else "population_loso_mlp_head"
+            "population_loso_partial_finetune"
+            if partial_finetuning_enabled
+            else (
+                "population_loso_linear_probe"
+                if config.head_type == "linear"
+                else "population_loso_mlp_head"
+            )
         ),
         "warning": (
             "Temporary 10-second baseline: each derived window contains one "
@@ -1947,6 +2332,14 @@ def main() -> None:
             "trainable_backbone_parameters": (
                 backbone.trainable_parameters
             ),
+            "embedding_layer_requested": str(args.embedding_layer),
+            "embedding_layer_resolved": int(embedding_layer),
+            "embedding_layer_internal_index": int(config.output_layer_idx),
+            "unfreeze_last_n_blocks": int(args.unfreeze_last_n_blocks),
+            "unfrozen_blocks": [
+                int(index + 1) for index in trainable_block_indices
+            ],
+            "feature_cache_enabled": feature_cache_enabled,
             "target_sample_rate": config.target_sample_rate,
             "target_num_points": config.target_num_points,
             "num_tokens": config.num_tokens,
@@ -1970,6 +2363,19 @@ def main() -> None:
             "best_epoch": best_epoch,
             "metric_for_best": args.metric_for_best,
             "head_lr": args.head_lr,
+            "backbone_lr": args.backbone_lr,
+            "unfreeze_last_n_blocks": args.unfreeze_last_n_blocks,
+            "embedding_layer": embedding_layer,
+            "embedding_layer_internal_index": config.output_layer_idx,
+            "unfrozen_blocks": [
+                int(index + 1) for index in trainable_block_indices
+            ],
+            "trainable_backbone_params": sum(
+                parameter.numel() for parameter in trainable_backbone_parameters
+            ),
+            "trainable_head_params": sum(
+                parameter.numel() for parameter in head_parameters
+            ),
             "head_type": config.head_type,
             "head_hidden_dim": config.head_hidden_dim,
             "head_dropout": config.head_dropout,
@@ -2009,6 +2415,19 @@ def main() -> None:
         "head_dropout": config.head_dropout,
         "head_norm": config.head_norm,
         "head_lr": args.head_lr,
+        "backbone_lr": args.backbone_lr,
+        "embedding_layer": embedding_layer,
+        "embedding_layer_internal_index": config.output_layer_idx,
+        "unfreeze_last_n_blocks": args.unfreeze_last_n_blocks,
+        "unfrozen_blocks": [
+            int(index + 1) for index in trainable_block_indices
+        ],
+        "trainable_backbone_params": sum(
+            parameter.numel() for parameter in trainable_backbone_parameters
+        ),
+        "trainable_head_params": sum(
+            parameter.numel() for parameter in head_parameters
+        ),
         "weight_decay": args.weight_decay,
         "seed": args.seed,
     }

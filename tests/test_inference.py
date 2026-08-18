@@ -17,6 +17,7 @@ import torch
 from bci_dayloop.inference.predictor import (
     PreparedPredictor,
 )
+from bci_dayloop.runtime.adaptation_types import OnlineUpdateResult
 from bci_dayloop.runtime.types import (
     ModelOutput,
     PreparedModelInput,

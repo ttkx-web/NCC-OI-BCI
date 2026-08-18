@@ -150,7 +150,7 @@ def test_missing_file_is_an_argparse_error(tmp_path: Path, capsys: pytest.Captur
 
     error = capsys.readouterr().err
     assert "Input 'missing'" in error
-    assert str(missing) in error
+    assert repr(str(missing)) in error
     assert "does not exist" in error
 
 
@@ -199,5 +199,5 @@ def test_missing_gain_fields_identify_input_path_and_field(
 
     error = capsys.readouterr().err
     assert "Input '50m'" in error
-    assert str(summary) in error
+    assert repr(str(summary)) in error
     assert missing_path in error

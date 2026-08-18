@@ -13,9 +13,7 @@ import torch
 
 from _bootstrap import ROOT
 
-from bci_dayloop.data.hdf5_dataset import (
-    EEGHDF5,
-)
+from bci_dayloop.data.sequential_dataset import SequentialDataset, load_sequential_dataset
 from bci_dayloop.data.preprocessing import (
     PreprocessingConfig,
 )
@@ -115,8 +113,7 @@ def replace_directory_atomically(
 def verify_package(
     *,
     package_path: Path,
-    dataset: EEGHDF5,
-    session_name: str,
+    dataset: SequentialDataset,
     device: str,
 ) -> dict[str, Any]:
     loaded = load_runtime_package(
@@ -131,12 +128,7 @@ def verify_package(
             f"got {loaded.model_type!r}."
         )
 
-    session = dataset.load(session_name)
-
-    trials = np.asarray(
-        session["data"],
-        dtype=np.float32,
-    )
+    trials = np.asarray(dataset.data, dtype=np.float32)
 
     raw_points = int(
         round(
@@ -145,10 +137,10 @@ def verify_package(
         )
     )
 
-    if trials.shape[-1] < raw_points:
+    if trials.shape[-1] != raw_points:
         raise ValueError(
-            "Test trial is shorter than the "
-            "package window."
+            "Export smoke source trial must exactly match the package window; "
+            "no crop, padding, or cross-trial concatenation is allowed."
         )
 
     raw_window = RawEEGWindow(
@@ -313,7 +305,7 @@ def main() -> None:
             "contain state_dict."
         )
 
-    dataset = EEGHDF5(data_path)
+    dataset = load_sequential_dataset(data_path, session=args.session)
     data_metadata = dataset.metadata
 
     class_names = tuple(
@@ -451,7 +443,6 @@ def main() -> None:
             verification = verify_package(
                 package_path=saved_package,
                 dataset=dataset,
-                session_name=args.session,
                 device=args.device,
             )
 
@@ -465,7 +456,6 @@ def main() -> None:
             verify_package(
                 package_path=output_path,
                 dataset=dataset,
-                session_name=args.session,
                 device=args.device,
             )
 

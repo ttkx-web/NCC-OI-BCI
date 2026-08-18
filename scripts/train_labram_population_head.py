@@ -31,9 +31,10 @@ import torch
 
 from _bootstrap import ROOT
 
-from bci_dayloop.data.hdf5_dataset import (
-    EEGHDF5,
-    HDF5Metadata,
+from bci_dayloop.data.sequential_dataset import (
+    SequentialDatasetMetadata,
+    load_sequential_dataset,
+    resolve_population_split_plan,
 )
 from bci_dayloop.data.preprocessing import (
     EEGPreprocessor,
@@ -173,8 +174,8 @@ def resolve_subject_file(
 
 
 def validate_metadata_compatibility(
-    reference: HDF5Metadata,
-    candidate: HDF5Metadata,
+    reference: SequentialDatasetMetadata,
+    candidate: SequentialDatasetMetadata,
     *,
     subject_id: int,
     path: Path,
@@ -400,7 +401,7 @@ def load_preprocessed_subject_session(
     path: Path,
     session_name: str,
     preprocessor: EEGPreprocessor,
-    reference_metadata: HDF5Metadata | None,
+    reference_metadata: SequentialDatasetMetadata | None,
     expected_window_sec: float,
     trial_window_anchor: str,
     maximum_per_class: int | None,
@@ -408,10 +409,10 @@ def load_preprocessed_subject_session(
 ) -> tuple[
     np.ndarray,
     np.ndarray,
-    HDF5Metadata,
+    SequentialDatasetMetadata,
     dict[str, Any],
 ]:
-    dataset = EEGHDF5(path)
+    dataset = load_sequential_dataset(path, session=session_name)
     metadata = dataset.metadata
 
     if reference_metadata is not None:
@@ -422,30 +423,23 @@ def load_preprocessed_subject_session(
             path=path,
         )
 
-    payload = dataset.load(session_name)
-
-    validate_loaded_session(
-        payload,
-        subject_id=subject_id,
-        session_name=session_name,
-        path=path,
-    )
-
-    source_data = np.asarray(
-        payload["data"],
-        dtype=np.float32,
-    )
-
-    labels = np.asarray(
-        payload["labels"],
-        dtype=np.int64,
-    )
+    source_data = np.asarray(dataset.data, dtype=np.float32)
+    labels = np.asarray(dataset.labels, dtype=np.int64)
 
     source_num_samples = int(source_data.shape[-1])
     source_window_sec = (
         source_num_samples
         / float(metadata.sample_rate)
     )
+
+    if (
+        metadata.dataset_name == "workload_pbci_hackathon"
+        and not np.isclose(source_window_sec, expected_window_sec, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(
+            "Workload trials must be consumed at their persisted window duration; "
+            f"dataset={source_window_sec}, requested={expected_window_sec}."
+        )
 
     target_num_samples = int(
         round(
@@ -934,11 +928,8 @@ def main() -> None:
             "in --subjects."
         )
 
-    population_subjects = [
-        subject
-        for subject in subjects
-        if subject != target_subject
-    ]
+    split_plan = resolve_population_split_plan(subjects, target_subject, args.train_session, args.validation_session, args.final_test_session)
+    population_subjects = list(split_plan.train_subjects)
 
     if not population_subjects:
         raise ValueError(
@@ -1113,7 +1104,7 @@ def main() -> None:
     }
 
     reference_metadata: (
-        HDF5Metadata | None
+        SequentialDatasetMetadata | None
     ) = None
 
     print(

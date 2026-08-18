@@ -52,9 +52,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from _bootstrap import ROOT
 
-from bci_dayloop.data.hdf5_dataset import (
-    EEGHDF5,
-    HDF5Metadata,
+from bci_dayloop.data.sequential_dataset import (
+    SequentialDatasetMetadata,
+    load_sequential_dataset,
+    resolve_population_split_plan,
 )
 from bci_dayloop.models.cbramod.backbone import (
     CBraModBackbone,
@@ -440,8 +441,8 @@ def validate_no_trial_leakage(
 
 
 def validate_metadata_compatibility(
-    reference: HDF5Metadata,
-    candidate: HDF5Metadata,
+    reference: SequentialDatasetMetadata,
+    candidate: SequentialDatasetMetadata,
     *,
     subject_id: int,
     path: Path,
@@ -526,7 +527,7 @@ def resolve_subject_file(
 def prepare_cbramod_trials(
     *,
     data: np.ndarray,
-    metadata: HDF5Metadata,
+    metadata: SequentialDatasetMetadata,
     trial_ids: np.ndarray,
     subject_id: int,
     session_name: str,
@@ -561,7 +562,7 @@ def prepare_cbramod_trials(
             sample_rate=float(metadata.sample_rate),
             unit=str(metadata.unit),
             layout="CT",
-            trial_id=str(int(trial_ids[index])),
+            trial_id=str(trial_ids[index]),
             metadata={
                 "subject_id": int(subject_id),
                 "session": session_name,
@@ -698,14 +699,14 @@ def build_subject_feature_split(
     subject_id: int,
     session_name: str,
     subject_path: Path,
-    reference_metadata: HDF5Metadata | None,
+    reference_metadata: SequentialDatasetMetadata | None,
     canonicalizer: SignalCanonicalizer,
     preprocessor: CBraModPipelinePreprocessor,
     backbone: CBraModBackbone,
     feature_batch_size: int,
     direct_trial_anchor: str,
-) -> tuple[FeatureSplit, HDF5Metadata]:
-    dataset = EEGHDF5(subject_path)
+) -> tuple[FeatureSplit, SequentialDatasetMetadata]:
+    dataset = load_sequential_dataset(subject_path, session=session_name)
     metadata = dataset.metadata
 
     if reference_metadata is not None:
@@ -716,27 +717,10 @@ def build_subject_feature_split(
             path=subject_path,
         )
 
-    loaded = dataset.load(session_name)
-
-    data = np.asarray(
-        loaded["data"],
-        dtype=np.float32,
-    )
-
-    labels = np.asarray(
-        loaded["labels"],
-        dtype=np.int64,
-    )
-
-    trial_ids = np.asarray(
-        loaded["trial_ids"],
-        dtype=np.int64,
-    )
-
-    subject_ids = np.asarray(
-        loaded["subject_ids"],
-        dtype=np.int64,
-    )
+    data = np.asarray(dataset.data, dtype=np.float32)
+    labels = np.asarray(dataset.labels, dtype=np.int64)
+    trial_ids = np.asarray(dataset.trial_ids, dtype=str)
+    subject_ids = np.full(len(data), subject_id, dtype=np.int64)
 
     if data.ndim != 3:
         raise ValueError(
@@ -754,29 +738,6 @@ def build_subject_feature_split(
             f"{subject_path}: labels length mismatch."
         )
 
-    if not np.all(subject_ids == subject_id):
-        actual_subjects = sorted(
-            set(subject_ids.tolist())
-        )
-
-        raise ValueError(
-            f"{subject_path}: expected subject {subject_id}, "
-            f"found {actual_subjects}."
-        )
-
-    loaded_sessions = set(
-        np.asarray(
-            loaded["session_ids"]
-        ).astype(str).tolist()
-    )
-
-    if loaded_sessions != {session_name}:
-        raise ValueError(
-            f"{subject_path}: expected only session "
-            f"{session_name!r}, got "
-            f"{sorted(loaded_sessions)}."
-        )
-
     validate_labels(
         labels,
         num_classes=len(metadata.class_names),
@@ -784,6 +745,15 @@ def build_subject_feature_split(
             f"subject_{subject_id:02d}/{session_name}"
         ),
     )
+
+    if (
+        metadata.dataset_name == "workload_pbci_hackathon"
+        and not np.isclose(metadata.window_sec, preprocessor.config.window_seconds, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(
+            "Workload trials must be consumed at their persisted window duration; "
+            f"dataset={metadata.window_sec}, requested={preprocessor.config.window_seconds}."
+        )
 
     data, _ = select_direct_trial_window(
         data,
@@ -813,14 +783,8 @@ def build_subject_feature_split(
     )
 
     global_trial_ids = np.asarray(
-        [
-            encode_source_trial_id(
-                subject_id,
-                int(trial_id),
-            )
-            for trial_id in trial_ids
-        ],
-        dtype=np.int64,
+        [f"{subject_id}:{session_name}:{trial_id}" for trial_id in trial_ids],
+        dtype=str,
     )
 
     return (
@@ -1332,6 +1296,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--window-seconds",
+        "--window-sec",
+        dest="window_seconds",
         type=float,
         default=4.0,
     )
@@ -1458,11 +1424,8 @@ def main() -> None:
             f"Got target={target_subject}, subjects={subjects}."
         )
 
-    population_subjects = [
-        subject
-        for subject in subjects
-        if subject != target_subject
-    ]
+    split_plan = resolve_population_split_plan(subjects, target_subject, args.train_session, args.validation_session, args.final_test_session)
+    population_subjects = list(split_plan.train_subjects)
 
     if not population_subjects:
         raise ValueError(
@@ -1519,7 +1482,7 @@ def main() -> None:
     )
 
     class_names: tuple[str, ...] | None = None
-    reference_metadata: HDF5Metadata | None = None
+    reference_metadata: SequentialDatasetMetadata | None = None
     subject_paths: dict[int, Path] = {}
 
     for subject_id in subjects:
@@ -1531,7 +1494,9 @@ def main() -> None:
 
         subject_paths[subject_id] = subject_path
 
-        metadata = EEGHDF5(subject_path).metadata
+        metadata = load_sequential_dataset(
+            subject_path, session=args.train_session
+        ).metadata
 
         if reference_metadata is None:
             reference_metadata = metadata
@@ -1554,12 +1519,6 @@ def main() -> None:
             "Could not resolve dataset metadata."
         )
 
-    if len(class_names) != 4:
-        raise ValueError(
-            "The current CBRaMod population protocol is fixed "
-            "to BNCI2014_001 four-class MI. Got "
-            f"class_names={list(class_names)}."
-        )
 
     config = CBraModConfig(
         checkpoint_path=checkpoint_path,
@@ -1571,7 +1530,9 @@ def main() -> None:
         n_channels=22,
         time_segments=time_segments,
         points_per_patch=200,
-        input_unit=args.input_unit,
+        # The source contract is authoritative; Workload is stored in V while
+        # the existing BNCI files declare uV.
+        input_unit=str(reference_metadata.unit),
 
         strict_window_duration=True,
         filter_enabled=bool(args.filter_enabled),

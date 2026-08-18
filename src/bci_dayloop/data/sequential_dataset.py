@@ -50,6 +50,35 @@ class SequentialDataset:
         return int(self.data.shape[0])
 
 
+@dataclass(frozen=True, slots=True)
+class PopulationSplitPlan:
+    train_subjects: tuple[int, ...]
+    validation_subjects: tuple[int, ...]
+    final_test_subjects: tuple[int, ...]
+    train_session: str
+    validation_session: str
+    final_test_session: str
+
+
+def resolve_population_split_plan(
+    subjects: object, target_subject: int, train_session: str,
+    validation_session: str, final_test_session: str,
+) -> PopulationSplitPlan:
+    normalized = tuple(sorted(set(int(value) for value in subjects)))
+    if not normalized or target_subject not in normalized:
+        raise ValueError("target_subject must occur in a non-empty subjects list.")
+    if any(not str(value).strip() for value in (train_session, validation_session, final_test_session)):
+        raise ValueError("Population split sessions must be non-empty.")
+    population = tuple(value for value in normalized if value != target_subject)
+    if not population:
+        raise ValueError("Population split requires at least one non-target subject.")
+    return PopulationSplitPlan(population, population, (target_subject,), str(train_session), str(validation_session), str(final_test_session))
+
+
+def source_trial_identities(dataset: SequentialDataset) -> tuple[tuple[str, str, str, str], ...]:
+    return tuple((dataset.metadata.dataset_name, str(subject), str(session), str(window)) for subject, session, window in zip(dataset.subject_ids, dataset.session_ids, dataset.window_ids, strict=True))
+
+
 def _as_trial_vector(values: object, *, name: str, expected: int) -> np.ndarray:
     array = np.asarray(values).reshape(-1)
     if array.shape != (expected,):

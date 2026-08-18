@@ -16,7 +16,7 @@ import torch
 
 from _bootstrap import ROOT
 
-from bci_dayloop.data.hdf5_dataset import EEGHDF5
+from bci_dayloop.data.sequential_dataset import SequentialDataset, load_sequential_dataset
 from bci_dayloop.models.cbramod.runtime import (
     CBraModRuntime,
     build_cbramod_runtime,
@@ -361,8 +361,7 @@ def runtime_kwargs_from_training_report(
 
 def extract_first_trial_window(
     *,
-    dataset: EEGHDF5,
-    session_name: str,
+    dataset: SequentialDataset,
     window_seconds: float,
     anchor: str,
 ) -> RawEEGWindow:
@@ -374,12 +373,7 @@ def extract_first_trial_window(
     Runtime Replay 和真实设备会直接提供完整滑窗，
     不会再次执行该裁剪。
     """
-    loaded = dataset.load(session_name)
-
-    data = np.asarray(
-        loaded["data"],
-        dtype=np.float32,
-    )
+    data = np.asarray(dataset.data, dtype=np.float32)
 
     if data.ndim != 3:
         raise ValueError(
@@ -389,7 +383,7 @@ def extract_first_trial_window(
 
     if len(data) == 0:
         raise ValueError(
-            f"Session {session_name!r} is empty."
+            "Sequential dataset session is empty."
         )
 
     if anchor not in {"start", "center", "end"}:
@@ -409,6 +403,15 @@ def extract_first_trial_window(
     if target_samples <= 0:
         raise ValueError(
             "Target smoke-test window has no samples."
+        )
+
+    if (
+        metadata.dataset_name == "workload_pbci_hackathon"
+        and source_samples != target_samples
+    ):
+        raise ValueError(
+            "Workload export smoke must use the persisted trial window exactly; "
+            f"source_samples={source_samples}, target_samples={target_samples}."
         )
 
     if target_samples > source_samples:
@@ -443,13 +446,11 @@ def extract_first_trial_window(
         sample_rate=sample_rate,
         unit=str(metadata.unit),
         layout="CT",
-        trial_id=str(
-            int(loaded["trial_ids"][0])
-        ),
+        trial_id=str(dataset.trial_ids[0]),
         window_id="export_smoke_test",
         label=int(loaded["labels"][0]),
         metadata={
-            "session": session_name,
+            "session": str(dataset.session_ids[0]),
             "source": (
                 "export_cbramod_model_package"
             ),
@@ -1133,7 +1134,7 @@ def main() -> None:
             name="command-map JSON",
         )
 
-    dataset = EEGHDF5(data_path)
+    dataset = load_sequential_dataset(data_path, session=args.session)
     metadata = dataset.metadata
 
     class_names = tuple(
@@ -1141,12 +1142,6 @@ def main() -> None:
         for name in metadata.class_names
     )
 
-    if len(class_names) != 4:
-        raise ValueError(
-            "CBraMod population package currently expects "
-            "four BNCI2014_001 classes, got "
-            f"{list(class_names)}."
-        )
 
     report = load_json_mapping(training_report_path)
 
@@ -1274,7 +1269,6 @@ def main() -> None:
 
     raw_window = extract_first_trial_window(
         dataset=dataset,
-        session_name=args.session,
         window_seconds=float(
             runtime_kwargs["window_seconds"]
         ),

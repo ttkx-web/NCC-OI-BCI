@@ -677,6 +677,37 @@ streamlit run web/app.py
 
 ---
 
+## 17.1 Passive BCI 模型服务
+
+[Passive BCI](https://github.com/ttkx-web) 浏览器负责采集与切窗；本仓库提供 WebSocket 推理服务。浏览器只发送原始 `uV`、`layout=CT` 窗口。窗长由 hello 的 `input.window_sec` 声明：mock / 50M 为 4 秒，本地 REVE 为 2 秒。
+
+没有 Runtime Package 时用固定概率 mock：
+
+```bash
+python scripts/serve_dev_mock_model.py --host 127.0.0.1 --port 8768 --profile neuracle59
+```
+
+本地 REVE 权重（`checkpoints/backbones/reve-base` + `reve-positions`）：
+
+```bash
+python scripts/serve_reve_model.py --host 127.0.0.1 --port 8768 --size base
+# 需要: pip install transformers einops safetensors
+```
+
+正式包体：
+
+```bash
+python scripts/serve_runtime_model.py \
+  --package <runtime-package> \
+  --host 127.0.0.1 \
+  --port 8768 \
+  --strategy none
+```
+
+端点：`ws://127.0.0.1:8768/v1/model`（也接受根路径 `/`，供 Vite `/ws/model` 代理）。
+
+---
+
 ## 18. Stage 2A：Neuracle 离线数据
 
 仓库已提供：

@@ -9,4 +9,5 @@ mne>=1.6
 scikit-learn>=1.4
 pandas>=2.0
 streamlit>=1.39
+websockets>=12
 pytest>=8.0

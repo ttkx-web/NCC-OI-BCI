@@ -27,7 +27,9 @@ def test_demo_state_decoder_returns_complete_presentation_contract() -> None:
     assert 0.0 <= result.signal_quality <= 100.0
     assert result.waveform is not None
     assert result.psd_frequencies is not None
-    assert result.topomap_values is not None
+    assert result.cortical_activity is not None
+    assert result.cortical_activity.left_rgba.shape[-1] == 4
+    assert result.cortical_activity.right_rgba.shape[-1] == 4
     probabilities = result.motor_intent["probabilities"]
     assert set(probabilities) == set(MOTOR_LABELS_CN)
     assert np.isclose(sum(probabilities.values()), 1.0)
@@ -45,3 +47,43 @@ def test_motor_intent_transitions_are_smoothed_not_random() -> None:
     # the old probability decays gradually instead of becoming a random value.
     assert probabilities[0] > 0.65
     assert probabilities[11] > probabilities[13] > 0.05
+
+
+class CountingMotorDecoder:
+    display_name = "Counting"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def predict(self, **_: object) -> dict[str, object]:
+        self.calls += 1
+        return {
+            "label": "left_hand",
+            "label_cn": "左手",
+            "confidence": 1.0,
+            "probabilities": {name: 0.25 for name in MOTOR_LABELS_CN},
+        }
+
+
+def test_new_state_indices_are_bounded_and_emotion_is_structured() -> None:
+    decoder = DemoStateDecoder(compute_motor_intent=False)
+    results = [
+        decoder.decode(_eeg_window(), sample_rate=250.0, channel_names=["F3", "F4", "C3", "C4"])
+        for _ in range(6)
+    ]
+
+    assert list(results[-1].states) == list(STATE_LABELS_CN)
+    assert len(results[-1].states) == 16
+    assert all(0.0 <= value <= 100.0 for result in results for value in result.states.values())
+    assert results[-1].emotion is not None
+    assert results[-1].emotion.label_cn in {"放松", "愉悦", "平稳", "专注", "紧张"}
+    assert results[-1].emotion.emoji
+    assert results[-1].motor_intent["decoder_type"] == "disabled"
+
+
+def test_hidden_motor_intent_skips_motor_decoder_inference() -> None:
+    motor = CountingMotorDecoder()
+    decoder = DemoStateDecoder(motor_decoder=motor, compute_motor_intent=False)
+    decoder.decode(_eeg_window(), sample_rate=250.0, channel_names=["F3", "F4", "C3", "C4"])
+
+    assert motor.calls == 0

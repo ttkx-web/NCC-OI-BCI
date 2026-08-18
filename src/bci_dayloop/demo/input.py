@@ -11,6 +11,9 @@ import numpy as np
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
 
 
+MIN_STEP_SEC = 0.1
+
+
 @dataclass(frozen=True, slots=True)
 class DemoTrial:
     samples: np.ndarray
@@ -52,8 +55,8 @@ def load_demo_trial(data_path: str | Path, *, session: str, trial_index: int) ->
 def window_count(trial: DemoTrial, window_sec: float, step_sec: float) -> int:
     window = int(round(window_sec * trial.sample_rate))
     step = int(round(step_sec * trial.sample_rate))
-    if window <= 0 or step <= 0 or step > window:
-        raise ValueError("window_sec and step_sec must be positive, with step <= window")
+    if window <= 0 or step_sec < MIN_STEP_SEC or step > window:
+        raise ValueError(f"window_sec must be positive and step_sec must be in [{MIN_STEP_SEC}, window_sec]")
     return max(0, 1 + (trial.samples.shape[1] - window) // step)
 
 

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from bci_dayloop.demo.cortical_activity import CorticalActivityResult
 
 
 STATE_LABELS_CN: dict[str, str] = {
@@ -50,8 +54,8 @@ class BrainStateResult:
 
     Values in ``states`` and ``signal_quality`` are bounded to 0--100.  The
     raw waveform is included so UI code never needs to run feature extraction.
-    ``topomap_positions`` is optional because not every device uses a standard
-    montage.
+    ``cortical_activity`` is a sensor-derived visualization over static
+    templates; it is not an EEG source-localization result.
     """
 
     timestamp: float
@@ -74,6 +78,7 @@ class BrainStateResult:
     average_latency_ms: float | None = None
     p95_latency_ms: float | None = None
     emotion: EmotionState | None = None
+    cortical_activity: CorticalActivityResult | None = None
 
     @property
     def brain_state_score(self) -> float:

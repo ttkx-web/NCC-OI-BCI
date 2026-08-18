@@ -8,10 +8,11 @@ from time import perf_counter, time
 import numpy as np
 
 from bci_dayloop.demo.interpretation import make_interpretation
+from bci_dayloop.demo.cortical_activity import CorticalActivityMapper
 from bci_dayloop.demo.motor_decoder import DemoMotorIntentDecoder, MotorIntentDecoder
-from bci_dayloop.demo.schemas import BrainStateResult, STATE_LABELS_CN
+from bci_dayloop.demo.schemas import BrainStateResult, EmotionState, STATE_LABELS_CN
 from bci_dayloop.demo.signal_features import SignalFeatures, extract_signal_features
-from bci_dayloop.demo.utils import RollingLatency, bounded_score, standard_1020_positions
+from bci_dayloop.demo.utils import RollingLatency, bounded_score
 
 
 class DemoStateDecoder:
@@ -29,12 +30,22 @@ class DemoStateDecoder:
         smoothing: float = 0.34,
         history_size: int = 24,
         motor_decoder: MotorIntentDecoder | None = None,
+        compute_motor_intent: bool = True,
     ) -> None:
         self.device = device.upper()
         self.smoothing = float(np.clip(smoothing, 0.01, 1.0))
         self.motor_decoder: MotorIntentDecoder = motor_decoder or DemoMotorIntentDecoder()
+        self.compute_motor_intent = compute_motor_intent
         self._smoothed_states: dict[str, float] = {}
         self._engagement_history: deque[float] = deque(maxlen=max(4, history_size))
+        self._state_vector_history: deque[np.ndarray] = deque(maxlen=max(4, history_size))
+        self._previous_mean_psd: np.ndarray | None = None
+        self._emotion_label: str | None = None
+        self._emotion_candidate: str | None = None
+        self._emotion_candidate_count = 0
+        # The mapper loads static RGBA assets and precomputes masks once.  It is
+        # deliberately independent of MNE/Nilearn and retained across trials.
+        self._cortical_mapper = CorticalActivityMapper()
         self._latency = RollingLatency()
 
     def reset(self) -> None:
@@ -43,11 +54,21 @@ class DemoStateDecoder:
             reset_motor_decoder()
         self._smoothed_states.clear()
         self._engagement_history.clear()
+        self._state_vector_history.clear()
+        self._previous_mean_psd = None
+        self._emotion_label = None
+        self._emotion_candidate = None
+        self._emotion_candidate_count = 0
+        self._cortical_mapper.reset()
         self._latency = RollingLatency()
 
     def set_motor_decoder(self, motor_decoder: MotorIntentDecoder) -> None:
         """Swap only the motor head while retaining neural-state history."""
         self.motor_decoder = motor_decoder
+
+    def set_compute_motor_intent(self, enabled: bool) -> None:
+        """Toggle motor inference without removing the injected decoder."""
+        self.compute_motor_intent = enabled
 
     @staticmethod
     def _raw_states(features: SignalFeatures) -> dict[str, float]:
@@ -89,6 +110,77 @@ class DemoStateDecoder:
         self._smoothed_states["attention_stability"] = stability
         return result
 
+    def _rhythm_stability(self, psd: np.ndarray) -> float:
+        mean_psd = np.mean(psd, axis=0)
+        if self._previous_mean_psd is None or self._previous_mean_psd.shape != mean_psd.shape:
+            similarity = 0.72
+        else:
+            similarity = float(
+                np.dot(mean_psd, self._previous_mean_psd)
+                / (np.linalg.norm(mean_psd) * np.linalg.norm(self._previous_mean_psd) + 1e-12)
+            )
+        self._previous_mean_psd = mean_psd.copy()
+        return float(np.clip(similarity * 100.0, 0.0, 100.0))
+
+    @staticmethod
+    def _additional_raw_states(features: SignalFeatures, rhythm_stability: float) -> dict[str, float]:
+        return {
+            "rhythm_stability": rhythm_stability,
+            "spatial_balance": float(np.clip(features.spatial_balance * 100.0, 0.0, 100.0)),
+            "neural_mobility": bounded_score(features.hjorth_mobility, center=0.55, scale=0.38),
+            "dynamic_complexity": bounded_score(features.hjorth_complexity, center=1.45, scale=0.72),
+            "signal_activity": bounded_score(np.log1p(features.temporal_activity), center=1.35, scale=0.9),
+            "regional_consistency": float(np.clip(features.regional_consistency * 100.0, 0.0, 100.0)),
+        }
+
+    def _state_stability(self, states: dict[str, float]) -> float:
+        names = [name for name in STATE_LABELS_CN if name not in {"emotion_state", "state_stability", "attention_stability"}]
+        vector = np.asarray([states[name] for name in names], dtype=np.float64)
+        if len(self._state_vector_history) < 3:
+            raw_stability = 70.0
+        else:
+            reference = np.mean(np.asarray(self._state_vector_history), axis=0)
+            distance = float(np.linalg.norm(vector - reference) / np.sqrt(vector.size))
+            raw_stability = float(np.clip(100.0 * np.exp(-distance / 22.0), 0.0, 100.0))
+        self._state_vector_history.append(vector)
+        old = self._smoothed_states.get("state_stability", raw_stability)
+        score = float(np.clip((1.0 - self.smoothing) * old + self.smoothing * raw_stability, 0.0, 100.0))
+        self._smoothed_states["state_stability"] = score
+        return score
+
+    def _emotion(self, states: dict[str, float]) -> EmotionState:
+        relaxation = states["neural_relaxation"]
+        arousal = states["cortical_arousal"]
+        engagement = states["cognitive_engagement"]
+        load = states["cognitive_load"]
+        if relaxation >= 65.0 and arousal < 45.0:
+            candidate, score = "relaxed", 82.0
+        elif relaxation >= 55.0 and 40.0 <= arousal < 65.0:
+            candidate, score = "positive", 72.0
+        elif engagement >= 65.0 and load < 68.0:
+            candidate, score = "focused", 74.0
+        elif arousal >= 65.0 and load >= 60.0:
+            candidate, score = "tense", 28.0
+        else:
+            candidate, score = "neutral", 55.0
+        if candidate == self._emotion_candidate:
+            self._emotion_candidate_count += 1
+        else:
+            self._emotion_candidate, self._emotion_candidate_count = candidate, 1
+        if self._emotion_label is None or candidate == self._emotion_label or self._emotion_candidate_count >= 3:
+            self._emotion_label = candidate
+        metadata = {
+            "relaxed": ("放松", "😌"),
+            "positive": ("愉悦", "🙂"),
+            "neutral": ("平稳", "😐"),
+            "focused": ("专注", "🤔"),
+            "tense": ("紧张", "😣"),
+        }
+        label = self._emotion_label or "neutral"
+        label_cn, emoji = metadata[label]
+        display_score = score if label == candidate else {"relaxed": 82.0, "positive": 72.0, "neutral": 55.0, "focused": 74.0, "tense": 28.0}[label]
+        return EmotionState(label=label, label_cn=label_cn, emoji=emoji, score=display_score)
+
     def decode(
         self,
         samples: np.ndarray,
@@ -105,23 +197,37 @@ class DemoStateDecoder:
             raise ValueError(f"samples must be [channels, samples], got {values.shape}")
         if values.shape[0] != len(channel_names):
             raise ValueError("channel_names length does not match samples")
-        features = extract_signal_features(values, sample_rate, unit=unit)
-        states = self._smooth_states(self._raw_states(features))
-        motor = self.motor_decoder.predict(
-            band_power=features.relative_band_power,
-            rms_uv=features.rms_uv,
-            samples=values,
-            sample_rate=sample_rate,
-            channel_names=channel_names,
-            unit=unit,
+        features = extract_signal_features(values, sample_rate, unit=unit, channel_names=channel_names)
+        raw_states = self._raw_states(features)
+        raw_states.update(self._additional_raw_states(features, self._rhythm_stability(features.psd)))
+        states = self._smooth_states(raw_states)
+        states["state_stability"] = self._state_stability(states)
+        emotion = self._emotion(states)
+        emotion_old = self._smoothed_states.get("emotion_state", emotion.score)
+        states["emotion_state"] = float(
+            np.clip((1.0 - self.smoothing) * emotion_old + self.smoothing * emotion.score, 0.0, 100.0)
         )
-        positions, positioned_names = standard_1020_positions(channel_names)
-        if positioned_names is None:
-            topomap_values = None
+        self._smoothed_states["emotion_state"] = states["emotion_state"]
+        states = {name: states[name] for name in STATE_LABELS_CN}
+        if self.compute_motor_intent:
+            motor = self.motor_decoder.predict(
+                band_power=features.relative_band_power,
+                rms_uv=features.rms_uv,
+                samples=values,
+                sample_rate=sample_rate,
+                channel_names=channel_names,
+                unit=unit,
+            )
         else:
-            by_name = {name: value for name, value in zip(channel_names, features.channel_alpha_power, strict=True)}
-            topomap_values = np.asarray([by_name[name] for name in positioned_names], dtype=np.float64)
-            topomap_values = np.log10(topomap_values + 1e-12)
+            motor = {
+                "label": "",
+                "label_cn": "",
+                "confidence": 0.0,
+                "probabilities": {},
+                "decoder_type": "disabled",
+                "decoder_display_name": "disabled",
+            }
+        cortical_activity = self._cortical_mapper.update(channel_names, features.channel_relative_band_power)
         latency_ms = (perf_counter() - started) * 1000.0
         average_latency_ms, p95_latency_ms = self._latency.add(latency_ms)
         interpretation = make_interpretation(states, motor, features.relative_band_power)
@@ -134,9 +240,6 @@ class DemoStateDecoder:
             latency_ms=latency_ms,
             device=self.device,
             interpretation=interpretation,
-            topomap_values=topomap_values,
-            topomap_positions=positions,
-            topomap_channel_names=positioned_names,
             waveform=values.copy(),
             channel_names=list(channel_names),
             sample_rate=float(sample_rate),
@@ -145,6 +248,8 @@ class DemoStateDecoder:
             psd_values=np.mean(features.psd, axis=0),
             average_latency_ms=average_latency_ms,
             p95_latency_ms=p95_latency_ms,
+            emotion=emotion,
+            cortical_activity=cortical_activity,
         )
 
 

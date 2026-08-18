@@ -1,6 +1,6 @@
 # Omni Neural Decoder：EEG 多状态解码 Demo
 
-这是一个独立的 Streamlit 可视化层，用于产品演示和视频拍摄。它读取真实 EEG HDF5 trial 的连续窗口，展示运动意图、传统 EEG 特征生成的 Neural State Index、波形、PSD、topomap、信号质量、延迟与规则式中文解读。
+这是一个独立的 Streamlit 可视化层，用于产品演示和视频拍摄。它读取真实 EEG HDF5 trial 的连续窗口，展示传统 EEG 特征生成的 Neural State Index、波形、PSD、皮层活动图、信号质量、延迟与规则式中文解读；运动意图 decoder contract 仍保留，但当前主界面默认隐藏其卡片。
 
 它不修改生产 Runtime、Replay pipeline、NeuroOnline、Rest-Tune、50M / LaBraM / CBraMod 后端、正式训练或评测脚本。选择真实运动意图模型时，Demo 会通过既有 `load_runtime_package(...)` 和 `RuntimeModel` 接口调用对应 Package；不会自行加载 checkpoint 或重写预处理。
 
@@ -41,7 +41,19 @@ python scripts/run_multistate_demo.py --data-path data/processed/bnci2014_001/su
 | 神经复杂度 | 五个频带功率分布的 spectral entropy |
 | 神经同步度 | 最多 32 个通道的平均绝对相关系数 |
 
-频带定义集中在 `bci_dayloop.demo.signal_features.EEG_BANDS`：Delta 1–4 Hz、Theta 4–8 Hz、Alpha 8–13 Hz、Beta 13–30 Hz、Gamma 30–45 Hz。PSD、topomap 输入、信号质量与延迟均由同一窗口计算；topomap 优先使用 MNE，若 montage/MNE 不可用则安全回退为标准通道位置图。
+频带定义集中在 `bci_dayloop.demo.signal_features.EEG_BANDS`：Delta 1–4 Hz、Theta 4–8 Hz、Alpha 8–13 Hz、Beta 13–30 Hz、Gamma 30–45 Hz。PSD、每通道相对频段功率、皮层活动图输入、信号质量与延迟均由同一窗口计算，不会为皮层活动图重复执行 FFT。
+
+## 皮层活动图
+
+页面中的“皮层活动图”是 **sensor-derived cortical activity visualization**：它将当前 scalp EEG 的每通道 Theta + Alpha + Beta 相对功率，通过固定的 channel-to-template pixel mapping 叠加到预生成的左右半球静态 PNG 上。它用于 Demo visualization，**不是**经过 forward/inverse modeling 得到的 EEG source localization。
+
+静态模板位于 `src/bci_dayloop/demo/assets/cortical/`，运行 Streamlit 时只会读取 PNG 并以 NumPy 叠加预计算 Gaussian masks；不会导入 Nilearn 或 MNE 来渲染皮层。开发者需要重新生成模板时才运行：
+
+```bash
+python tools/multistate_demo/generate_cortical_template.py
+```
+
+该工具使用 Nilearn 的 `fsaverage5` pial/sulcal surface 生成固定 512×384、透明背景的左右 lateral PNG，因此 Nilearn 仅是一次性开发依赖，不是 Demo runtime 依赖。
 
 信号质量为展示用启发式分数，结合有效通道比例、平坦通道、极端振幅和高频噪声代理项；不是临床伪迹检测。
 

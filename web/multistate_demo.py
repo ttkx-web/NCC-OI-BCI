@@ -7,7 +7,6 @@ import sys
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
@@ -19,15 +18,21 @@ for candidate in (ROOT, SRC):
         sys.path.insert(0, str(candidate))
 
 from bci_dayloop.data.hdf5_dataset import EEGHDF5  # noqa: E402
-from bci_dayloop.demo.input import list_demo_sessions, load_demo_trial, trial_window, window_count  # noqa: E402
+from bci_dayloop.demo.input import MIN_STEP_SEC, list_demo_sessions, load_demo_trial, trial_window, window_count  # noqa: E402
 from bci_dayloop.demo.model_package_discovery import discover_motor_intent_packages  # noqa: E402
 from bci_dayloop.demo.motor_decoder import DemoMotorIntentDecoder, ModelPackageMotorIntentDecoder, MotorIntentDecoder  # noqa: E402
 from bci_dayloop.demo.schemas import MOTOR_LABELS_CN, STATE_LABELS_CN  # noqa: E402
 from bci_dayloop.demo.state_decoder import DemoStateDecoder  # noqa: E402
 from bci_dayloop.demo.utils import score_level  # noqa: E402
+from bci_dayloop.demo.visual_state import VISUAL_INTERVAL_SEC, VisualState  # noqa: E402
 
 
 st.set_page_config(page_title="Omni Neural Decoder", page_icon=":material/neurology:", layout="wide")
+
+# Keep the motor package controls and result contract ready for future use while
+# keeping the current video-focused dashboard centered on neural-state indices.
+SHOW_MOTOR_INTENT = False
+MAX_DECODE_CATCHUP = 3
 
 DEMO_CSS = """
 <style>
@@ -49,8 +54,11 @@ h1 {font-size: 1.45rem !important; margin: 0 0 0.08rem !important; line-height: 
 .section-label {font-size:0.80rem; font-weight:600; color:#DCE6ED; margin:0.40rem 0 0.23rem;}
 .state-card {height:76px; box-sizing:border-box; padding:0.38rem 0.46rem; background:#17212B; border:1px solid #263849; border-radius:0.42rem; overflow:hidden;}
 .state-top,.state-bottom {display:flex; align-items:baseline; justify-content:space-between; gap:0.22rem;}.state-name {font-size:0.64rem; color:#B6C4CE; white-space:nowrap;}.state-value {font-size:1.02rem; color:#F3F6F9; font-weight:700;}.state-level {font-size:0.60rem; color:#7ECCD1;}.state-spark {width:48px; height:16px;}.state-track {margin-top:0.30rem; height:0.20rem;}
+.emotion-emoji {font-size:0.96rem; line-height:1;}.emotion-label {font-size:0.72rem; color:#7ECCD1; white-space:nowrap;}
 .signal-section {font-size:0.80rem; font-weight:600; color:#DCE6ED; margin:1.35rem 0 0.23rem;}
 .signal-title {font-size:0.80rem; font-weight:600; color:#DCE6ED; margin:0 0 0.05rem;}.signal-caption {font-size:0.62rem; color:#8293A1; margin:0 0 0.08rem;}
+.visual-signal-grid {display:grid; grid-template-columns:1.40fr 1fr; gap:0.55rem;}.visual-signal-pane {min-width:0;}
+.demo-debug-counter {display:none;}
 div[data-testid="stProgress"] {height:0.34rem; margin:0.08rem 0;}
 div[data-testid="stSidebar"] label, div[data-testid="stSidebar"] p {font-size:0.74rem !important;}
 div[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {margin-bottom:-0.18rem;}
@@ -103,12 +111,18 @@ def reset_replay(start_trial_index: int) -> None:
     st.session_state.demo_result = None
     st.session_state.demo_history = {name: [] for name in STATE_LABELS_CN}
     st.session_state.demo_playing = False
-    st.session_state.demo_last_tick = 0.0
     st.session_state.demo_current_trial_index = start_trial_index
     st.session_state.demo_current_window_index = 0
     st.session_state.demo_last_trial_index = None
     st.session_state.demo_last_window_index = None
     st.session_state.demo_finished = False
+    st.session_state.demo_next_decode_stream_time = 0.0
+    st.session_state.demo_trial_decode_complete = False
+    st.session_state.demo_static_revision = 0
+    st.session_state.demo_static_rendered_revision = -1
+    st.session_state.demo_cortical_revision = 0
+    st.session_state.demo_cortical_rendered_revision = -1
+    st.session_state.demo_visual_state.reset()
 
 
 def ensure_decoder(
@@ -119,11 +133,16 @@ def ensure_decoder(
     if st.session_state.get("demo_configuration") != configuration:
         reset_replay(start_trial_index)
         st.session_state.demo_configuration = configuration
-        st.session_state.demo_decoder = DemoStateDecoder(device=str(configuration[-1]), motor_decoder=motor_decoder)
+        st.session_state.demo_decoder = DemoStateDecoder(
+            device=str(configuration[-1]), motor_decoder=motor_decoder, compute_motor_intent=SHOW_MOTOR_INTENT
+        )
     elif st.session_state.demo_decoder is None:
-        st.session_state.demo_decoder = DemoStateDecoder(device=str(configuration[-1]), motor_decoder=motor_decoder)
+        st.session_state.demo_decoder = DemoStateDecoder(
+            device=str(configuration[-1]), motor_decoder=motor_decoder, compute_motor_intent=SHOW_MOTOR_INTENT
+        )
     else:
         st.session_state.demo_decoder.set_motor_decoder(motor_decoder)
+        st.session_state.demo_decoder.set_compute_motor_intent(SHOW_MOTOR_INTENT)
 
 
 def resolve_device(requested_device: str) -> tuple[str, str | None]:
@@ -174,7 +193,6 @@ for key, value in {
     "demo_result": None,
     "demo_history": {name: [] for name in STATE_LABELS_CN},
     "demo_playing": False,
-    "demo_last_tick": 0.0,
     "demo_configuration": None,
     "demo_current_trial_index": 0,
     "demo_current_window_index": 0,
@@ -184,8 +202,22 @@ for key, value in {
     "demo_motor_decoder": None,
     "demo_motor_configuration": None,
     "demo_motor_error": None,
+    "demo_next_decode_stream_time": 0.0,
+    "demo_trial_decode_complete": False,
+    "demo_static_revision": 0,
+    "demo_static_rendered_revision": -1,
+    "demo_cortical_revision": 0,
+    "demo_cortical_rendered_revision": -1,
+    # Development-only execution counters. They make it possible to verify
+    # that automatic data flow stays inside fragments rather than rerunning the
+    # entire Streamlit script.
+    "demo_app_run_count": 0,
+    "demo_visual_fragment_run_count": 0,
+    "demo_decode_fragment_run_count": 0,
 }.items():
     st.session_state.setdefault(key, value)
+st.session_state.setdefault("demo_visual_state", VisualState())
+st.session_state.demo_app_run_count += 1
 
 defaults = command_line_defaults()
 available_files = discover_hdf5()
@@ -193,6 +225,10 @@ default_data = defaults.data_path or (available_files[0] if available_files else
 
 st.title("Omni Neural Decoder · 多维脑状态实时解码")
 st.markdown('<div class="demo-subtitle">一个 EEG 输入，多维神经状态同步解析</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<span class="demo-debug-counter demo-debug-app" data-app-runs="{st.session_state.demo_app_run_count}"></span>',
+    unsafe_allow_html=True,
+)
 motor_package_options = discover_motor_packages()
 
 with st.sidebar:
@@ -215,7 +251,7 @@ with st.sidebar:
         format_func=lambda value: value if isinstance(value, str) else f"Trial {value + 1}",
     )
     selected_window_sec = st.select_slider("窗口长度", options=[1.0, 1.5, 2.0, 3.0, 4.0], value=2.0)
-    step_sec = st.select_slider("推进步长", options=[0.25, 0.5, 0.75, 1.0], value=0.5)
+    step_sec = st.select_slider("推进步长", options=[0.1, 0.2, 0.25, 0.5, 0.75, 1.0], value=0.5)
     speed = st.select_slider("数据流速度", options=[0.5, 1.0, 2.0, 4.0], value=1.0, format_func=lambda value: f"{value:g}x")
 
     st.divider()
@@ -283,13 +319,18 @@ with st.sidebar:
 if start:
     st.session_state.demo_playing = True
     st.session_state.demo_finished = False
-    st.session_state.demo_last_tick = 0.0
+    st.session_state.demo_visual_state.pause()
+    st.session_state.demo_static_revision += 1
 if pause:
     st.session_state.demo_playing = False
+    st.session_state.demo_visual_state.pause()
+    st.session_state.demo_static_revision += 1
 if reset:
     reset_replay(selected_trial_indices[0])
     st.session_state.demo_configuration = configuration
-    st.session_state.demo_decoder = DemoStateDecoder(device=device, motor_decoder=motor_decoder)
+    st.session_state.demo_decoder = DemoStateDecoder(
+        device=device, motor_decoder=motor_decoder, compute_motor_intent=SHOW_MOTOR_INTENT
+    )
 
 
 def decode_current_frame() -> None:
@@ -308,21 +349,81 @@ def decode_current_frame() -> None:
         timestamp=(current_trial_index * trial.samples.shape[-1] + current_window_index * step_sec * trial.sample_rate) / trial.sample_rate,
     )
     st.session_state.demo_result = result
+    cortical = result.cortical_activity
+    st.session_state.demo_visual_state.set_decode_targets(
+        result.psd_values,
+        None if cortical is None else cortical.left_rgba,
+        None if cortical is None else cortical.right_rgba,
+    )
+    # The cortical mapper already smooths its target with decode-time EMA.
+    # Re-render this media element only for a new decoder result, not on every
+    # 15 Hz visual tick; this keeps both hemispheres in one stable frame.
+    st.session_state.demo_cortical_revision += 1
     for name, value in result.states.items():
         history = st.session_state.demo_history.setdefault(name, [])
         history.append(float(value))
         del history[:-24]
     st.session_state.demo_last_trial_index = current_trial_index
     st.session_state.demo_last_window_index = current_window_index
+    st.session_state.demo_static_revision += 1
     st.session_state.demo_current_window_index += 1
     if st.session_state.demo_current_window_index >= total_frames:
-        sequence_position = selected_trial_indices.index(current_trial_index)
-        if sequence_position + 1 < len(selected_trial_indices):
-            st.session_state.demo_current_trial_index = selected_trial_indices[sequence_position + 1]
-            st.session_state.demo_current_window_index = 0
-        else:
-            st.session_state.demo_playing = False
-            st.session_state.demo_finished = True
+        st.session_state.demo_trial_decode_complete = True
+
+
+def current_trial_frame_count() -> int:
+    trial = cached_trial(data_path, session, st.session_state.demo_current_trial_index)
+    return window_count(trial, window_sec, step_sec)
+
+
+def advance_trial_if_ready() -> bool:
+    """Move only at a stream-time boundary, preserving visual target arrays."""
+    if not st.session_state.demo_trial_decode_complete:
+        return False
+    trial_frames = current_trial_frame_count()
+    trial_duration = trial_frames * step_sec
+    visual_state = st.session_state.demo_visual_state
+    if visual_state.stream_time_sec < trial_duration:
+        return False
+    sequence_position = selected_trial_indices.index(st.session_state.demo_current_trial_index)
+    if sequence_position + 1 >= len(selected_trial_indices):
+        st.session_state.demo_playing = False
+        st.session_state.demo_finished = True
+        visual_state.stream_time_sec = trial_duration
+        visual_state.pause()
+        st.session_state.demo_static_revision += 1
+        return True
+    visual_state.stream_time_sec -= trial_duration
+    st.session_state.demo_current_trial_index = selected_trial_indices[sequence_position + 1]
+    st.session_state.demo_current_window_index = 0
+    st.session_state.demo_next_decode_stream_time = 0.0
+    st.session_state.demo_trial_decode_complete = False
+    return True
+
+
+def decode_due_frames() -> None:
+    """Run decode only on its own stream-time clock, with bounded catch-up."""
+    visual_state = st.session_state.demo_visual_state
+    catchup = 0
+    while st.session_state.demo_playing and catchup < MAX_DECODE_CATCHUP:
+        if advance_trial_if_ready():
+            continue
+        if st.session_state.demo_trial_decode_complete:
+            break
+        if visual_state.stream_time_sec + 1e-9 < st.session_state.demo_next_decode_stream_time:
+            break
+        decode_current_frame()
+        st.session_state.demo_next_decode_stream_time += step_sec
+        catchup += 1
+    if catchup >= MAX_DECODE_CATCHUP and st.session_state.demo_playing and not st.session_state.demo_trial_decode_complete:
+        overdue = visual_state.stream_time_sec - st.session_state.demo_next_decode_stream_time
+        if overdue >= 0.0:
+            skipped = int(overdue // step_sec) + 1
+            st.session_state.demo_current_window_index += skipped
+            st.session_state.demo_next_decode_stream_time += skipped * step_sec
+            if st.session_state.demo_current_window_index >= current_trial_frame_count():
+                st.session_state.demo_current_window_index = current_trial_frame_count()
+                st.session_state.demo_trial_decode_complete = True
 
 
 def sparkline_svg(values: list[float]) -> str:
@@ -336,7 +437,7 @@ def sparkline_svg(values: list[float]) -> str:
     return f'<svg class="state-spark" viewBox="0 0 48 16"><polyline fill="none" stroke="#00A6A6" stroke-width="1.5" points="{" ".join(points)}"/></svg>'
 
 
-def render_result(result) -> None:
+def render_dashboard(result) -> None:
     motor = result.motor_intent
     displayed_trial = st.session_state.demo_last_trial_index
     displayed_window = st.session_state.demo_last_window_index
@@ -360,115 +461,236 @@ def render_result(result) -> None:
         unsafe_allow_html=True,
     )
 
-    probability_rows = "".join(
-        f'<div class="prob-row"><span>{MOTOR_LABELS_CN[label]}</span><div class="prob-track"><div class="prob-fill" style="width:{float(value) * 100:.1f}%"></div></div><span>{float(value):.0%}</span></div>'
-        for label, value in ((label, motor["probabilities"][label]) for label in ("left_hand", "right_hand", "feet", "tongue"))
-    )
-    core_left, core_right = st.columns([1.12, 1], gap="small")
-    with core_left:
-        decoder_name = str(motor.get("decoder_display_name", "Demo"))
-        st.markdown(
-            f'<div class="core-card"><div class="core-title">运动意图 · Decoder {decoder_name} · 综合状态 {result.brain_state_score:.0f} · {score_level(result.brain_state_score)}</div>'
-            f'<div class="motor-head"><span class="motor-label">{motor["label_cn"]}</span><span class="motor-confidence">{float(motor["confidence"]):.1%}</span></div>{probability_rows}</div>',
-            unsafe_allow_html=True,
+    if SHOW_MOTOR_INTENT:
+        probability_rows = "".join(
+            f'<div class="prob-row"><span>{MOTOR_LABELS_CN[label]}</span><div class="prob-track"><div class="prob-fill" style="width:{float(value) * 100:.1f}%"></div></div><span>{float(value):.0%}</span></div>'
+            for label, value in ((label, motor["probabilities"][label]) for label in ("left_hand", "right_hand", "feet", "tongue"))
         )
-    with core_right:
+        core_left, core_right = st.columns([1.12, 1], gap="small")
+        with core_left:
+            decoder_name = str(motor.get("decoder_display_name", "Demo"))
+            st.markdown(
+                f'<div class="core-card"><div class="core-title">运动意图 · Decoder {decoder_name} · 综合状态 {result.brain_state_score:.0f} · {score_level(result.brain_state_score)}</div>'
+                f'<div class="motor-head"><span class="motor-label">{motor["label_cn"]}</span><span class="motor-confidence">{float(motor["confidence"]):.1%}</span></div>{probability_rows}</div>',
+                unsafe_allow_html=True,
+            )
+        with core_right:
+            st.markdown(
+                f'<div class="core-card"><div class="core-title">AI 神经状态解读 · 综合状态 {result.brain_state_score:.0f} · {score_level(result.brain_state_score)}</div><div class="interpretation">{result.interpretation}</div>'
+                '<div class="disclaimer">规则生成 · 研究演示 · 非医学结论</div></div>',
+                unsafe_allow_html=True,
+            )
+    else:
         st.markdown(
-            f'<div class="core-card"><div class="core-title">AI 神经状态解读</div><div class="interpretation">{result.interpretation}</div>'
+            f'<div class="core-card"><div class="core-title">AI 神经状态解读 · 综合状态 {result.brain_state_score:.0f} · {score_level(result.brain_state_score)}</div><div class="interpretation">{result.interpretation}</div>'
             '<div class="disclaimer">规则生成 · 研究演示 · 非医学结论</div></div>',
             unsafe_allow_html=True,
         )
 
     st.markdown('<div class="section-label">Neural State Index</div>', unsafe_allow_html=True)
-    cards = st.columns(8, gap="small")
-    for column, (name, chinese_name) in zip(cards, STATE_LABELS_CN.items(), strict=True):
-        value = result.states[name]
-        history = st.session_state.demo_history.get(name, [])
-        with column:
-            st.markdown(
-                f'<div class="state-card"><div class="state-top"><span class="state-name">{chinese_name}</span><span class="state-value">{value:.0f}</span></div>'
-                f'<div class="state-bottom"><span class="state-level">{score_level(value)}</span>{sparkline_svg(history)}</div>'
-                f'<div class="state-track"><div class="state-fill" style="width:{value:.1f}%"></div></div></div>',
-                unsafe_allow_html=True,
-            )
+    state_items = list(STATE_LABELS_CN.items())
+    for row_start in range(0, len(state_items), 8):
+        cards = st.columns(8, gap="small")
+        for column, (name, chinese_name) in zip(cards, state_items[row_start : row_start + 8], strict=True):
+            value = result.states[name]
+            history = st.session_state.demo_history.get(name, [])
+            with column:
+                if name == "emotion_state" and result.emotion is not None:
+                    st.markdown(
+                        f'<div class="state-card"><div class="state-top"><span class="state-name">{chinese_name}</span><span class="emotion-emoji">{result.emotion.emoji}</span></div>'
+                        f'<div class="state-bottom"><span class="emotion-label">{result.emotion.label_cn}</span>{sparkline_svg(history)}</div>'
+                        f'<div class="state-track"><div class="state-fill" style="width:{value:.1f}%"></div></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="state-card"><div class="state-top"><span class="state-name">{chinese_name}</span><span class="state-value">{value:.0f}</span></div>'
+                        f'<div class="state-bottom"><span class="state-level">{score_level(value)}</span>{sparkline_svg(history)}</div>'
+                        f'<div class="state-track"><div class="state-fill" style="width:{value:.1f}%"></div></div></div>',
+                        unsafe_allow_html=True,
+                    )
 
-    st.markdown('<div class="signal-section">神经信号分析</div>', unsafe_allow_html=True)
-    waveform_column, spectrum_column, map_column = st.columns([1.45, 1.05, 0.82], gap="small")
-    with waveform_column:
-        st.markdown('<div class="signal-title">实时 EEG 波形</div><div class="signal-caption">当前窗口 · μV · 偏移显示</div>', unsafe_allow_html=True)
-        waveform = result.waveform
-        if waveform is not None:
-            all_names = result.channel_names or [f"Ch {index + 1}" for index in range(waveform.shape[0])]
-            selected_indices = [all_names.index(name) for name in display_channels if name in all_names]
-            selected_indices = selected_indices or list(range(min(6, waveform.shape[0])))
-            display = waveform[selected_indices].T
-            if (result.waveform_unit or "").lower() == "v":
-                display = display * 1e6
-            names = [all_names[index] for index in selected_indices]
-            time_axis = np.arange(display.shape[0]) / float(result.sample_rate or 1.0)
-            fig, axis = plt.subplots(figsize=(5.2, 1.55), facecolor="#0E1117")
-            axis.set_facecolor("#0E1117")
-            offsets = np.ptp(display, axis=0).mean() * np.arange(len(selected_indices))
-            offsets = offsets if np.any(offsets) else np.arange(len(selected_indices)) * 20.0
-            for index, name in enumerate(names):
-                axis.plot(time_axis, display[:, index] + offsets[index], linewidth=0.58, label=name)
-            axis.tick_params(labelsize=6, length=2)
-            axis.grid(alpha=0.12)
-            axis.legend(loc="upper right", ncol=2, fontsize=5.5, frameon=False)
-            fig.subplots_adjust(left=0.08, right=0.99, top=0.96, bottom=0.20)
-            st.pyplot(fig, clear_figure=True, use_container_width=True)
-    with spectrum_column:
-        st.markdown('<div class="signal-title">神经频谱</div><div class="signal-caption">1–45 Hz · 当前窗口 PSD</div>', unsafe_allow_html=True)
-        if result.psd_frequencies is not None and result.psd_values is not None:
-            psd = 10.0 * np.log10(result.psd_values + 1e-12)
-            fig, axis = plt.subplots(figsize=(4.2, 1.55), facecolor="#0E1117")
-            axis.set_facecolor("#0E1117")
-            axis.plot(result.psd_frequencies, psd, color="#00A6A6", linewidth=1.05)
-            axis.set(xlim=(1, 45))
-            axis.tick_params(labelsize=6, length=2)
-            axis.grid(alpha=0.12)
-            fig.subplots_adjust(left=0.12, right=0.99, top=0.96, bottom=0.20)
-            st.pyplot(fig, clear_figure=True, use_container_width=True)
-        labels = {"delta": "δ", "theta": "θ", "alpha": "α", "beta": "β", "gamma": "γ"}
-        bands = " · ".join(f"{labels[name]} {value:.0%}" for name, value in result.band_power.items())
-        st.markdown(f'<div class="signal-caption">{bands}</div>', unsafe_allow_html=True)
-    with map_column:
-        st.markdown('<div class="signal-title">脑区活动地图</div><div class="signal-caption">Alpha Power Topomap</div>', unsafe_allow_html=True)
-        if result.topomap_values is not None and result.topomap_positions is not None:
-            try:
-                import mne
-
-                fig, axis = plt.subplots(figsize=(2.45, 1.8), facecolor="#0E1117")
-                axis.set_facecolor("#0E1117")
-                mne.viz.plot_topomap(result.topomap_values, result.topomap_positions, axes=axis, show=False, contours=3, cmap="viridis")
-                fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.02)
-                st.pyplot(fig, clear_figure=True, use_container_width=True)
-            except Exception:  # pragma: no cover - defensive display fallback.
-                fig, axis = plt.subplots(figsize=(2.45, 1.8), facecolor="#0E1117")
-                axis.set_facecolor("#0E1117")
-                axis.scatter(result.topomap_positions[:, 0], result.topomap_positions[:, 1], c=result.topomap_values, s=54, cmap="viridis")
-                axis.add_patch(plt.Circle((0, 0), 1.04, fill=False, color="#F3F6F9", linewidth=0.8))
-                axis.set(xlim=(-1.1, 1.1), ylim=(-1.1, 1.1), aspect="equal")
-                axis.axis("off")
-                fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.02)
-                st.pyplot(fig, clear_figure=True, use_container_width=True)
-        else:
-            st.caption("当前通道没有可用 montage。")
+def visual_waveform() -> tuple[np.ndarray, list[str], float, str]:
+    """Slice the current trial by stream time instead of decoder-window index."""
+    trial = cached_trial(data_path, session, st.session_state.demo_current_trial_index)
+    visible_samples = min(trial.samples.shape[1], max(2, int(round(window_sec * trial.sample_rate))))
+    cursor = int(st.session_state.demo_visual_state.stream_time_sec * trial.sample_rate)
+    start = min(max(0, cursor), max(0, trial.samples.shape[1] - visible_samples))
+    return trial.samples[:, start : start + visible_samples], trial.channel_names, trial.sample_rate, trial.unit
 
 
-@st.fragment(run_every=0.25)
-def live_demo() -> None:
-    now = time.monotonic()
-    interval = 0.55 / float(speed)
-    should_decode = st.session_state.demo_playing and now - st.session_state.demo_last_tick >= interval
-    if should_decode:
-        st.session_state.demo_last_tick = now
-        decode_current_frame()
+def _polyline_points(x_values: np.ndarray, y_values: np.ndarray, *, width: float, height: float) -> str:
+    return " ".join(f"{x * width:.1f},{y * height:.1f}" for x, y in zip(x_values, y_values, strict=True))
+
+
+def waveform_svg(display: np.ndarray, names: list[str]) -> str:
+    """Small SVG renderer avoids creating a Matplotlib figure for every visual tick."""
+    max_points = 320
+    if display.shape[0] > max_points:
+        indices = np.linspace(0, display.shape[0] - 1, max_points, dtype=int)
+        display = display[indices]
+    width, height, left = 520.0, 150.0, 28.0
+    x = np.linspace(left / width, 0.99, display.shape[0])
+    channel_height = 0.86 / max(1, display.shape[1])
+    paths: list[str] = []
+    labels: list[str] = []
+    for index, name in enumerate(names):
+        values = display[:, index]
+        amplitude = max(float(np.ptp(values)), 1e-6)
+        center = 0.07 + channel_height * (index + 0.5)
+        y = center - 0.70 * channel_height * (values - np.mean(values)) / amplitude
+        paths.append(f'<polyline fill="none" stroke="#00A6A6" stroke-width="0.8" points="{_polyline_points(x, y, width=width, height=height)}"/>')
+        labels.append(f'<text x="2" y="{height * (center + 0.02):.1f}" fill="#8293A1" font-size="7">{name}</text>')
+    grids = "".join(f'<line x1="{left}" y1="{height * (0.07 + channel_height * index):.1f}" x2="{width * .99}" y2="{height * (0.07 + channel_height * index):.1f}" stroke="#263849" stroke-width="0.5"/>' for index in range(display.shape[1] + 1))
+    return f'<svg viewBox="0 0 {width:.0f} {height:.0f}" style="width:100%;height:150px;display:block;background:#0E1117">{grids}{"".join(labels)}{"".join(paths)}</svg>'
+
+
+def waveform_html() -> str:
+    waveform, all_names, sample_rate, unit = visual_waveform()
+    selected_indices = [all_names.index(name) for name in display_channels if name in all_names]
+    selected_indices = selected_indices or list(range(min(6, waveform.shape[0])))
+    display = waveform[selected_indices].T
+    if unit.lower() == "v":
+        display = display * 1e6
+    names = [all_names[index] for index in selected_indices]
+    del sample_rate
+    return waveform_svg(display, names)
+
+
+def render_waveform_visual() -> None:
+    st.markdown(waveform_html(), unsafe_allow_html=True)
+
+
+def psd_svg(frequencies: np.ndarray, values: np.ndarray) -> str:
+    mask = (frequencies >= 1.0) & (frequencies <= 45.0)
+    x_values = frequencies[mask]
+    db = 10.0 * np.log10(values[mask] + 1e-12)
+    if x_values.size > 180:
+        indices = np.linspace(0, x_values.size - 1, 180, dtype=int)
+        x_values, db = x_values[indices], db[indices]
+    low, high = np.percentile(db, (2.0, 98.0))
+    y_values = 0.92 - 0.80 * np.clip((db - low) / max(high - low, 1e-6), 0.0, 1.0)
+    x_normalized = 0.08 + 0.90 * (x_values - 1.0) / 44.0
+    points = _polyline_points(x_normalized, y_values, width=420.0, height=150.0)
+    grids = "".join(f'<line x1="34" y1="{row}" x2="412" y2="{row}" stroke="#263849" stroke-width="0.5"/>' for row in (22, 54, 86, 118, 142))
+    return f'<svg viewBox="0 0 420 150" style="width:100%;height:150px;display:block;background:#0E1117">{grids}<polyline fill="none" stroke="#00A6A6" stroke-width="1.2" points="{points}"/></svg>'
+
+
+def psd_html(result, displayed_psd: np.ndarray | None) -> str:
+    chart = ""
+    if result.psd_frequencies is not None and displayed_psd is not None:
+        chart = psd_svg(result.psd_frequencies, displayed_psd)
+    labels = {"delta": "δ", "theta": "θ", "alpha": "α", "beta": "β", "gamma": "γ"}
+    bands = " · ".join(f"{labels[name]} {value:.0%}" for name, value in result.band_power.items())
+    return f'{chart}<div class="signal-caption">{bands}</div>'
+
+
+def render_psd_visual(result, displayed_psd: np.ndarray | None) -> None:
+    st.markdown(psd_html(result, displayed_psd), unsafe_allow_html=True)
+
+
+def render_cortical_visual(visual_state: VisualState) -> None:
+    left, right = visual_state.displayed_cortical_rgba("left"), visual_state.displayed_cortical_rgba("right")
+    if left is None or right is None:
+        return
+    # One Streamlit image avoids the independent left/right media lifecycle that
+    # could briefly drop the right hemisphere during a high-frequency rerun.
+    combined = np.concatenate((left[::2, ::2], right[::2, ::2]), axis=1)
+    st.markdown(
+        '<div class="signal-caption" style="display:flex;justify-content:space-around"><span>左半球</span><span>右半球</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.image(combined, width="stretch")
+
+
+decode_run_every = step_sec if st.session_state.demo_playing else None
+visual_run_every = VISUAL_INTERVAL_SEC if st.session_state.demo_playing else None
+
+
+@st.fragment(run_every=decode_run_every)
+def render_decode_fragment() -> None:
+    """Decoder-rate controller and state-index dashboard."""
+    visual_state = st.session_state.demo_visual_state
+    if st.session_state.demo_playing:
+        st.session_state.demo_decode_fragment_run_count += 1
+        # `stream_time_sec` is advanced solely by the visual clock. This
+        # fragment reads that shared cursor and performs the bounded decoder
+        # catchup without requesting a full-app rerun.
+        decode_due_frames()
+
+    st.markdown(
+        f'<span class="demo-debug-counter demo-debug-decode" data-runs="{st.session_state.demo_decode_fragment_run_count}"></span>',
+        unsafe_allow_html=True,
+    )
+
     result = st.session_state.demo_result
-    if result is not None:
-        render_result(result)
-    else:
+    if result is None:
         st.info("选择 Trial 后点击“开始 / 继续”启动数据流。")
+        return
 
 
-live_demo()
+    # Direct fragment output is scoped to this dashboard position. In
+    # particular, no fragment writes into a placeholder owned by another
+    # fragment, avoiding Streamlit's invalid-delta-path/front-end flicker.
+    render_dashboard(result)
+
+
+@st.fragment(run_every=visual_run_every)
+def render_visual_fragment() -> None:
+    """Visual-rate fragment: continuous waveform plus interpolated PSD only."""
+    visual_state = st.session_state.demo_visual_state
+    if st.session_state.demo_playing:
+        st.session_state.demo_visual_fragment_run_count += 1
+        visual_state.advance(time.monotonic(), float(speed))
+        # PSD targets are installed by `render_decode_fragment`; interpolation
+        # is intentionally visual-only. Cortical maps remain decoder-rate.
+        visual_state.interpolate(decode_interval_sec=step_sec)
+    st.markdown(
+        f'<span class="demo-debug-counter demo-debug-visual" data-runs="{st.session_state.demo_visual_fragment_run_count}"></span>',
+        unsafe_allow_html=True,
+    )
+
+    result = st.session_state.demo_result
+    if result is None:
+        st.markdown(
+            '<div class="visual-signal-grid"><div class="visual-signal-pane"><div class="signal-title">实时 EEG 波形</div><div class="signal-caption">连续数据流 · μV · 偏移显示</div></div>'
+            '<div class="visual-signal-pane"><div class="signal-title">神经频谱</div><div class="signal-caption">1–45 Hz · 平滑显示</div></div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    started = time.perf_counter()
+    waveform = waveform_html()
+    visual_state.waveform_render_ms = (time.perf_counter() - started) * 1000.0
+    started = time.perf_counter()
+    spectrum = psd_html(result, visual_state.displayed_psd)
+    visual_state.psd_render_ms = (time.perf_counter() - started) * 1000.0
+    st.markdown(
+        '<div class="visual-signal-grid">'
+        '<div class="visual-signal-pane"><div class="signal-title">实时 EEG 波形</div><div class="signal-caption">连续数据流 · μV · 偏移显示</div>'
+        f'{waveform}</div>'
+        '<div class="visual-signal-pane"><div class="signal-title">神经频谱</div><div class="signal-caption">1–45 Hz · 平滑显示</div>'
+        f'{spectrum}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+@st.fragment(run_every=decode_run_every)
+def render_cortical_fragment() -> None:
+    """Decode-rate cortical output, using the mapper's existing EMA target."""
+    st.markdown('<div class="signal-title">皮层活动图</div>', unsafe_allow_html=True)
+    visual_state = st.session_state.demo_visual_state
+    if visual_state.displayed_cortical_left is None or visual_state.displayed_cortical_right is None:
+        return
+    started = time.perf_counter()
+    render_cortical_visual(visual_state)
+    visual_state.cortical_render_ms = (time.perf_counter() - started) * 1000.0
+
+
+render_decode_fragment()
+st.markdown('<div class="signal-section">神经信号分析</div>', unsafe_allow_html=True)
+signal_visual_column, map_column = st.columns([2.40, 1.02], gap="small")
+with signal_visual_column:
+    render_visual_fragment()
+with map_column:
+    render_cortical_fragment()

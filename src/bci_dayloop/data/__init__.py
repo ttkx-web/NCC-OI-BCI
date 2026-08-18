@@ -12,6 +12,19 @@ _EXPORTS = {
     "EEGHDF5": (".hdf5_dataset", "EEGHDF5"),
     "HDF5Metadata": (".hdf5_dataset", "HDF5Metadata"),
     "write_hdf5": (".hdf5_dataset", "write_hdf5"),
+    "SequentialDataset": (".sequential_dataset", "SequentialDataset"),
+    "SequentialDatasetMetadata": (
+        ".sequential_dataset",
+        "SequentialDatasetMetadata",
+    ),
+    "load_sequential_dataset": (
+        ".sequential_dataset",
+        "load_sequential_dataset",
+    ),
+    "validate_package_window_contract": (
+        ".sequential_dataset",
+        "validate_package_window_contract",
+    ),
     "WorkloadHDF5": (".workload", "WorkloadHDF5"),
     "prepare_workload_subject": (".workload", "prepare_workload_subject"),
     "NeuracleBDFReader": (".neuracle_bdf", "NeuracleBDFReader"),

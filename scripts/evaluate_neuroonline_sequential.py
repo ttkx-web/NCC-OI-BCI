@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import sys
 import time
 import warnings
@@ -18,7 +17,12 @@ import torch
 
 from _bootstrap import ROOT  # noqa: F401
 
-from bci_dayloop.data.hdf5_dataset import EEGHDF5, HDF5Metadata
+from bci_dayloop.data.sequential_dataset import (
+    SequentialDataset,
+    SequentialDatasetMetadata,
+    load_sequential_dataset as load_adapted_sequential_dataset,
+    validate_package_window_contract,
+)
 from bci_dayloop.inference.neuroonline_strategy import (
     NeuroOnlineConfig,
     NeuroOnlineStrategy,
@@ -39,8 +43,6 @@ else:
     LoadedRuntimePackage = Any
 
 
-FIXED_WINDOW_SEC = 4.0
-FIXED_STEP_SEC = 4.0
 VALID_STRATEGIES = ("none", "neuroonline", "both")
 
 
@@ -60,25 +62,11 @@ class SequentialSettings:
     neuroonline_config: NeuroOnlineConfig
 
 
-@dataclass(frozen=True, slots=True)
-class SequentialDataset:
-    metadata: HDF5Metadata
-    data: np.ndarray
-    labels: np.ndarray
-    subject_ids: np.ndarray
-    session_ids: np.ndarray
-    trial_ids: np.ndarray
-
-    @property
-    def num_trials(self) -> int:
-        return int(self.data.shape[0])
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate static RuntimeModel and NeuroOnline in a strict "
-            "4-second trial-by-trial causal protocol."
+            "dataset-contract trial-by-trial causal protocol."
         )
     )
     parser.add_argument("--config", default="configs/stage0/day1_bnci_s01.yaml")
@@ -208,117 +196,25 @@ def resolve_settings(
     )
 
 
-def _trial_ids(values: np.ndarray, *, expected: int) -> np.ndarray:
-    array = np.asarray(values)
-    if array.shape != (expected,):
-        raise ValueError(
-            "trial_ids length does not match trial count: "
-            f"{array.shape} != ({expected},)."
-        )
-    return array
-
-
 def load_sequential_dataset(settings: SequentialSettings) -> SequentialDataset:
-    dataset = EEGHDF5(settings.data_path)
-    metadata = dataset.metadata
-    payload = dataset.load(settings.session)
-
-    data = np.asarray(payload["data"], dtype=np.float32)
-    labels = np.asarray(payload["labels"], dtype=np.int64).reshape(-1)
-    subject_ids = np.asarray(payload["subject_ids"], dtype=np.int64).reshape(-1)
-    session_ids = np.asarray(payload["session_ids"]).reshape(-1)
-    trial_ids = _trial_ids(np.asarray(payload["trial_ids"]), expected=data.shape[0])
-
-    validate_trial_payload(
-        data=data,
-        labels=labels,
-        subject_ids=subject_ids,
-        trial_ids=trial_ids,
-        metadata=metadata,
+    return load_adapted_sequential_dataset(
+        settings.data_path,
+        session=settings.session,
+        max_trials=settings.max_trials,
     )
-
-    if settings.max_trials is not None:
-        limit = min(settings.max_trials, data.shape[0])
-        data = data[:limit]
-        labels = labels[:limit]
-        subject_ids = subject_ids[:limit]
-        session_ids = session_ids[:limit]
-        trial_ids = trial_ids[:limit]
-
-    return SequentialDataset(
-        metadata=metadata,
-        data=data,
-        labels=labels,
-        subject_ids=subject_ids,
-        session_ids=session_ids,
-        trial_ids=trial_ids,
-    )
-
-
-def validate_trial_payload(
-    *,
-    data: np.ndarray,
-    labels: np.ndarray,
-    subject_ids: np.ndarray,
-    trial_ids: np.ndarray,
-    metadata: HDF5Metadata,
-) -> None:
-    if data.ndim != 3:
-        raise ValueError(f"HDF5 data must have shape [N,C,T], got {data.shape}.")
-
-    num_trials, num_channels, num_samples = data.shape
-    if num_channels != len(metadata.channel_names):
-        raise ValueError(
-            "HDF5 channel dimension does not match metadata channel_names: "
-            f"{num_channels} != {len(metadata.channel_names)}."
-        )
-
-    expected_shape = (num_trials,)
-    for name, values in (
-        ("labels", labels),
-        ("subject_ids", subject_ids),
-        ("trial_ids", trial_ids),
-    ):
-        if np.asarray(values).shape != expected_shape:
-            raise ValueError(
-                f"{name} length does not match trial count: "
-                f"{np.asarray(values).shape} != {expected_shape}."
-            )
-
-    sample_rate = float(metadata.sample_rate)
-    if not math.isfinite(sample_rate) or sample_rate <= 0:
-        raise ValueError("HDF5 sample_rate must be finite and positive.")
-
-    expected_samples = int(round(FIXED_WINDOW_SEC * sample_rate))
-    if num_samples != expected_samples:
-        duration = num_samples / sample_rate
-        raise ValueError(
-            "Every source trial must be exactly 4 seconds: "
-            f"samples={num_samples}, sample_rate={sample_rate}, "
-            f"duration={duration:.9f}, expected_samples={expected_samples}."
-        )
-
-    if not np.all(np.isfinite(data)):
-        raise ValueError("HDF5 signal contains NaN or Inf.")
 
 
 def validate_package_contract(
     loaded: LoadedRuntimePackage,
     *,
-    metadata: HDF5Metadata,
+    dataset: SequentialDataset,
 ) -> None:
-    if not np.isclose(
-        loaded.window_sec,
-        FIXED_WINDOW_SEC,
-        atol=1e-6,
-        rtol=0.0,
-    ):
-        raise ValueError(
-            "Runtime Package input window must be exactly 4 seconds: "
-            f"{loaded.window_sec}."
-        )
+    validate_package_window_contract(
+        dataset,
+        package_window_sec=float(loaded.window_sec),
+    )
 
-    dataset_classes = tuple(str(name) for name in metadata.class_names)
+    dataset_classes = tuple(str(name) for name in dataset.metadata.class_names)
     if dataset_classes != loaded.class_names:
         raise ValueError(
             "Dataset class order does not match Runtime Package: "
@@ -580,9 +476,10 @@ def summarize_updates(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def _raw_window_for_trial(
     *,
     trial: np.ndarray,
-    metadata: HDF5Metadata,
+    metadata: SequentialDatasetMetadata,
     trial_id: str,
-    subject_id: int,
+    window_id: str,
+    subject_id: int | str,
     session: str,
     trial_ordinal: int,
 ) -> RawEEGWindow:
@@ -594,15 +491,31 @@ def _raw_window_for_trial(
         layout="CT",
         start_time_sec=0.0,
         trial_id=trial_id,
-        window_id=f"{trial_id}:trial4s",
+        window_id=window_id,
         label=None,
         metadata={
-            "session": session,
-            "subject_id": int(subject_id),
+            "session": str(session),
+            "subject_id": subject_id,
             "trial_ordinal": int(trial_ordinal),
-            "protocol": "neuroonline_sequential_4s",
+            "protocol": (
+                "neuroonline_sequential_"
+                f"{_window_label(metadata.window_sec)}"
+            ),
         },
     )
+
+
+def _window_label(window_sec: float) -> str:
+    rounded = int(round(float(window_sec)))
+    if np.isclose(float(window_sec), rounded, atol=1e-9, rtol=0.0):
+        return f"{rounded}s"
+    return f"{float(window_sec):g}s"
+
+
+def _identifier(value: object) -> int | str:
+    if isinstance(value, np.generic):
+        value = value.item()
+    return int(value) if isinstance(value, (int, np.integer)) else str(value)
 
 
 def _make_not_applied_result(*, mode: str, update_step: int, revision: str) -> OnlineUpdateResult:
@@ -669,7 +582,7 @@ def evaluate_mode(
     pred_so_far: list[int] = []
 
     for index in range(dataset.num_trials):
-        trial_ordinal = index + 1
+        trial_ordinal = int(dataset.trial_ordinals[index])
         true_label = int(dataset.labels[index])
         if not 0 <= true_label < len(class_names):
             raise ValueError(
@@ -678,13 +591,15 @@ def evaluate_mode(
             )
 
         trial_id = str(dataset.trial_ids[index])
-        subject_id = int(dataset.subject_ids[index])
+        window_id = str(dataset.window_ids[index])
+        subject_id = _identifier(dataset.subject_ids[index])
         raw_window = _raw_window_for_trial(
             trial=dataset.data[index],
             metadata=dataset.metadata,
             trial_id=trial_id,
+            window_id=window_id,
             subject_id=subject_id,
-            session=settings.session,
+            session=str(dataset.session_ids[index]),
             trial_ordinal=trial_ordinal,
         )
 
@@ -731,7 +646,7 @@ def evaluate_mode(
         else:
             if strategy is None:
                 raise RuntimeError("NeuroOnline strategy is missing.")
-            observation_id = f"{settings.session}:{trial_id}:{trial_ordinal}"
+            observation_id = f"{dataset.session_ids[index]}:{trial_id}:{trial_ordinal}"
             observation = OnlineObservation(
                 observation_id=observation_id,
                 prepared_input=prepared,
@@ -1052,7 +967,7 @@ def run_evaluation(
             device=settings.device,
             verify_hashes=True,
         )
-        validate_package_contract(loaded, metadata=dataset.metadata)
+        validate_package_contract(loaded, dataset=dataset)
         if package_info is None:
             package_info = {
                 "path": str(loaded.package_path),
@@ -1107,9 +1022,14 @@ def run_evaluation(
     summary_payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "protocol": {
-            "name": "neuroonline_sequential_trial_4s",
-            "window_sec": FIXED_WINDOW_SEC,
-            "step_sec": FIXED_STEP_SEC,
+            "name": (
+                "neuroonline_sequential_trial_"
+                f"{_window_label(dataset.metadata.window_sec)}"
+            ),
+            "window_sec": dataset.metadata.window_sec,
+            # Source trials are discrete; their causal evaluation cadence is
+            # the persisted trial duration, not Runtime Package step_sec.
+            "step_sec": dataset.metadata.window_sec,
             "one_prediction_per_source_trial": True,
             "uses_replay_acquirer": False,
             "uses_sliding_window_decoder": False,

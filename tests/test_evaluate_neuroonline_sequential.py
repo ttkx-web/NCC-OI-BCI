@@ -355,10 +355,15 @@ def test_validates_exact_four_second_trials(tmp_path):
     assert loaded.data.shape == (4, 2, 8)
 
 
-def test_non_four_second_trial_raises(tmp_path):
+def test_dataset_package_window_mismatch_fails_closed(tmp_path):
     data_path = write_dataset(tmp_path / "bad.h5", samples=7)
-    with pytest.raises(ValueError, match="exactly 4 seconds"):
-        seq.load_sequential_dataset(settings(tmp_path, data_path=data_path))
+    dataset = seq.load_sequential_dataset(settings(tmp_path, data_path=data_path))
+    package = FakeLoadedPackage(
+        RecordingRuntimeModel([0, 1, 2, 3]),
+        tmp_path / "pkg",
+    )
+    with pytest.raises(ValueError, match="Dataset and Runtime Package window contracts differ"):
+        seq.validate_package_contract(package, dataset=dataset)
 
 
 def test_trial_order_is_not_shuffled(tmp_path):
@@ -391,6 +396,18 @@ def test_both_mode_loads_runtime_package_twice_and_keeps_instances_separate(tmp_
     assert loaded_models[0] is not loaded_models[1]
     assert summary["static"]["num_trials"] == 4
     assert summary["neuroonline"]["num_trials"] == 4
+    assert summary["protocol"] == {
+        "name": "neuroonline_sequential_trial_4s",
+        "window_sec": 4.0,
+        "step_sec": 4.0,
+        "one_prediction_per_source_trial": True,
+        "uses_replay_acquirer": False,
+        "uses_sliding_window_decoder": False,
+        "continuous_stream_concatenation": False,
+        "shuffle": False,
+        "label_available_during_prediction": False,
+        "package_step_sec_ignored_for_trial_sequence": True,
+    }
 
 
 def test_predict_feedback_update_order_and_revisions(tmp_path):

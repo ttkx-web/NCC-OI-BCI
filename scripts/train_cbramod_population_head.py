@@ -287,6 +287,42 @@ def stable_json_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def build_preprocessing_manifest(
+    *,
+    config: CBraModConfig,
+    source_unit: str,
+    direct_trial_anchor: str,
+) -> dict[str, Any]:
+    """Build the persisted preprocessing contract without loading a model."""
+    return {
+        "source_unit": str(source_unit),
+        "standard_channels": list(config.standard_channels),
+        "target_sample_rate": config.target_sample_rate,
+        "window_seconds": config.window_seconds,
+        "time_segments": config.time_segments,
+        "points_per_patch": config.points_per_patch,
+        "input_unit": config.input_unit,
+        "filter_enabled": config.filter_enabled,
+        "filter_low_hz": config.filter_low_hz,
+        "filter_high_hz": config.filter_high_hz,
+        "filter_order": config.filter_order,
+        "reference_mode": config.reference_mode,
+        "normalization": config.normalization,
+        "zscore_eps": config.zscore_eps,
+        "strict_window_duration": config.strict_window_duration,
+        "window_tolerance_seconds": config.window_tolerance_seconds,
+        "training_source_trial_selection": {
+            "policy": "one_contiguous_window_per_source_trial",
+            "anchor": direct_trial_anchor,
+            "padding": False,
+            "cross_trial_concatenation": False,
+        },
+        "missing_channel_policy": config.missing_channel_policy,
+        "min_observed_channels": config.min_observed_channels,
+        "spline_alpha": config.spline_alpha,
+    }
+
+
 def current_git_commit() -> str | None:
     try:
         result = subprocess.run(
@@ -826,7 +862,7 @@ def combine_feature_splits(
                 for split in splits
             ],
             axis=0,
-        ).astype(np.int64, copy=False),
+        ).astype(str, copy=False),
         subject_ids=np.concatenate(
             [
                 split.subject_ids
@@ -1349,9 +1385,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--normalization",
-        choices=["none", "per_window_zscore"],
+        choices=["none", "per_window_zscore", "fixed_100uv"],
         default="none",
     )
+    parser.add_argument("--missing-channel-policy", choices=["error", "spherical_spline"], default="error")
+    parser.add_argument("--min-observed-channels", type=int, default=None)
+    parser.add_argument("--spline-alpha", type=float, default=1e-5)
 
     parser.add_argument(
         "--head-type",
@@ -1530,9 +1569,7 @@ def main() -> None:
         n_channels=22,
         time_segments=time_segments,
         points_per_patch=200,
-        # The source contract is authoritative; Workload is stored in V while
-        # the existing BNCI files declare uV.
-        input_unit=str(reference_metadata.unit),
+        input_unit=args.input_unit,
 
         strict_window_duration=True,
         filter_enabled=bool(args.filter_enabled),
@@ -1541,6 +1578,9 @@ def main() -> None:
         filter_order=args.filter_order,
         reference_mode=args.reference_mode,
         normalization=args.normalization,
+        missing_channel_policy=args.missing_channel_policy,
+        min_observed_channels=args.min_observed_channels,
+        spline_alpha=args.spline_alpha,
 
         num_classes=len(class_names),
         head_type=args.head_type,
@@ -1551,48 +1591,11 @@ def main() -> None:
 
     backbone_sha256 = sha256_file(checkpoint_path)
 
-    preprocessing_manifest = {
-        "standard_channels": list(
-            config.standard_channels
-        ),
-        "target_sample_rate": (
-            config.target_sample_rate
-        ),
-        "window_seconds": config.window_seconds,
-        "time_segments": config.time_segments,
-        "points_per_patch": (
-            config.points_per_patch
-        ),
-        "input_unit": config.input_unit,
-        "filter_enabled": config.filter_enabled,
-        "filter_low_hz": config.filter_low_hz,
-        "filter_high_hz": config.filter_high_hz,
-        "filter_order": config.filter_order,
-        "reference_mode": config.reference_mode,
-        "normalization": config.normalization,
-        "zscore_eps": config.zscore_eps,
-        "strict_window_duration": (
-            config.strict_window_duration
-        ),
-        "window_tolerance_seconds": (
-            config.window_tolerance_seconds
-        ),
-        "training_source_trial_selection": {
-            "policy": (
-                "one_contiguous_window_per_source_trial"
-            ),
-            "anchor": args.direct_trial_anchor,
-            "padding": False,
-            "cross_trial_concatenation": False,
-        },
-        "missing_channel_policy": (
-            config.missing_channel_policy
-        ),
-        "min_observed_channels": (
-            config.min_observed_channels
-        ),
-        "spline_alpha": config.spline_alpha,
-    }
+    preprocessing_manifest = build_preprocessing_manifest(
+        config=config,
+        source_unit=str(reference_metadata.unit),
+        direct_trial_anchor=args.direct_trial_anchor,
+    )
 
     preprocessing_hash = stable_json_hash(
         preprocessing_manifest

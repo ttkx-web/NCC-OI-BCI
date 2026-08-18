@@ -49,7 +49,7 @@ CHANNEL_ALIASES: dict[str, str] = {
 
 
 ReferenceMode = Literal["none", "average"]
-NormalizationMode = Literal["none", "per_window_zscore"]
+NormalizationMode = Literal["none", "per_window_zscore", "fixed_100uv"]
 MissingChannelPolicy = Literal["error", "spherical_spline"]
 HeadType = Literal["official_mlp", "linear"]
 
@@ -319,7 +319,7 @@ class CBraModConfig:
 
         if self.normalization not in {
             "none",
-            "per_window_zscore",
+            "per_window_zscore", "fixed_100uv",
         }:
             raise ValueError(
                 f"Unsupported normalization: "

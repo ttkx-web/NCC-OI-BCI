@@ -123,6 +123,41 @@ def test_cbramod_parser_accepts_window_sec_alias() -> None:
     assert args.window_seconds == 2.0
 
 
+def test_cbramod_spline_cli_contract() -> None:
+    module = _script_module("train_cbramod_population_head.py", "test_cbramod_spline_cli")
+    args = module.build_argument_parser().parse_args([
+        "--target-subject", "1", "--normalization", "fixed_100uv",
+        "--missing-channel-policy", "spherical_spline",
+        "--min-observed-channels", "21", "--spline-alpha", "1e-5",
+    ])
+    assert args.normalization == "fixed_100uv"
+    assert args.missing_channel_policy == "spherical_spline"
+    assert args.min_observed_channels == 21 and args.spline_alpha == 1e-5
+
+
+def test_cbramod_workload_preprocessing_manifest_provenance() -> None:
+    module = _script_module("train_cbramod_population_head.py", "test_cbramod_manifest")
+    config = module.CBraModConfig(
+        checkpoint_path="unused.pt", target_sample_rate=200.0,
+        window_seconds=2.0, time_segments=2, points_per_patch=200,
+        input_unit="uV", normalization="fixed_100uv",
+        missing_channel_policy="spherical_spline", min_observed_channels=21,
+        spline_alpha=1e-5, filter_enabled=False, reference_mode="none",
+    )
+    manifest = module.build_preprocessing_manifest(
+        config=config, source_unit="V", direct_trial_anchor="end"
+    )
+    assert manifest["source_unit"] == "V"
+    assert manifest["input_unit"] == "uV"
+    assert manifest["normalization"] == "fixed_100uv"
+    assert manifest["window_seconds"] == 2.0
+    assert manifest["time_segments"] == 2
+    assert manifest["points_per_patch"] == 200
+    assert manifest["missing_channel_policy"] == "spherical_spline"
+    assert manifest["min_observed_channels"] == 21
+    assert manifest["spline_alpha"] == 1e-5
+
+
 def test_population_split_plan_excludes_target_and_fails_closed() -> None:
     plan = resolve_population_split_plan(range(1, 16), 1, "S1", "S2", "S2")
     assert plan.train_subjects == tuple(range(2, 16))
@@ -142,3 +177,20 @@ def test_workload_sessions_are_selected_strictly(tmp_path: Path) -> None:
     assert s2.window_ids[0] == "P01:S2:A:0"
     with pytest.raises(ValueError, match="Session"):
         load_sequential_dataset(path, session="missing")
+
+
+def test_cbramod_feature_split_merge_preserves_string_source_ids() -> None:
+    module = _script_module("train_cbramod_population_head.py", "test_cbramod_merge")
+    left = module.FeatureSplit(
+        features=torch.zeros((1, 22, 2, 200)), labels=torch.tensor([0]),
+        source_trial_ids=np.asarray(["P02:S1:trial-1"]),
+        subject_ids=np.asarray([2]), session_name="S1",
+    )
+    right = module.FeatureSplit(
+        features=torch.zeros((1, 22, 2, 200)), labels=torch.tensor([1]),
+        source_trial_ids=np.asarray(["P02:S2:trial-1"]),
+        subject_ids=np.asarray([2]), session_name="S2",
+    )
+    merged = module.combine_feature_splits([left, right], session_name="population")
+    assert merged.source_trial_ids.tolist() == ["P02:S1:trial-1", "P02:S2:trial-1"]
+    assert len(set(merged.source_trial_ids.tolist())) == 2

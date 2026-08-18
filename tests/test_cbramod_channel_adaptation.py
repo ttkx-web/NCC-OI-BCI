@@ -12,6 +12,8 @@ from bci_dayloop.models.cbramod.preprocessing import (
     CBraModPipelinePreprocessor,
 )
 from bci_dayloop.runtime.types import CanonicalEEGWindow
+from bci_dayloop.runtime.types import RawEEGWindow
+from bci_dayloop.preprocessing.canonical import SignalCanonicalizer
 
 from bci_dayloop.models.cbramod.config import (
     BCICIV2A_22_CHANNELS,
@@ -22,27 +24,103 @@ from bci_dayloop.models.cbramod.config import (
 def build_preprocessor(
     *,
     missing_channel_policy: str,
+    normalization: str = "none",
+    window_seconds: float = 4.0,
+    time_segments: int = 4,
+    min_observed_channels: int | None = None,
 ) -> CBraModPipelinePreprocessor:
     target_channels = BCICIV2A_22_CHANNELS
 
-    min_observed_channels = (
-        len(target_channels)
-        if missing_channel_policy == "error"
-        else 2
-    )
+    if min_observed_channels is None:
+        min_observed_channels = (
+            len(target_channels) if missing_channel_policy == "error" else 2
+        )
 
     config = CBraModConfig(
         checkpoint_path=Path("unused_backbone.pt"),
         device="cpu",
         filter_enabled=False,
         reference_mode="none",
-        normalization="none",
+        normalization=normalization,
+        window_seconds=window_seconds,
+        time_segments=time_segments,
         missing_channel_policy=missing_channel_policy,
         min_observed_channels=min_observed_channels,
         spline_alpha=1e-5,
     )
 
     return CBraModPipelinePreprocessor(config)
+
+
+def test_fixed_100uv_exact_values_and_shape() -> None:
+    preprocessor = build_preprocessor(
+        missing_channel_policy="error", normalization="fixed_100uv",
+        window_seconds=2.0, time_segments=2,
+    )
+    signal = np.zeros((22, 400), dtype=np.float32)
+    signal[:, 0], signal[:, 1], signal[:, 2] = 100.0, 50.0, -100.0
+    actual = prepared_signal(preprocessor, make_window(
+        signal=signal, channel_names=list(BCICIV2A_22_CHANNELS)
+    ))
+    assert actual.shape == (1, 22, 2, 200)
+    assert actual.dtype == np.float32 and np.isfinite(actual).all()
+    np.testing.assert_allclose(actual[0, :, 0, :3], [
+        [1.0, 0.5, -1.0]
+    ] * 22, rtol=0.0, atol=1e-7)
+
+
+def test_volts_canonicalize_to_uv_then_fixed_100uv() -> None:
+    raw = RawEEGWindow(
+        data=np.full((22, 400), 100e-6, dtype=np.float32),
+        channel_names=list(BCICIV2A_22_CHANNELS), sample_rate=200.0,
+        unit="V", layout="CT", window_id="v-to-uv",
+    )
+    canonical = SignalCanonicalizer(target_unit="uV").transform(raw)
+    np.testing.assert_allclose(canonical.data, 100.0, rtol=0.0, atol=1e-4)
+    preprocessor = build_preprocessor(
+        missing_channel_policy="error", normalization="fixed_100uv",
+        window_seconds=2.0, time_segments=2,
+    )
+    actual = prepared_signal(preprocessor, canonical)
+    np.testing.assert_allclose(actual, 1.0, rtol=0.0, atol=1e-6)
+
+
+def test_workload_250hz_spline_two_second_shape_and_diagnostics() -> None:
+    preprocessor = build_preprocessor(
+        missing_channel_policy="spherical_spline", normalization="fixed_100uv",
+        window_seconds=2.0, time_segments=2, min_observed_channels=21,
+    )
+    observed = [name for name in BCICIV2A_22_CHANNELS if name != "Cz"]
+    time = np.arange(500, dtype=np.float32) / 250.0
+    signal = np.stack([np.sin(2 * np.pi * (i + 1) * time) for i in range(21)]).astype(np.float32)
+    window = CanonicalEEGWindow(
+        data=signal, channel_names=observed, sample_rate=250.0,
+        unit="uV", trial_id="workload", window_id="workload-2s",
+    )
+    actual = prepared_signal(preprocessor, window)
+    assert actual.shape == (1, 22, 2, 200) and np.isfinite(actual).all()
+    diagnostics = preprocessor.last_diagnostics
+    assert diagnostics is not None
+    assert [name.upper() for name in diagnostics.missing_channel_names] == ["CZ"]
+    assert diagnostics.completion_policy == "spherical_spline"
+    assert diagnostics.normalization == "fixed_100uv"
+
+
+def test_none_and_per_window_zscore_remain_compatible() -> None:
+    names = list(BCICIV2A_22_CHANNELS)
+    signal = make_signal(22, 400)
+    none_values = prepared_signal(build_preprocessor(
+        missing_channel_policy="error", normalization="none",
+        window_seconds=2.0, time_segments=2,
+    ), make_window(signal=signal, channel_names=names))
+    np.testing.assert_allclose(none_values.reshape(22, 400), signal, rtol=0.0, atol=1e-6)
+    zscore_values = prepared_signal(build_preprocessor(
+        missing_channel_policy="error", normalization="per_window_zscore",
+        window_seconds=2.0, time_segments=2,
+    ), make_window(signal=signal, channel_names=names)).reshape(22, 400)
+    np.testing.assert_allclose(zscore_values.mean(axis=-1), 0.0, atol=1e-6)
+    np.testing.assert_allclose(zscore_values.std(axis=-1), 1.0, atol=1e-5)
+    assert CBraModConfig(checkpoint_path="unused.pt").missing_channel_policy == "error"
 
 
 def make_signal(

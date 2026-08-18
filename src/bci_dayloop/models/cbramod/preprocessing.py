@@ -887,6 +887,10 @@ class CBraModPipelinePreprocessor(ModelInputTransform):
         if self.config.normalization == "none":
             return signal.astype(np.float32, copy=False)
 
+        if self.config.normalization == "fixed_100uv":
+            # The canonical window has already been converted to uV.
+            return (signal / 100.0).astype(np.float32, copy=False)
+
         if self.config.normalization == "per_window_zscore":
             mean = signal.mean(
                 axis=-1,

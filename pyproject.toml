@@ -16,6 +16,7 @@ dependencies = [
   "scikit-learn>=1.4",
   "scipy>=1.11",
   "streamlit>=1.39",
+  "websockets>=12",
   "torch>=2.0.1,<2.1",
   "torchvision==0.15.2",
   "torchaudio==2.0.2",

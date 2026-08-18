@@ -264,17 +264,35 @@ def runtime_kwargs_from_training_report(
         "preprocessing",
         source=Path("training_report.json"),
     )
+    standard_channels = tuple(
+        str(name)
+        for name in preprocessing["standard_channels"]
+    )
+    declared_channel_count = int(
+        preprocessing.get(
+            "n_channels",
+            len(standard_channels),
+        )
+    )
+    if declared_channel_count != len(standard_channels):
+        raise ValueError(
+            "training report preprocessing n_channels does not "
+            "match standard_channels length."
+        )
+    raw_min_observed_channels = preprocessing.get(
+        "min_observed_channels"
+    )
 
     return {
+        "source_unit": str(preprocessing["source_unit"]),
         "target_sample_rate": float(
             preprocessing["target_sample_rate"]
         ),
         "window_seconds": float(
             preprocessing["window_seconds"]
         ),
-        "n_channels": len(
-            preprocessing["standard_channels"]
-        ),
+        "n_channels": declared_channel_count,
+        "standard_channels": standard_channels,
         "time_segments": int(
             preprocessing["time_segments"]
         ),
@@ -344,11 +362,10 @@ def runtime_kwargs_from_training_report(
                 "error",
             )
         ),
-        "min_observed_channels": int(
-            preprocessing.get(
-                "min_observed_channels",
-                2,
-            )
+        "min_observed_channels": (
+            None
+            if raw_min_observed_channels is None
+            else int(raw_min_observed_channels)
         ),
         "spline_alpha": float(
             preprocessing.get(
@@ -447,8 +464,8 @@ def extract_first_trial_window(
         unit=str(metadata.unit),
         layout="CT",
         trial_id=str(dataset.trial_ids[0]),
-        window_id="export_smoke_test",
-        label=int(loaded["labels"][0]),
+        window_id=str(dataset.window_ids[0]),
+        label=int(dataset.labels[0]),
         metadata={
             "session": str(dataset.session_ids[0]),
             "source": (
@@ -646,6 +663,22 @@ def build_package_payload(
             "normalization": str(
                 runtime_kwargs["normalization"]
             ),
+            "missing_channel_policy": str(
+                runtime_kwargs["missing_channel_policy"]
+            ),
+            "min_observed_channels": (
+                None
+                if runtime_kwargs["min_observed_channels"]
+                is None
+                else int(
+                    runtime_kwargs[
+                        "min_observed_channels"
+                    ]
+                )
+            ),
+            "spline_alpha": float(
+                runtime_kwargs["spline_alpha"]
+            ),
         },
     }
 
@@ -718,6 +751,9 @@ def build_package_payload(
         },
         "provenance": {
             "source_model": "CBraMod",
+            "source_unit": str(
+                runtime_kwargs["source_unit"]
+            ),
             "source_backbone_filename": (
                 backbone_path.name
             ),
@@ -903,6 +939,7 @@ def load_package_runtime_for_smoke_test(
             contract["window_sec"]
         ),
         n_channels=int(transform["n_channels"]),
+        standard_channels=standard_channels,
         time_segments=int(
             transform["time_segments"]
         ),
@@ -957,6 +994,24 @@ def load_package_runtime_for_smoke_test(
                 "normalization",
                 "none",
             )
+        ),
+        missing_channel_policy=str(
+            transform.get(
+                "missing_channel_policy",
+                "error",
+            )
+        ),
+        min_observed_channels=(
+            None
+            if transform.get(
+                "min_observed_channels"
+            ) is None
+            else int(
+                transform["min_observed_channels"]
+            )
+        ),
+        spline_alpha=float(
+            transform.get("spline_alpha", 1e-5)
         ),
         head_type=str(model["head_type"]),
     )

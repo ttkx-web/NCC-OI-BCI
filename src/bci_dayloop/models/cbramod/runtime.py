@@ -23,7 +23,7 @@ from .classifier import (
     CBraModClassifier,
     build_cbramod_classifier,
 )
-from .config import CBraModConfig
+from .config import BCICIV2A_22_CHANNELS, CBraModConfig
 from .preprocessing import CBraModPipelinePreprocessor
 
 
@@ -507,6 +507,7 @@ def build_cbramod_runtime(
     target_sample_rate: float = 200.0,
     window_seconds: float = 4.0,
     n_channels: int = 22,
+    standard_channels: Sequence[str] = BCICIV2A_22_CHANNELS,
     time_segments: int = 4,
     points_per_patch: int = 200,
 
@@ -575,6 +576,9 @@ def build_cbramod_runtime(
         target_sample_rate=target_sample_rate,
         window_seconds=window_seconds,
         n_channels=n_channels,
+        standard_channels=tuple(
+            str(name) for name in standard_channels
+        ),
         time_segments=time_segments,
         points_per_patch=points_per_patch,
 

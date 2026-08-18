@@ -26,6 +26,32 @@ streamlit run web/multistate_demo.py -- --data-path data/processed/bnci2014_001/
 python scripts/run_multistate_demo.py --data-path data/processed/bnci2014_001/subject_01.h5 --session 0train --trial 0
 ```
 
+## 真实设备输入契约
+
+设备接入层无需了解特征、状态 history 或 cortical rendering。它只需在已有
+ring buffer 中切出一个窗口，并复用同一个 `DemoStateDecoder` 实例：
+
+```python
+from bci_dayloop.demo.schemas import DemoEEGWindow
+
+window = DemoEEGWindow(
+    samples=eeg,                 # float array, [C, T]
+    sample_rate=250.0,
+    channel_names=names,         # 与 samples 的第 0 维一一对应
+    unit="uV",                   # 支持 uV 或 V；内部特征统一为 uV
+    timestamp=timestamp,
+    channel_valid_mask=valid,    # 可选 bool [C]；坏导/掉导为 False
+    device_name="BCIGo",         # 可选展示/追踪元数据
+    montage_name="bcigo_32_placeholder",
+)
+result = decoder.decode_window(window)
+```
+
+设备层负责 SDK、socket、sentinel 清理、buffer 与连接生命周期；Demo 不会连接
+设备或识别任何厂商 sentinel。`channel_valid_mask=False` 的导联不参与 PSD 聚合、
+entropy、Hjorth、同步度、空间统计和皮层热力图。当前 `decode(samples, ...)` 仍保留，
+它仅构造相同的 `DemoEEGWindow` 后转交给 `decode_window()`，因此 HDF5 路径兼容。
+
 ## 当前指标
 
 每个值都做了 0–100 映射和指数平滑，仅供可视化：
@@ -41,11 +67,35 @@ python scripts/run_multistate_demo.py --data-path data/processed/bnci2014_001/su
 | 神经复杂度 | 五个频带功率分布的 spectral entropy |
 | 神经同步度 | 最多 32 个通道的平均绝对相关系数 |
 
-频带定义集中在 `bci_dayloop.demo.signal_features.EEG_BANDS`：Delta 1–4 Hz、Theta 4–8 Hz、Alpha 8–13 Hz、Beta 13–30 Hz、Gamma 30–45 Hz。PSD、每通道相对频段功率、皮层活动图输入、信号质量与延迟均由同一窗口计算，不会为皮层活动图重复执行 FFT。
+频带定义集中在 `bci_dayloop.demo.signal_features.EEG_BANDS`：Delta 1–4 Hz、Theta 4–8 Hz、Alpha 8–13 Hz、Beta 13–30 Hz、Gamma 30–45 Hz。PSD、每通道相对频段功率、1–30 Hz absolute power、信号质量与延迟均由同一窗口计算，不会为皮层活动图重复执行 FFT。
 
 ## 皮层活动图
 
-页面中的“皮层活动图”是 **sensor-derived cortical activity visualization**：它将当前 scalp EEG 的每通道 Theta + Alpha + Beta 相对功率，通过固定的 channel-to-template pixel mapping 叠加到预生成的左右半球静态 PNG 上。它用于 Demo visualization，**不是**经过 forward/inverse modeling 得到的 EEG source localization。
+页面中的“皮层活动图”是 **sensor-derived cortical activity visualization**，不是
+经过 forward/inverse modeling 得到的 EEG source localization。每个 decoder window
+复用同一次 per-channel PSD，计算 1–30 Hz absolute power，应用 `log1p(power)`，仅对
+有效且已映射导联取 P10/P90 robust scaling，再通过设备专属的 2D anchor 叠加到预生成
+的左右半球静态 PNG。无有效映射时页面显示“暂无可用皮层映射”。
+
+Montage 配置位于：
+
+```text
+src/bci_dayloop/demo/configs/cortical_montages/
+```
+
+- `bnci_22.json`：当前 HDF5 Demo 默认配置。
+- `bcigo_32_placeholder.json`：32 导配置模板示例。它的 `CH01`–`CH32` 和位置是近似
+  可视化占位，**必须由设备负责人按真实帽型/电极命名替换，不能视为 BCIGo 的准确 montage**。
+- `cortical_montage_template.json`：复制后填入设备 channel name 与 `anchors`。
+
+每个配置以 channel name 匹配，不依赖导联顺序；一条 channel 可以提供一个或两个
+`anchors`（例如中线导联映射到左右两侧）。配置会在加载时验证名称、唯一性、hemisphere
+和 `[0,1]` 坐标；切换 montage 时 mapper 重建/切换对应的预计算 Gaussian mask cache，并
+清除旧 montage 的 EMA history。可用以下工具检查配置：
+
+```bash
+python tools/multistate_demo/validate_cortical_montage.py --config bnci_22
+```
 
 静态模板位于 `src/bci_dayloop/demo/assets/cortical/`，运行 Streamlit 时只会读取 PNG 并以 NumPy 叠加预计算 Gaussian masks；不会导入 Nilearn 或 MNE 来渲染皮层。开发者需要重新生成模板时才运行：
 
@@ -55,7 +105,9 @@ python tools/multistate_demo/generate_cortical_template.py
 
 该工具使用 Nilearn 的 `fsaverage5` pial/sulcal surface 生成固定 512×384、透明背景的左右 lateral PNG，因此 Nilearn 仅是一次性开发依赖，不是 Demo runtime 依赖。
 
-信号质量为展示用启发式分数，结合有效通道比例、平坦通道、极端振幅和高频噪声代理项；不是临床伪迹检测。
+皮层活动图保持 decoder-rate EMA（`step_sec=0.1` 时约 10 Hz；`0.25` 时约 4 Hz），
+不会进入 15 Hz waveform/PSD display interpolation。信号质量为展示用启发式分数，结合
+有效通道比例、平坦通道、极端振幅和高频噪声代理项；不是临床伪迹检测。
 
 ## Motor Intent
 

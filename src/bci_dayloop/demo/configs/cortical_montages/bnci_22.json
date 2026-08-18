@@ -1,0 +1,29 @@
+{
+  "device_name": "BNCI2014_001",
+  "montage_name": "bnci_22",
+  "description": "Approximate visualization anchors for the BNCI2014_001 22-channel cap; not source localization.",
+  "channels": {
+    "FZ": {"anchors": [{"hemisphere": "left", "x": 0.36, "y": 0.39}, {"hemisphere": "right", "x": 0.64, "y": 0.39}]},
+    "FC3": {"anchors": [{"hemisphere": "left", "x": 0.42, "y": 0.46}]},
+    "FC1": {"anchors": [{"hemisphere": "left", "x": 0.47, "y": 0.45}]},
+    "FCZ": {"anchors": [{"hemisphere": "left", "x": 0.46, "y": 0.45}, {"hemisphere": "right", "x": 0.54, "y": 0.45}]},
+    "FC2": {"anchors": [{"hemisphere": "right", "x": 0.53, "y": 0.45}]},
+    "FC4": {"anchors": [{"hemisphere": "right", "x": 0.58, "y": 0.46}]},
+    "C5": {"anchors": [{"hemisphere": "left", "x": 0.44, "y": 0.54}]},
+    "C3": {"anchors": [{"hemisphere": "left", "x": 0.50, "y": 0.52}]},
+    "C1": {"anchors": [{"hemisphere": "left", "x": 0.54, "y": 0.51}]},
+    "CZ": {"anchors": [{"hemisphere": "left", "x": 0.53, "y": 0.51}, {"hemisphere": "right", "x": 0.47, "y": 0.51}]},
+    "C2": {"anchors": [{"hemisphere": "right", "x": 0.46, "y": 0.51}]},
+    "C4": {"anchors": [{"hemisphere": "right", "x": 0.50, "y": 0.52}]},
+    "C6": {"anchors": [{"hemisphere": "right", "x": 0.56, "y": 0.54}]},
+    "CP3": {"anchors": [{"hemisphere": "left", "x": 0.61, "y": 0.57}]},
+    "CP1": {"anchors": [{"hemisphere": "left", "x": 0.65, "y": 0.56}]},
+    "CPZ": {"anchors": [{"hemisphere": "left", "x": 0.64, "y": 0.56}, {"hemisphere": "right", "x": 0.36, "y": 0.56}]},
+    "CP2": {"anchors": [{"hemisphere": "right", "x": 0.35, "y": 0.56}]},
+    "CP4": {"anchors": [{"hemisphere": "right", "x": 0.39, "y": 0.57}]},
+    "P1": {"anchors": [{"hemisphere": "left", "x": 0.82, "y": 0.61}]},
+    "PZ": {"anchors": [{"hemisphere": "left", "x": 0.82, "y": 0.61}, {"hemisphere": "right", "x": 0.18, "y": 0.61}]},
+    "P2": {"anchors": [{"hemisphere": "right", "x": 0.18, "y": 0.61}]},
+    "POZ": {"anchors": [{"hemisphere": "left", "x": 0.88, "y": 0.70}, {"hemisphere": "right", "x": 0.12, "y": 0.70}]}
+  }
+}

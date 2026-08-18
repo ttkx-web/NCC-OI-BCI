@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from bci_dayloop.demo.schemas import MOTOR_LABELS_CN, STATE_LABELS_CN
+from bci_dayloop.demo.schemas import DemoEEGWindow, MOTOR_LABELS_CN, STATE_LABELS_CN
 from bci_dayloop.demo.state_decoder import DemoStateDecoder
 
 
@@ -87,3 +87,33 @@ def test_hidden_motor_intent_skips_motor_decoder_inference() -> None:
     decoder.decode(_eeg_window(), sample_rate=250.0, channel_names=["F3", "F4", "C3", "C4"])
 
     assert motor.calls == 0
+
+
+def test_decode_window_accepts_32_channel_device_contract_and_excludes_invalid_channels() -> None:
+    sample_rate = 250.0
+    seconds = 4.0
+    time = np.arange(int(sample_rate * seconds)) / sample_rate
+    amplitudes = np.linspace(5.0, 20.0, 32)
+    samples_uv = np.vstack([amplitude * np.sin(2 * np.pi * 10.0 * time) for amplitude in amplitudes]).astype(np.float32)
+    valid = np.ones(32, dtype=bool)
+    valid[[3, 19]] = False
+    samples_uv[3] = 1e6  # Must not alter valid-channel feature/cortical statistics.
+    decoder = DemoStateDecoder(compute_motor_intent=False)
+    result = decoder.decode_window(
+        DemoEEGWindow(
+            samples=samples_uv,
+            sample_rate=sample_rate,
+            channel_names=[f"CH{index:02d}" for index in range(1, 33)],
+            unit="uV",
+            timestamp=12.5,
+            channel_valid_mask=valid,
+            device_name="BCIGo",
+            montage_name="bcigo_32_placeholder",
+        )
+    )
+
+    assert result.timestamp == 12.5
+    assert result.cortical_activity is not None
+    assert result.cortical_activity.available
+    assert result.cortical_activity.mapped_channel_count == 30
+    assert all(np.isfinite(value) and 0.0 <= value <= 100.0 for value in result.states.values())

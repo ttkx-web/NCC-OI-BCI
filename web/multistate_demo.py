@@ -21,7 +21,7 @@ from bci_dayloop.data.hdf5_dataset import EEGHDF5  # noqa: E402
 from bci_dayloop.demo.input import MIN_STEP_SEC, list_demo_sessions, load_demo_trial, trial_window, window_count  # noqa: E402
 from bci_dayloop.demo.model_package_discovery import discover_motor_intent_packages  # noqa: E402
 from bci_dayloop.demo.motor_decoder import DemoMotorIntentDecoder, ModelPackageMotorIntentDecoder, MotorIntentDecoder  # noqa: E402
-from bci_dayloop.demo.schemas import MOTOR_LABELS_CN, STATE_LABELS_CN  # noqa: E402
+from bci_dayloop.demo.schemas import DemoEEGWindow, MOTOR_LABELS_CN, STATE_LABELS_CN  # noqa: E402
 from bci_dayloop.demo.state_decoder import DemoStateDecoder  # noqa: E402
 from bci_dayloop.demo.utils import score_level  # noqa: E402
 from bci_dayloop.demo.visual_state import VISUAL_INTERVAL_SEC, VisualState  # noqa: E402
@@ -341,12 +341,15 @@ def decode_current_frame() -> None:
     if total_frames == 0:
         raise ValueError(f"Trial {current_trial_index + 1} is shorter than the selected window")
     window = trial_window(trial, current_window_index, window_sec=window_sec, step_sec=step_sec)
-    result = st.session_state.demo_decoder.decode(
-        window,
-        sample_rate=trial.sample_rate,
-        channel_names=trial.channel_names,
-        unit=trial.unit,
-        timestamp=(current_trial_index * trial.samples.shape[-1] + current_window_index * step_sec * trial.sample_rate) / trial.sample_rate,
+    result = st.session_state.demo_decoder.decode_window(
+        DemoEEGWindow(
+            samples=window,
+            sample_rate=trial.sample_rate,
+            channel_names=trial.channel_names,
+            unit=trial.unit,
+            timestamp=(current_trial_index * trial.samples.shape[-1] + current_window_index * step_sec * trial.sample_rate) / trial.sample_rate,
+            montage_name="bnci_22",
+        )
     )
     st.session_state.demo_result = result
     cortical = result.cortical_activity
@@ -354,6 +357,7 @@ def decode_current_frame() -> None:
         result.psd_values,
         None if cortical is None else cortical.left_rgba,
         None if cortical is None else cortical.right_rgba,
+        cortical_available=bool(cortical is not None and cortical.available),
     )
     # The cortical mapper already smooths its target with decode-time EMA.
     # Re-render this media element only for a new decoder result, not on every
@@ -591,6 +595,9 @@ def render_psd_visual(result, displayed_psd: np.ndarray | None) -> None:
 
 def render_cortical_visual(visual_state: VisualState) -> None:
     left, right = visual_state.displayed_cortical_rgba("left"), visual_state.displayed_cortical_rgba("right")
+    if not visual_state.cortical_available:
+        st.caption("暂无可用皮层映射")
+        return
     if left is None or right is None:
         return
     # One Streamlit image avoids the independent left/right media lifecycle that

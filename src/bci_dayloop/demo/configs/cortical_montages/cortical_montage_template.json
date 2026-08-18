@@ -1,0 +1,18 @@
+{
+  "device_name": "Your device name",
+  "montage_name": "your_montage_name",
+  "description": "2D visualization anchors. This is not source localization.",
+  "channels": {
+    "CHANNEL_NAME": {
+      "anchors": [
+        {"hemisphere": "left", "x": 0.50, "y": 0.50}
+      ]
+    },
+    "MIDLINE_CHANNEL": {
+      "anchors": [
+        {"hemisphere": "left", "x": 0.50, "y": 0.50},
+        {"hemisphere": "right", "x": 0.50, "y": 0.50}
+      ]
+    }
+  }
+}

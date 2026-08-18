@@ -39,6 +39,47 @@ MOTOR_LABELS_CN: dict[str, str] = {
 
 
 @dataclass(frozen=True, slots=True)
+class DemoEEGWindow:
+    """Source-neutral EEG input contract for the multi-state demo.
+
+    Device adapters are responsible for acquisition, sentinel cleanup and
+    buffering. The decoder receives one already-cleaned ``[channels, samples]``
+    window plus an optional channel-validity mask.
+    """
+
+    samples: np.ndarray
+    sample_rate: float
+    channel_names: list[str]
+    unit: str
+    timestamp: float
+    channel_valid_mask: np.ndarray | None = None
+    device_name: str | None = None
+    montage_name: str | None = None
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.samples)
+        if values.ndim != 2:
+            raise ValueError(f"samples must be [channels, samples], got {values.shape}")
+        if values.shape[0] != len(self.channel_names):
+            raise ValueError("channel_names length does not match samples")
+        if values.shape[1] < 2:
+            raise ValueError("samples must contain at least two time samples")
+        if not np.isfinite(self.sample_rate) or self.sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if self.channel_valid_mask is not None:
+            mask = np.asarray(self.channel_valid_mask)
+            if mask.ndim != 1 or mask.shape[0] != values.shape[0]:
+                raise ValueError("channel_valid_mask must have shape [channels]")
+
+    @property
+    def valid_mask(self) -> np.ndarray:
+        """Return a boolean mask without mutating the device-owned input."""
+        if self.channel_valid_mask is None:
+            return np.ones(len(self.channel_names), dtype=bool)
+        return np.asarray(self.channel_valid_mask, dtype=bool).copy()
+
+
+@dataclass(frozen=True, slots=True)
 class EmotionState:
     """Display metadata for the demo-only emotion-state estimator."""
 

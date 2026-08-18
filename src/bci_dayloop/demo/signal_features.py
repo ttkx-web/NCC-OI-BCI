@@ -24,6 +24,8 @@ class SignalFeatures:
     relative_band_power: dict[str, float]
     channel_relative_band_power: dict[str, np.ndarray]
     channel_alpha_power: np.ndarray
+    channel_power_1_30: np.ndarray
+    channel_valid_mask: np.ndarray
     rms_uv: float
     spectral_entropy: float
     mean_abs_correlation: float
@@ -73,18 +75,25 @@ def _welch_psd(samples: np.ndarray, sample_rate: float, nperseg: int) -> tuple[n
     return np.fft.rfftfreq(nperseg, d=1.0 / sample_rate), np.mean(estimates, axis=0)
 
 
-def calculate_signal_quality(samples_uv: np.ndarray, frequencies: np.ndarray, psd: np.ndarray) -> float:
+def calculate_signal_quality(
+    samples_uv: np.ndarray,
+    frequencies: np.ndarray,
+    psd: np.ndarray,
+    channel_valid_mask: np.ndarray,
+) -> float:
     """A pragmatic display-quality score, not an artifact classifier."""
-    finite_channel = np.isfinite(samples_uv).all(axis=1)
+    finite_channel = np.isfinite(samples_uv).all(axis=1) & channel_valid_mask
     if not np.any(finite_channel):
         return 0.0
     valid = samples_uv[finite_channel]
     flat_ratio = float(np.mean(np.std(valid, axis=1) < 0.15))
     clipped_ratio = float(np.mean(np.abs(valid) > 250.0))
-    total = np.trapz(psd, frequencies, axis=1) + 1e-12
-    high = _band_mean(psd, frequencies, 30.0, 45.0)
+    total = np.trapz(psd[finite_channel], frequencies, axis=1) + 1e-12
+    high = _band_mean(psd[finite_channel], frequencies, 30.0, 45.0)
     noise_ratio = float(np.mean(high / total))
-    valid_ratio = float(np.mean(finite_channel))
+    # Explicitly invalid channels are excluded from feature quality statistics;
+    # their quality is owned by the acquisition/device adapter.
+    valid_ratio = float(np.mean(np.isfinite(samples_uv[channel_valid_mask]).all(axis=1))) if np.any(channel_valid_mask) else 0.0
     score = 100.0 * (0.50 * valid_ratio + 0.25 * (1.0 - flat_ratio) + 0.15 * (1.0 - min(1.0, clipped_ratio * 15.0)) + 0.10 * (1.0 - min(1.0, noise_ratio * 4.0)))
     return float(np.clip(score, 0.0, 100.0))
 
@@ -139,59 +148,89 @@ def extract_signal_features(
     *,
     unit: str = "V",
     channel_names: list[str] | None = None,
+    channel_valid_mask: np.ndarray | None = None,
 ) -> SignalFeatures:
-    """Return PSD, relative powers, entropy, synchrony and display quality."""
+    """Return features from valid EEG channels only.
+
+    PSD is retained in original channel order so renderers can map it by name.
+    Invalid channels are represented by ``NaN`` in channel-level outputs and
+    never participate in aggregate statistics or robust normalization.
+    """
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
     samples_uv = _as_microvolts(samples, unit)
+    channels = samples_uv.shape[0]
+    if channel_valid_mask is None:
+        requested_valid = np.ones(channels, dtype=bool)
+    else:
+        requested_valid = np.asarray(channel_valid_mask, dtype=bool)
+        if requested_valid.ndim != 1 or requested_valid.shape[0] != channels:
+            raise ValueError("channel_valid_mask must have shape [channels]")
+    finite_channel = np.isfinite(samples_uv).all(axis=1)
+    valid_mask = requested_valid & finite_channel
+    if not np.any(valid_mask):
+        raise ValueError("at least one valid finite EEG channel is required")
     clean = np.nan_to_num(samples_uv, nan=0.0, posinf=0.0, neginf=0.0)
     nperseg = min(clean.shape[1], max(32, int(round(sample_rate * 2))))
     frequencies, psd = _welch_psd(clean - clean.mean(axis=1, keepdims=True), sample_rate, nperseg)
     keep = (frequencies >= 1.0) & (frequencies <= min(45.0, sample_rate / 2.0))
     frequencies, psd = frequencies[keep], psd[:, keep]
     total_by_channel = np.trapz(psd, frequencies, axis=1) + 1e-12
+    valid_total_power = total_by_channel[valid_mask]
     relative: dict[str, float] = {}
     channel_relative: dict[str, np.ndarray] = {}
-    channel_alpha = np.zeros(clean.shape[0], dtype=np.float64)
+    channel_alpha = np.full(channels, np.nan, dtype=np.float64)
     for name, (low, high) in EEG_BANDS.items():
         power = _band_mean(psd, frequencies, low, high)
-        relative[name] = float(np.mean(power / total_by_channel))
-        channel_relative[name] = power / total_by_channel
+        ratio = power / total_by_channel
+        ratio[~valid_mask] = np.nan
+        relative[name] = float(np.nanmean(ratio[valid_mask]))
+        channel_relative[name] = ratio
         if name == "alpha":
-            channel_alpha = power
+            channel_alpha[valid_mask] = power[valid_mask]
+    power_1_30 = _band_mean(psd, frequencies, 1.0, 30.0)
+    power_1_30[~valid_mask] = np.nan
     band_distribution = np.asarray([relative[name] for name in EEG_BANDS], dtype=np.float64)
     band_distribution = band_distribution / (band_distribution.sum() + 1e-12)
     entropy = -np.sum(band_distribution * np.log(band_distribution + 1e-12)) / np.log(len(band_distribution))
-    subset = clean[: min(32, clean.shape[0])]
+    subset = clean[valid_mask][:32]
     if subset.shape[0] < 2 or subset.shape[1] < 2:
         synchrony = 0.0
     else:
         corr = np.corrcoef(subset)
         upper = np.abs(corr[np.triu_indices_from(corr, k=1)])
-        synchrony = float(np.nanmean(upper)) if upper.size else 0.0
-    first_difference = np.diff(clean, axis=1)
+        synchrony = float(np.nanmean(upper)) if upper.size and np.isfinite(upper).any() else 0.0
+    valid_clean = clean[valid_mask]
+    first_difference = np.diff(valid_clean, axis=1)
     second_difference = np.diff(first_difference, axis=1)
-    variance = np.var(clean, axis=1) + 1e-12
+    variance = np.var(valid_clean, axis=1) + 1e-12
     first_variance = np.var(first_difference, axis=1) + 1e-12
     second_variance = np.var(second_difference, axis=1) + 1e-12
     mobility_by_channel = np.sqrt(first_variance / variance)
     complexity_by_channel = np.sqrt(second_variance / first_variance) / (mobility_by_channel + 1e-12)
-    zero_crossing_rate = np.mean(np.diff(np.signbit(clean), axis=1) != 0)
-    temporal_activity = float(np.sqrt(np.mean(first_difference**2)) + np.mean(np.std(clean, axis=1)) * zero_crossing_rate)
-    quality = calculate_signal_quality(samples_uv, frequencies, psd)
+    zero_crossing_rate = np.mean(np.diff(np.signbit(valid_clean), axis=1) != 0)
+    temporal_activity = float(np.sqrt(np.mean(first_difference**2)) + np.mean(np.std(valid_clean, axis=1)) * zero_crossing_rate)
+    quality = calculate_signal_quality(samples_uv, frequencies, psd, requested_valid)
+    valid_names = [name for name, valid in zip(channel_names or [], valid_mask, strict=True) if valid] if channel_names else None
     return SignalFeatures(
         frequencies=frequencies,
         psd=psd,
         relative_band_power=relative,
         channel_relative_band_power=channel_relative,
         channel_alpha_power=channel_alpha,
-        rms_uv=float(np.sqrt(np.mean(clean**2))),
+        channel_power_1_30=power_1_30,
+        channel_valid_mask=valid_mask,
+        rms_uv=float(np.sqrt(np.mean(valid_clean**2))),
         spectral_entropy=float(np.clip(entropy, 0.0, 1.0)),
         mean_abs_correlation=float(np.clip(synchrony, 0.0, 1.0)),
         signal_quality=quality,
         hjorth_mobility=float(np.nanmedian(mobility_by_channel)),
         hjorth_complexity=float(np.nanmedian(complexity_by_channel)),
         temporal_activity=temporal_activity,
-        spatial_balance=_hemisphere_balance(total_by_channel, channel_names),
-        regional_consistency=_regional_consistency(channel_relative, channel_names),
+        spatial_balance=_hemisphere_balance(valid_total_power, valid_names),
+        regional_consistency=(
+            _regional_consistency({name: values[valid_mask] for name, values in channel_relative.items()}, valid_names)
+            if valid_names is not None
+            else 0.5
+        ),
     )

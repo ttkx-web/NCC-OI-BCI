@@ -1,0 +1,23 @@
+{
+  "device_name": "BCIGo",
+  "montage_name": "bcigo_32_placeholder",
+  "description": "PLACEHOLDER visualization mapping for 32 named channels (CH01–CH32). Replace channel names and anchors with the verified BCIGo cap layout before production use.",
+  "channels": {
+    "CH01": {"anchors": [{"hemisphere": "left", "x": 0.22, "y": 0.30}]}, "CH02": {"anchors": [{"hemisphere": "right", "x": 0.78, "y": 0.30}]},
+    "CH03": {"anchors": [{"hemisphere": "left", "x": 0.30, "y": 0.35}]}, "CH04": {"anchors": [{"hemisphere": "right", "x": 0.70, "y": 0.35}]},
+    "CH05": {"anchors": [{"hemisphere": "left", "x": 0.38, "y": 0.40}]}, "CH06": {"anchors": [{"hemisphere": "right", "x": 0.62, "y": 0.40}]},
+    "CH07": {"anchors": [{"hemisphere": "left", "x": 0.44, "y": 0.45}]}, "CH08": {"anchors": [{"hemisphere": "right", "x": 0.56, "y": 0.45}]},
+    "CH09": {"anchors": [{"hemisphere": "left", "x": 0.48, "y": 0.50}]}, "CH10": {"anchors": [{"hemisphere": "right", "x": 0.52, "y": 0.50}]},
+    "CH11": {"anchors": [{"hemisphere": "left", "x": 0.43, "y": 0.55}]}, "CH12": {"anchors": [{"hemisphere": "right", "x": 0.57, "y": 0.55}]},
+    "CH13": {"anchors": [{"hemisphere": "left", "x": 0.50, "y": 0.60}]}, "CH14": {"anchors": [{"hemisphere": "right", "x": 0.50, "y": 0.60}]},
+    "CH15": {"anchors": [{"hemisphere": "left", "x": 0.64, "y": 0.63}]}, "CH16": {"anchors": [{"hemisphere": "right", "x": 0.36, "y": 0.63}]},
+    "CH17": {"anchors": [{"hemisphere": "left", "x": 0.72, "y": 0.68}]}, "CH18": {"anchors": [{"hemisphere": "right", "x": 0.28, "y": 0.68}]},
+    "CH19": {"anchors": [{"hemisphere": "left", "x": 0.80, "y": 0.72}]}, "CH20": {"anchors": [{"hemisphere": "right", "x": 0.20, "y": 0.72}]},
+    "CH21": {"anchors": [{"hemisphere": "left", "x": 0.26, "y": 0.42}]}, "CH22": {"anchors": [{"hemisphere": "right", "x": 0.74, "y": 0.42}]},
+    "CH23": {"anchors": [{"hemisphere": "left", "x": 0.34, "y": 0.49}]}, "CH24": {"anchors": [{"hemisphere": "right", "x": 0.66, "y": 0.49}]},
+    "CH25": {"anchors": [{"hemisphere": "left", "x": 0.40, "y": 0.58}]}, "CH26": {"anchors": [{"hemisphere": "right", "x": 0.60, "y": 0.58}]},
+    "CH27": {"anchors": [{"hemisphere": "left", "x": 0.58, "y": 0.66}]}, "CH28": {"anchors": [{"hemisphere": "right", "x": 0.42, "y": 0.66}]},
+    "CH29": {"anchors": [{"hemisphere": "left", "x": 0.84, "y": 0.76}]}, "CH30": {"anchors": [{"hemisphere": "right", "x": 0.16, "y": 0.76}]},
+    "CH31": {"anchors": [{"hemisphere": "left", "x": 0.52, "y": 0.36}]}, "CH32": {"anchors": [{"hemisphere": "right", "x": 0.48, "y": 0.36}]}
+  }
+}

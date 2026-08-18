@@ -10,7 +10,7 @@ import numpy as np
 from bci_dayloop.demo.interpretation import make_interpretation
 from bci_dayloop.demo.cortical_activity import CorticalActivityMapper
 from bci_dayloop.demo.motor_decoder import DemoMotorIntentDecoder, MotorIntentDecoder
-from bci_dayloop.demo.schemas import BrainStateResult, EmotionState, STATE_LABELS_CN
+from bci_dayloop.demo.schemas import BrainStateResult, DemoEEGWindow, EmotionState, STATE_LABELS_CN
 from bci_dayloop.demo.signal_features import SignalFeatures, extract_signal_features
 from bci_dayloop.demo.utils import RollingLatency, bounded_score
 
@@ -181,23 +181,19 @@ class DemoStateDecoder:
         display_score = score if label == candidate else {"relaxed": 82.0, "positive": 72.0, "neutral": 55.0, "focused": 74.0, "tense": 28.0}[label]
         return EmotionState(label=label, label_cn=label_cn, emoji=emoji, score=display_score)
 
-    def decode(
-        self,
-        samples: np.ndarray,
-        *,
-        sample_rate: float,
-        channel_names: list[str],
-        unit: str = "V",
-        timestamp: float | None = None,
-    ) -> BrainStateResult:
-        """Decode one [channel, sample] window into the stable presentation API."""
+    def decode_window(self, window: DemoEEGWindow) -> BrainStateResult:
+        """Decode a source-neutral :class:`DemoEEGWindow` into presentation data."""
         started = perf_counter()
-        values = np.asarray(samples, dtype=np.float32)
-        if values.ndim != 2:
-            raise ValueError(f"samples must be [channels, samples], got {values.shape}")
-        if values.shape[0] != len(channel_names):
-            raise ValueError("channel_names length does not match samples")
-        features = extract_signal_features(values, sample_rate, unit=unit, channel_names=channel_names)
+        values = np.asarray(window.samples, dtype=np.float32)
+        channel_names = list(window.channel_names)
+        sample_rate = float(window.sample_rate)
+        features = extract_signal_features(
+            values,
+            sample_rate,
+            unit=window.unit,
+            channel_names=channel_names,
+            channel_valid_mask=window.valid_mask,
+        )
         raw_states = self._raw_states(features)
         raw_states.update(self._additional_raw_states(features, self._rhythm_stability(features.psd)))
         states = self._smooth_states(raw_states)
@@ -216,7 +212,7 @@ class DemoStateDecoder:
                 samples=values,
                 sample_rate=sample_rate,
                 channel_names=channel_names,
-                unit=unit,
+                unit=window.unit,
             )
         else:
             motor = {
@@ -227,12 +223,17 @@ class DemoStateDecoder:
                 "decoder_type": "disabled",
                 "decoder_display_name": "disabled",
             }
-        cortical_activity = self._cortical_mapper.update(channel_names, features.channel_relative_band_power)
+        cortical_activity = self._cortical_mapper.update(
+            channel_names,
+            features.channel_power_1_30,
+            channel_valid_mask=features.channel_valid_mask,
+            montage_name=window.montage_name,
+        )
         latency_ms = (perf_counter() - started) * 1000.0
         average_latency_ms, p95_latency_ms = self._latency.add(latency_ms)
         interpretation = make_interpretation(states, motor, features.relative_band_power)
         return BrainStateResult(
-            timestamp=time() if timestamp is None else float(timestamp),
+            timestamp=float(window.timestamp),
             states=states,
             motor_intent=motor,
             band_power=features.relative_band_power,
@@ -243,13 +244,39 @@ class DemoStateDecoder:
             waveform=values.copy(),
             channel_names=list(channel_names),
             sample_rate=float(sample_rate),
-            waveform_unit=unit,
+            waveform_unit=window.unit,
             psd_frequencies=features.frequencies,
             psd_values=np.mean(features.psd, axis=0),
             average_latency_ms=average_latency_ms,
             p95_latency_ms=p95_latency_ms,
             emotion=emotion,
             cortical_activity=cortical_activity,
+        )
+
+    def decode(
+        self,
+        samples: np.ndarray,
+        *,
+        sample_rate: float,
+        channel_names: list[str],
+        unit: str = "V",
+        timestamp: float | None = None,
+        channel_valid_mask: np.ndarray | None = None,
+        device_name: str | None = None,
+        montage_name: str | None = None,
+    ) -> BrainStateResult:
+        """Backward-compatible raw-array adapter for existing HDF5 callers."""
+        return self.decode_window(
+            DemoEEGWindow(
+                samples=samples,
+                sample_rate=sample_rate,
+                channel_names=channel_names,
+                unit=unit,
+                timestamp=time() if timestamp is None else float(timestamp),
+                channel_valid_mask=channel_valid_mask,
+                device_name=device_name,
+                montage_name=montage_name,
+            )
         )
 
 

@@ -33,6 +33,7 @@ class VisualState:
     target_cortical_right: np.ndarray | None = None
     displayed_cortical_left: np.ndarray | None = None
     displayed_cortical_right: np.ndarray | None = None
+    cortical_available: bool = False
     visual_intervals: deque[float] = field(default_factory=lambda: deque(maxlen=60))
     visual_tick_count: int = 0
     decode_tick_count: int = 0
@@ -52,6 +53,7 @@ class VisualState:
         self.target_cortical_right = None
         self.displayed_cortical_left = None
         self.displayed_cortical_right = None
+        self.cortical_available = False
         self.visual_intervals.clear()
         self.visual_tick_count = 0
         self.decode_tick_count = 0
@@ -86,7 +88,14 @@ class VisualState:
         median_dt = float(np.median(np.asarray(self.visual_intervals, dtype=np.float64)))
         return 1.0 / median_dt if median_dt > 0.0 else None
 
-    def set_decode_targets(self, psd: np.ndarray | None, cortical_left: np.ndarray | None, cortical_right: np.ndarray | None) -> None:
+    def set_decode_targets(
+        self,
+        psd: np.ndarray | None,
+        cortical_left: np.ndarray | None,
+        cortical_right: np.ndarray | None,
+        *,
+        cortical_available: bool = True,
+    ) -> None:
         """Install a new immutable decode target without modifying its result."""
         self.decode_tick_count += 1
         if psd is not None:
@@ -100,6 +109,7 @@ class VisualState:
             self.psd_transition_stream_time = self.stream_time_sec
         self._set_cortical_target("left", cortical_left)
         self._set_cortical_target("right", cortical_right)
+        self.cortical_available = cortical_available
 
     def _set_cortical_target(self, side: str, image: np.ndarray | None) -> None:
         if image is None:

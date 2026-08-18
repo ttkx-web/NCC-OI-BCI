@@ -1,8 +1,8 @@
-"""Fast sensor-derived cortical activity visualization for the demo layer.
+"""Fast, device-configured cortical activity visualization for the demo.
 
-This module does not perform an EEG inverse solution or source localization.
-It projects per-channel sensor activity onto static lateral cortical templates
-using fixed, visual-only anchors and precomputed Gaussian masks.
+This is a sensor projection, not an inverse solution or source localization.
+It overlays 1–30 Hz channel log absolute power on static lateral templates
+using device-maintained 2D anchors.
 """
 
 from __future__ import annotations
@@ -14,19 +14,14 @@ from time import perf_counter
 import numpy as np
 from PIL import Image
 
+from bci_dayloop.demo.cortical_montage import CorticalMontage, canonical_channel_name, load_cortical_montage
+
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets" / "cortical"
 CORTICAL_EMA_ALPHA = 0.85
-ACTIVITY_BANDS = ("theta", "alpha", "beta")
+DEFAULT_MONTAGE_NAME = "bnci_22"
 DEFAULT_SIGMA_FRACTION = 0.075
 ACTIVITY_THRESHOLD = 0.22
-
-
-@dataclass(frozen=True, slots=True)
-class CorticalAnchor:
-    hemisphere: str
-    x: float
-    y: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,44 +29,10 @@ class CorticalActivityResult:
     left_rgba: np.ndarray
     right_rgba: np.ndarray
     update_ms: float
-
-
-def _anchors(left: tuple[float, float] | None = None, right: tuple[float, float] | None = None) -> tuple[CorticalAnchor, ...]:
-    anchors: list[CorticalAnchor] = []
-    if left is not None:
-        anchors.append(CorticalAnchor("left", *left))
-    if right is not None:
-        anchors.append(CorticalAnchor("right", *right))
-    return tuple(anchors)
-
-
-# Coordinates are normalized pixel positions in the fixed lateral templates.
-# They encode a visually reasonable sensor-to-cortex projection, not anatomy or
-# source estimates.  Midline electrodes intentionally contribute bilaterally.
-CHANNEL_CORTICAL_POSITIONS: dict[str, tuple[CorticalAnchor, ...]] = {
-    "FP1": _anchors(left=(0.18, 0.28)), "FP2": _anchors(right=(0.82, 0.28)),
-    "AF3": _anchors(left=(0.23, 0.32)), "AF4": _anchors(right=(0.77, 0.32)),
-    "F7": _anchors(left=(0.20, 0.42)), "F5": _anchors(left=(0.27, 0.40)), "F3": _anchors(left=(0.33, 0.39)), "F1": _anchors(left=(0.39, 0.40)),
-    "F2": _anchors(right=(0.61, 0.40)), "F4": _anchors(right=(0.67, 0.39)), "F6": _anchors(right=(0.73, 0.40)), "F8": _anchors(right=(0.80, 0.42)),
-    "FT7": _anchors(left=(0.29, 0.54)), "FC5": _anchors(left=(0.36, 0.47)), "FC3": _anchors(left=(0.42, 0.46)), "FC1": _anchors(left=(0.47, 0.45)),
-    "FC2": _anchors(right=(0.53, 0.45)), "FC4": _anchors(right=(0.58, 0.46)), "FC6": _anchors(right=(0.64, 0.47)), "FT8": _anchors(right=(0.71, 0.54)),
-    "T7": _anchors(left=(0.42, 0.68)), "C5": _anchors(left=(0.44, 0.54)), "C3": _anchors(left=(0.50, 0.52)), "C1": _anchors(left=(0.54, 0.51)),
-    "C2": _anchors(right=(0.46, 0.51)), "C4": _anchors(right=(0.50, 0.52)), "C6": _anchors(right=(0.56, 0.54)), "T8": _anchors(right=(0.58, 0.68)),
-    "TP7": _anchors(left=(0.51, 0.72)), "CP5": _anchors(left=(0.56, 0.59)), "CP3": _anchors(left=(0.61, 0.57)), "CP1": _anchors(left=(0.65, 0.56)),
-    "CP2": _anchors(right=(0.35, 0.56)), "CP4": _anchors(right=(0.39, 0.57)), "CP6": _anchors(right=(0.44, 0.59)), "TP8": _anchors(right=(0.49, 0.72)),
-    "P7": _anchors(left=(0.71, 0.70)), "P5": _anchors(left=(0.75, 0.66)), "P3": _anchors(left=(0.78, 0.63)), "P1": _anchors(left=(0.82, 0.61)),
-    "P2": _anchors(right=(0.18, 0.61)), "P4": _anchors(right=(0.22, 0.63)), "P6": _anchors(right=(0.25, 0.66)), "P8": _anchors(right=(0.29, 0.70)),
-    "PO3": _anchors(left=(0.87, 0.70)), "PO4": _anchors(right=(0.13, 0.70)), "O1": _anchors(left=(0.91, 0.75)), "O2": _anchors(right=(0.09, 0.75)),
-    "FPZ": _anchors(left=(0.20, 0.29), right=(0.80, 0.29)), "FZ": _anchors(left=(0.36, 0.39), right=(0.64, 0.39)),
-    "FCZ": _anchors(left=(0.46, 0.45), right=(0.54, 0.45)), "CZ": _anchors(left=(0.53, 0.51), right=(0.47, 0.51)),
-    "CPZ": _anchors(left=(0.64, 0.56), right=(0.36, 0.56)), "PZ": _anchors(left=(0.82, 0.61), right=(0.18, 0.61)),
-    "POZ": _anchors(left=(0.88, 0.70), right=(0.12, 0.70)), "OZ": _anchors(left=(0.92, 0.75), right=(0.08, 0.75)),
-}
-
-
-def _canonical_channel_name(name: str) -> str:
-    normalized = name.upper().strip().replace(" ", "")
-    return normalized.removeprefix("EEG-").removeprefix("EEG")
+    available: bool
+    mapped_channel_count: int
+    unmapped_channel_count: int
+    montage_name: str
 
 
 def _load_template(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -85,32 +46,60 @@ def _load_template(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 class CorticalActivityMapper:
-    """Compose two lateral cortical overlays with precomputed Gaussian masks."""
+    """Compose lateral overlays from named channel activity and a montage config."""
 
-    def __init__(self, *, ema_alpha: float = CORTICAL_EMA_ALPHA, sigma_fraction: float = DEFAULT_SIGMA_FRACTION) -> None:
+    def __init__(
+        self,
+        *,
+        default_montage_name: str = DEFAULT_MONTAGE_NAME,
+        ema_alpha: float = CORTICAL_EMA_ALPHA,
+        sigma_fraction: float = DEFAULT_SIGMA_FRACTION,
+    ) -> None:
         self.ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
+        self.sigma_fraction = float(np.clip(sigma_fraction, 0.01, 0.30))
         self.left_template, self.left_silhouette = _load_template(ASSET_DIR / "cortical_left_lateral.png")
         self.right_template, self.right_silhouette = _load_template(ASSET_DIR / "cortical_right_lateral.png")
-        self._masks = self._precompute_masks(float(sigma_fraction))
+        self._masks_by_montage: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+        self._active_montage: CorticalMontage | None = None
         self._previous_heatmaps: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        self._configure_montage(default_montage_name)
+
+    @property
+    def montage_name(self) -> str:
+        assert self._active_montage is not None
+        return self._active_montage.name
+
+    @property
+    def _masks(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        return self._masks_by_montage[self.montage_name]
 
     def reset(self) -> None:
-        """Reset only temporal EMA; static templates and masks stay cached."""
+        """Clear temporal EMA but retain templates and cached masks."""
         self._previous_heatmaps = {"left": None, "right": None}
 
-    def _precompute_masks(self, sigma_fraction: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def _configure_montage(self, montage_name: str) -> None:
+        montage = load_cortical_montage(montage_name)
+        if self._active_montage is not None and montage.name == self._active_montage.name:
+            return
+        if montage.name not in self._masks_by_montage:
+            self._masks_by_montage[montage.name] = self._precompute_masks(montage)
+        self._active_montage = montage
+        # Do not blend EMA history between different device layouts.
+        self.reset()
+
+    def _precompute_masks(self, montage: CorticalMontage) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         masks: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         grids = {
             "left": np.indices(self.left_silhouette.shape, dtype=np.float32),
             "right": np.indices(self.right_silhouette.shape, dtype=np.float32),
         }
         silhouettes = {"left": self.left_silhouette, "right": self.right_silhouette}
-        for name, anchors in CHANNEL_CORTICAL_POSITIONS.items():
+        for name, anchors in montage.channels.items():
             by_side = {side: np.zeros_like(silhouette, dtype=np.float32) for side, silhouette in silhouettes.items()}
             for anchor in anchors:
                 y_grid, x_grid = grids[anchor.hemisphere]
                 height, width = silhouettes[anchor.hemisphere].shape
-                sigma = max(2.0, width * sigma_fraction)
+                sigma = max(2.0, width * self.sigma_fraction)
                 center_x, center_y = anchor.x * (width - 1), anchor.y * (height - 1)
                 gaussian = np.exp(-((x_grid - center_x) ** 2 + (y_grid - center_y) ** 2) / (2.0 * sigma**2))
                 by_side[anchor.hemisphere] += gaussian * silhouettes[anchor.hemisphere]
@@ -118,13 +107,13 @@ class CorticalActivityMapper:
         return masks
 
     @staticmethod
-    def _normalize_activity(activity: np.ndarray) -> np.ndarray:
-        if activity.size == 0:
-            return activity
-        low, high = np.percentile(activity, (10.0, 90.0))
+    def _normalize_activity(log_power: np.ndarray) -> np.ndarray:
+        if log_power.size == 0:
+            return log_power.astype(np.float32)
+        low, high = np.percentile(log_power, (10.0, 90.0))
         if high - low < 1e-9:
-            return np.full(activity.shape, 0.55, dtype=np.float32)
-        return np.clip((activity - low) / (high - low), 0.0, 1.0).astype(np.float32)
+            return np.full(log_power.shape, 0.55, dtype=np.float32)
+        return np.clip((log_power - low) / (high - low), 0.0, 1.0).astype(np.float32)
 
     @staticmethod
     def _normalize_heatmap(heatmap: np.ndarray, silhouette: np.ndarray) -> np.ndarray:
@@ -146,26 +135,58 @@ class CorticalActivityMapper:
         composed = base * (1.0 - alpha[..., None]) + overlay * alpha[..., None]
         return np.dstack((np.rint(composed * 255.0).astype(np.uint8), template[..., 3]))
 
-    def update(self, channel_names: list[str], channel_relative_band_power: dict[str, np.ndarray]) -> CorticalActivityResult:
-        """Map existing theta/alpha/beta channel power onto the static templates."""
+    def _empty_result(self, started: float, *, unmapped: int) -> CorticalActivityResult:
+        self.reset()
+        return CorticalActivityResult(
+            left_rgba=self.left_template.copy(),
+            right_rgba=self.right_template.copy(),
+            update_ms=(perf_counter() - started) * 1000.0,
+            available=False,
+            mapped_channel_count=0,
+            unmapped_channel_count=unmapped,
+            montage_name=self.montage_name,
+        )
+
+    def update(
+        self,
+        channel_names: list[str],
+        channel_power_1_30: np.ndarray,
+        *,
+        channel_valid_mask: np.ndarray | None = None,
+        montage_name: str | None = None,
+    ) -> CorticalActivityResult:
+        """Update one decoder-rate map from 1–30 Hz absolute channel power.
+
+        Input power is in internally normalized microvolt power units. Invalid
+        or unknown channels are excluded before log-percentile scaling and
+        Gaussian accumulation.
+        """
         started = perf_counter()
-        if not all(band in channel_relative_band_power for band in ACTIVITY_BANDS):
-            activity = np.empty(0, dtype=np.float32)
-            supported: list[str] = []
-        else:
-            activity = np.sum(np.vstack([channel_relative_band_power[band] for band in ACTIVITY_BANDS]), axis=0)
-            supported = [
-                _canonical_channel_name(name)
-                for name in channel_names
-            ]
-        normalized = self._normalize_activity(np.asarray(activity, dtype=np.float32))
-        heatmaps = {"left": np.zeros_like(self.left_silhouette), "right": np.zeros_like(self.right_silhouette)}
-        for index, name in enumerate(supported):
-            if index >= normalized.size or name not in self._masks:
+        self._configure_montage(montage_name or self.montage_name)
+        power = np.asarray(channel_power_1_30, dtype=np.float64)
+        if power.ndim != 1 or power.shape[0] != len(channel_names):
+            raise ValueError("channel_power_1_30 must have shape [channels]")
+        valid = np.ones(power.shape[0], dtype=bool) if channel_valid_mask is None else np.asarray(channel_valid_mask, dtype=bool)
+        if valid.ndim != 1 or valid.shape[0] != power.shape[0]:
+            raise ValueError("channel_valid_mask must have shape [channels]")
+        candidates: list[tuple[str, float]] = []
+        unmapped = 0
+        for name, value, is_valid in zip(channel_names, power, valid, strict=True):
+            canonical = canonical_channel_name(name)
+            if not is_valid or not np.isfinite(value) or value < 0.0:
                 continue
+            if canonical not in self._masks:
+                unmapped += 1
+                continue
+            candidates.append((canonical, float(np.log1p(value))))
+        if not candidates:
+            return self._empty_result(started, unmapped=unmapped)
+        weights = self._normalize_activity(np.asarray([value for _, value in candidates], dtype=np.float64))
+        heatmaps = {"left": np.zeros_like(self.left_silhouette), "right": np.zeros_like(self.right_silhouette)}
+        for (name, _), weight in zip(candidates, weights, strict=True):
             left_mask, right_mask = self._masks[name]
-            heatmaps["left"] += normalized[index] * left_mask
-            heatmaps["right"] += normalized[index] * right_mask
+            heatmaps["left"] += weight * left_mask
+            heatmaps["right"] += weight * right_mask
         templates = {"left": self.left_template, "right": self.right_template}
         silhouettes = {"left": self.left_silhouette, "right": self.right_silhouette}
         output: dict[str, np.ndarray] = {}
@@ -176,15 +197,9 @@ class CorticalActivityMapper:
             self._previous_heatmaps[side] = smoothed
             output[side] = self._compose(templates[side], silhouettes[side], smoothed)
         return CorticalActivityResult(
-            left_rgba=output["left"], right_rgba=output["right"], update_ms=(perf_counter() - started) * 1000.0
+            left_rgba=output["left"], right_rgba=output["right"], update_ms=(perf_counter() - started) * 1000.0,
+            available=True, mapped_channel_count=len(candidates), unmapped_channel_count=unmapped, montage_name=self.montage_name,
         )
 
 
-__all__ = [
-    "ACTIVITY_BANDS",
-    "ASSET_DIR",
-    "CHANNEL_CORTICAL_POSITIONS",
-    "CORTICAL_EMA_ALPHA",
-    "CorticalActivityMapper",
-    "CorticalActivityResult",
-]
+__all__ = ["ASSET_DIR", "CORTICAL_EMA_ALPHA", "DEFAULT_MONTAGE_NAME", "CorticalActivityMapper", "CorticalActivityResult"]

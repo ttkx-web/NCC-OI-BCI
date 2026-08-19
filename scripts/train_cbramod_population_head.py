@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 """
-Train a LOSO CBRaMod frozen-backbone population head on BNCI2014_001.
+Train a CBRaMod frozen-backbone population head with LOSO or within-subject
+splits.
 
 For one target subject:
 
@@ -15,6 +16,10 @@ For one target subject:
         target subject / 1test
 
 The target subject is never used to train or select the population head.
+
+With ``--split-mode within-subject``, one source session is split at the
+source-trial level for training/validation and a distinct session is held out
+for final testing.
 
 The CBRaMod backbone is frozen. Only the downstream classification head is
 updated. The default head is the official CBRaMod MLP head:
@@ -55,6 +60,10 @@ from _bootstrap import ROOT
 from bci_dayloop.data.hdf5_dataset import (
     EEGHDF5,
     HDF5Metadata,
+)
+from bci_dayloop.data.splits import (
+    WithinSubjectTrialSplit,
+    resolve_within_subject_trial_split,
 )
 from bci_dayloop.models.cbramod.backbone import (
     CBraModBackbone,
@@ -717,6 +726,34 @@ def build_subject_feature_split(
         )
 
     loaded = dataset.load(session_name)
+    return build_feature_split_from_session_data(
+        subject_id=subject_id,
+        session_name=session_name,
+        subject_path=subject_path,
+        metadata=metadata,
+        loaded=loaded,
+        canonicalizer=canonicalizer,
+        preprocessor=preprocessor,
+        backbone=backbone,
+        feature_batch_size=feature_batch_size,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+
+
+def build_feature_split_from_session_data(
+    *,
+    subject_id: int,
+    session_name: str,
+    subject_path: Path,
+    metadata: HDF5Metadata,
+    loaded: Mapping[str, np.ndarray],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+) -> tuple[FeatureSplit, HDF5Metadata]:
+    """Extract features from an already selected set of source trials."""
 
     data = np.asarray(
         loaded["data"],
@@ -835,6 +872,213 @@ def build_subject_feature_split(
         ),
         metadata,
     )
+
+
+def select_trial_rows(
+    trial_data: Mapping[str, np.ndarray],
+    indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select source trials without modifying the HDF5-backed arrays."""
+    indices = np.asarray(indices, dtype=np.int64)
+    return {
+        key: np.asarray(values)[indices]
+        for key, values in trial_data.items()
+    }
+
+
+def select_trial_ids(
+    trial_data: Mapping[str, np.ndarray],
+    trial_ids: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select trial IDs and fail if the loaded session does not contain one."""
+    requested = np.asarray(trial_ids, dtype=np.int64)
+    available = np.asarray(
+        trial_data["trial_ids"],
+        dtype=np.int64,
+    )
+    selected = select_trial_rows(
+        trial_data,
+        np.flatnonzero(np.isin(available, requested)),
+    )
+    selected_ids = np.asarray(
+        selected["trial_ids"],
+        dtype=np.int64,
+    )
+    if set(selected_ids.tolist()) != set(requested.tolist()):
+        missing = sorted(
+            set(requested.tolist()) - set(selected_ids.tolist())
+        )
+        raise RuntimeError(
+            "Selected source trials are missing from the loaded session: "
+            f"{missing[:10]}."
+        )
+    return selected
+
+
+def resolve_class_names(
+    *,
+    metadata: HDF5Metadata,
+    explicit_class_names: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Resolve logit semantics without assuming every task is BNCI MI."""
+    num_classes = len(metadata.class_names)
+    if num_classes <= 0:
+        raise ValueError("HDF5 metadata class_names must not be empty.")
+
+    if explicit_class_names is not None:
+        class_names = tuple(
+            str(name).strip()
+            for name in explicit_class_names
+        )
+        source = "--class-names"
+    else:
+        metadata_names = tuple(
+            str(name).strip()
+            for name in metadata.class_names
+        )
+        if len(metadata_names) == num_classes and all(metadata_names):
+            class_names = metadata_names
+            source = "HDF5 metadata"
+        else:
+            class_names = tuple(
+                f"class_{index}"
+                for index in range(num_classes)
+            )
+            source = "numeric fallback"
+
+    if len(class_names) != num_classes:
+        raise ValueError(
+            "class_names length must match the HDF5 class count: "
+            f"{len(class_names)} != {num_classes}."
+        )
+    if not all(class_names):
+        raise ValueError("class_names must not contain empty values.")
+    if len(set(class_names)) != len(class_names):
+        raise ValueError(
+            f"class_names must be unique, got {list(class_names)}."
+        )
+    print(f"Class semantics source: {source}")
+    print(
+        "Class semantics:",
+        {index: name for index, name in enumerate(class_names)},
+    )
+    return class_names
+
+
+def build_within_subject_train_validation_splits(
+    *,
+    subject_id: int,
+    subject_path: Path,
+    train_session: str,
+    test_session: str,
+    validation_ratio: float,
+    seed: int,
+    class_names: Sequence[str],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+) -> tuple[
+    FeatureSplit,
+    FeatureSplit,
+    HDF5Metadata,
+    WithinSubjectTrialSplit,
+    dict[str, np.ndarray],
+]:
+    """Split one source session before CBraMod preprocessing or encoding."""
+    dataset = EEGHDF5(subject_path)
+    metadata = dataset.metadata
+    all_trial_metadata = dataset.trial_metadata()
+    split = resolve_within_subject_trial_split(
+        subject_ids=all_trial_metadata["subject_ids"],
+        session_ids=all_trial_metadata["session_ids"],
+        labels=all_trial_metadata["labels"],
+        subject_id=subject_id,
+        train_session=train_session,
+        test_session=test_session,
+        validation_ratio=validation_ratio,
+        seed=seed,
+        num_classes=len(class_names),
+    )
+    source_session_data = dataset.load(train_session)
+    train_data = select_trial_ids(
+        source_session_data,
+        all_trial_metadata["trial_ids"][split.train_indices],
+    )
+    validation_data = select_trial_ids(
+        source_session_data,
+        all_trial_metadata["trial_ids"][split.validation_indices],
+    )
+    train_split, _ = build_feature_split_from_session_data(
+        subject_id=subject_id,
+        session_name=train_session,
+        subject_path=subject_path,
+        metadata=metadata,
+        loaded=train_data,
+        canonicalizer=canonicalizer,
+        preprocessor=preprocessor,
+        backbone=backbone,
+        feature_batch_size=feature_batch_size,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+    validation_split, _ = build_feature_split_from_session_data(
+        subject_id=subject_id,
+        session_name=train_session,
+        subject_path=subject_path,
+        metadata=metadata,
+        loaded=validation_data,
+        canonicalizer=canonicalizer,
+        preprocessor=preprocessor,
+        backbone=backbone,
+        feature_batch_size=feature_batch_size,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+    return (
+        train_split,
+        validation_split,
+        metadata,
+        split,
+        all_trial_metadata,
+    )
+
+
+def build_within_subject_final_test_split(
+    *,
+    subject_id: int,
+    subject_path: Path,
+    metadata: HDF5Metadata,
+    split: WithinSubjectTrialSplit,
+    all_trial_metadata: Mapping[str, np.ndarray],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+) -> FeatureSplit:
+    """Load the held-out test session only after model selection."""
+    dataset = EEGHDF5(subject_path)
+    test_session_data = dataset.load(split.test_session)
+    test_data = select_trial_ids(
+        test_session_data,
+        np.asarray(
+            all_trial_metadata["trial_ids"][split.test_indices],
+            dtype=np.int64,
+        ),
+    )
+    test_split, _ = build_feature_split_from_session_data(
+        subject_id=subject_id,
+        session_name=split.test_session,
+        subject_path=subject_path,
+        metadata=metadata,
+        loaded=test_data,
+        canonicalizer=canonicalizer,
+        preprocessor=preprocessor,
+        backbone=backbone,
+        feature_batch_size=feature_batch_size,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+    return test_split
 
 
 def combine_feature_splits(
@@ -1192,8 +1436,8 @@ def write_confusion_matrix_csv(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train one LOSO CBRaMod frozen-backbone "
-            "population classification head."
+            "Train a CBRaMod frozen-backbone classification head with "
+            "LOSO population or within-subject splits."
         )
     )
 
@@ -1206,8 +1450,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--data-pattern",
         default="subject_{subject:02d}.h5",
         help=(
-            "Subject HDF5 filename pattern. "
-            "Example: subject_{subject:02d}.h5"
+            "Subject HDF5 filename pattern. It may use {subject}; a static "
+            "filename is supported for a single-subject HDF5."
         ),
     )
 
@@ -1225,6 +1469,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--split-mode",
+        choices=["loso", "within-subject"],
+        default="loso",
+        help=(
+            "Data split protocol. 'loso' preserves the existing population "
+            "behavior; 'within-subject' uses --target-subject as the "
+            "selected subject."
+        ),
+    )
+
+    parser.add_argument(
         "--train-session",
         default="0train",
     )
@@ -1237,6 +1492,35 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--final-test-session",
         default="1test",
+    )
+
+    parser.add_argument(
+        "--test-session",
+        default=None,
+        help=(
+            "Held-out final-test session for --split-mode within-subject. "
+            "Must differ from --train-session."
+        ),
+    )
+
+    parser.add_argument(
+        "--validation-ratio",
+        type=float,
+        default=0.2,
+        help=(
+            "Trial-level validation fraction of --train-session for "
+            "--split-mode within-subject (default: 0.2)."
+        ),
+    )
+
+    parser.add_argument(
+        "--class-names",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional logit semantics in label order, overriding HDF5 "
+            "metadata; for example: left_hand right_hand both_hand rest."
+        ),
     )
 
     parser.add_argument(
@@ -1449,26 +1733,35 @@ def main() -> None:
 
     set_seed(args.seed)
 
-    subjects = normalize_subjects(args.subjects)
     target_subject = int(args.target_subject)
-
-    if target_subject not in subjects:
-        raise ValueError(
-            "--target-subject must be included in --subjects. "
-            f"Got target={target_subject}, subjects={subjects}."
-        )
-
-    population_subjects = [
-        subject
-        for subject in subjects
-        if subject != target_subject
-    ]
-
-    if not population_subjects:
-        raise ValueError(
-            "LOSO population training requires at least one "
-            "non-target subject."
-        )
+    if args.split_mode == "loso":
+        subjects = normalize_subjects(args.subjects)
+        if target_subject not in subjects:
+            raise ValueError(
+                "--target-subject must be included in --subjects. "
+                f"Got target={target_subject}, subjects={subjects}."
+            )
+        population_subjects = [
+            subject
+            for subject in subjects
+            if subject != target_subject
+        ]
+        if not population_subjects:
+            raise ValueError(
+                "LOSO population training requires at least one "
+                "non-target subject."
+            )
+    else:
+        if target_subject <= 0:
+            raise ValueError("--target-subject must be positive.")
+        if args.test_session is None:
+            raise ValueError(
+                "--test-session is required for --split-mode within-subject."
+            )
+        if not 0.0 < args.validation_ratio < 1.0:
+            raise ValueError("--validation-ratio must be in (0,1).")
+        subjects = [target_subject]
+        population_subjects: list[int] = []
 
     data_root = resolve_repo_path(args.data_root)
     checkpoint_path = resolve_repo_path(args.checkpoint)
@@ -1483,7 +1776,11 @@ def main() -> None:
         ROOT
         / "runs"
         / "stage1"
-        / "bnci2014_001"
+        / (
+            "bnci2014_001"
+            if args.split_mode == "loso"
+            else "within_subject"
+        )
         / f"subject_{target_subject:02d}"
         / "cbramod"
         / window_tag
@@ -1500,7 +1797,11 @@ def main() -> None:
         / "checkpoints"
         / "heads"
         / "stage1"
-        / "bnci2014_001"
+        / (
+            "bnci2014_001"
+            if args.split_mode == "loso"
+            else "within_subject"
+        )
         / f"subject_{target_subject:02d}"
         / "cbramod"
         / window_tag
@@ -1544,9 +1845,9 @@ def main() -> None:
             )
 
         if class_names is None:
-            class_names = tuple(
-                str(name)
-                for name in metadata.class_names
+            class_names = resolve_class_names(
+                metadata=metadata,
+                explicit_class_names=args.class_names,
             )
 
     if reference_metadata is None or class_names is None:
@@ -1556,10 +1857,14 @@ def main() -> None:
 
     if len(class_names) != 4:
         raise ValueError(
-            "The current CBRaMod population protocol is fixed "
-            "to BNCI2014_001 four-class MI. Got "
+            "CBRaMod classification requires four classes. Got "
             f"class_names={list(class_names)}."
         )
+
+    label_mapping = {
+        str(index): str(name)
+        for index, name in enumerate(class_names)
+    }
 
     config = CBraModConfig(
         checkpoint_path=checkpoint_path,
@@ -1639,12 +1944,23 @@ def main() -> None:
 
     run_config = {
         "model_name": "cbramod-frozen-head",
+        "split_mode": args.split_mode,
         "target_subject": target_subject,
         "population_subjects": population_subjects,
         "train_session": args.train_session,
         "validation_session": args.validation_session,
-        "final_test_session": args.final_test_session,
+        "final_test_session": (
+            args.final_test_session
+            if args.split_mode == "loso"
+            else args.test_session
+        ),
+        "validation_ratio": (
+            float(args.validation_ratio)
+            if args.split_mode == "within-subject"
+            else None
+        ),
         "class_names": list(class_names),
+        "label_mapping": label_mapping,
         "backbone_checkpoint": str(checkpoint_path),
         "backbone_sha256": backbone_sha256,
         "output_head": str(output_head_path),
@@ -1812,23 +2128,76 @@ def main() -> None:
 
         return combined
 
-    population_train = build_or_load_split(
-        split_name="population_train",
-        split_subjects=population_subjects,
-        session_name=args.train_session,
-    )
-
-    population_validation = build_or_load_split(
-        split_name="population_validation",
-        split_subjects=population_subjects,
-        session_name=args.validation_session,
-    )
-
-    final_test = build_or_load_split(
-        split_name="target_final_test",
-        split_subjects=[target_subject],
-        session_name=args.final_test_session,
-    )
+    within_subject_split: WithinSubjectTrialSplit | None = None
+    within_subject_all_trials: dict[str, np.ndarray] | None = None
+    if args.split_mode == "loso":
+        population_train = build_or_load_split(
+            split_name="population_train",
+            split_subjects=population_subjects,
+            session_name=args.train_session,
+        )
+        population_validation = build_or_load_split(
+            split_name="population_validation",
+            split_subjects=population_subjects,
+            session_name=args.validation_session,
+        )
+        final_test: FeatureSplit | None = build_or_load_split(
+            split_name="target_final_test",
+            split_subjects=[target_subject],
+            session_name=args.final_test_session,
+        )
+        final_test_session = args.final_test_session
+    else:
+        print("Building within-subject training and validation features...")
+        (
+            population_train,
+            population_validation,
+            within_metadata,
+            within_subject_split,
+            within_subject_all_trials,
+        ) = build_within_subject_train_validation_splits(
+            subject_id=target_subject,
+            subject_path=subject_paths[target_subject],
+            train_session=args.train_session,
+            test_session=str(args.test_session),
+            validation_ratio=args.validation_ratio,
+            seed=args.seed,
+            class_names=class_names,
+            canonicalizer=canonicalizer,
+            preprocessor=preprocessor,
+            backbone=backbone,
+            feature_batch_size=args.feature_batch_size,
+            direct_trial_anchor=args.direct_trial_anchor,
+        )
+        validate_metadata_compatibility(
+            reference_metadata,
+            within_metadata,
+            subject_id=target_subject,
+            path=subject_paths[target_subject],
+        )
+        final_test = None
+        final_test_session = within_subject_split.test_session
+        print(f"Available sessions for subject {target_subject}:")
+        for session_name in within_subject_split.available_sessions:
+            print(f"- {session_name}")
+        print(
+            "within-subject train:",
+            len(population_train.labels),
+            class_counts(population_train.labels.numpy(), class_names),
+        )
+        print(
+            "within-subject validation:",
+            len(population_validation.labels),
+            class_counts(population_validation.labels.numpy(), class_names),
+        )
+        test_labels = within_subject_all_trials["labels"][
+            within_subject_split.test_indices
+        ]
+        print(
+            "within-subject held-out test:",
+            len(within_subject_split.test_indices),
+            class_counts(test_labels, class_names),
+        )
 
     validate_no_trial_leakage(
         population_train,
@@ -1837,19 +2206,19 @@ def main() -> None:
         right_name="population_validation",
     )
 
-    validate_no_trial_leakage(
-        population_train,
-        final_test,
-        left_name="population_train",
-        right_name="target_final_test",
-    )
-
-    validate_no_trial_leakage(
-        population_validation,
-        final_test,
-        left_name="population_validation",
-        right_name="target_final_test",
-    )
+    if final_test is not None:
+        validate_no_trial_leakage(
+            population_train,
+            final_test,
+            left_name="population_train",
+            right_name="target_final_test",
+        )
+        validate_no_trial_leakage(
+            population_validation,
+            final_test,
+            left_name="population_validation",
+            right_name="target_final_test",
+        )
 
     classifier = build_cbramod_classifier(config).to(
         backbone.device
@@ -1961,6 +2330,38 @@ def main() -> None:
     classifier.load_state_dict(best_state)
     classifier.eval()
 
+    if final_test is None:
+        assert within_subject_split is not None
+        assert within_subject_all_trials is not None
+        print(
+            "Within-subject model selection is complete. "
+            "Extracting held-out final-test features..."
+        )
+        final_test = build_within_subject_final_test_split(
+            subject_id=target_subject,
+            subject_path=subject_paths[target_subject],
+            metadata=reference_metadata,
+            split=within_subject_split,
+            all_trial_metadata=within_subject_all_trials,
+            canonicalizer=canonicalizer,
+            preprocessor=preprocessor,
+            backbone=backbone,
+            feature_batch_size=args.feature_batch_size,
+            direct_trial_anchor=args.direct_trial_anchor,
+        )
+        validate_no_trial_leakage(
+            population_train,
+            final_test,
+            left_name="population_train",
+            right_name="target_final_test",
+        )
+        validate_no_trial_leakage(
+            population_validation,
+            final_test,
+            left_name="population_validation",
+            right_name="target_final_test",
+        )
+
     final_test_metrics = evaluate_head(
         classifier=classifier,
         split=final_test,
@@ -1969,12 +2370,53 @@ def main() -> None:
         num_classes=config.num_classes,
     )
 
+    if within_subject_split is None:
+        within_subject_metadata: dict[str, Any] | None = None
+    else:
+        assert within_subject_all_trials is not None
+        within_subject_metadata = {
+            "subject": target_subject,
+            "train_session": within_subject_split.train_session,
+            "test_session": within_subject_split.test_session,
+            "validation_ratio": float(args.validation_ratio),
+            "split_seed": int(args.seed),
+            "available_sessions": list(within_subject_split.available_sessions),
+            "train_trial_ids": within_subject_all_trials["trial_ids"][
+                within_subject_split.train_indices
+            ].tolist(),
+            "validation_trial_ids": within_subject_all_trials["trial_ids"][
+                within_subject_split.validation_indices
+            ].tolist(),
+            "test_trial_ids": within_subject_all_trials["trial_ids"][
+                within_subject_split.test_indices
+            ].tolist(),
+            "train_class_counts": class_counts(
+                within_subject_all_trials["labels"][
+                    within_subject_split.train_indices
+                ],
+                class_names,
+            ),
+            "validation_class_counts": class_counts(
+                within_subject_all_trials["labels"][
+                    within_subject_split.validation_indices
+                ],
+                class_names,
+            ),
+            "test_class_counts": class_counts(
+                within_subject_all_trials["labels"][
+                    within_subject_split.test_indices
+                ],
+                class_names,
+            ),
+        }
+
     saved_head_path = save_cbramod_classifier_checkpoint(
         classifier,
         output_head_path,
         config=config,
         class_names=class_names,
         extra_metadata={
+            "split_mode": args.split_mode,
             "target_subject": target_subject,
             "population_training_subjects": (
                 population_subjects
@@ -1990,8 +2432,10 @@ def main() -> None:
             ),
             "final_test_subject": target_subject,
             "final_test_session": (
-                args.final_test_session
+                final_test_session
             ),
+            "label_mapping": label_mapping,
+            "within_subject_split": within_subject_metadata,
             "best_epoch": best_epoch,
             "best_metric_name": (
                 args.metric_for_best
@@ -2019,7 +2463,12 @@ def main() -> None:
 
     report = {
         "model_name": "cbramod-frozen-head",
-        "protocol": "LOSO population head",
+        "protocol": (
+            "LOSO population head"
+            if args.split_mode == "loso"
+            else "within-subject cross-session head"
+        ),
+        "split_mode": args.split_mode,
         "target_subject": target_subject,
         "population_training_subjects": population_subjects,
         "population_training_session": (
@@ -2032,8 +2481,11 @@ def main() -> None:
             args.validation_session
         ),
         "final_test_subject": target_subject,
-        "final_test_session": args.final_test_session,
+        "final_test_session": final_test_session,
         "class_names": list(class_names),
+        "label_mapping": label_mapping,
+        "num_classes": int(config.num_classes),
+        "within_subject": within_subject_metadata,
         "seed": args.seed,
         "backbone_checkpoint": str(checkpoint_path),
         "backbone_sha256": backbone_sha256,
@@ -2103,7 +2555,19 @@ def main() -> None:
         run_dir / "final_metrics.json",
         {
             "model_name": "cbramod-frozen-head",
+            "split_mode": args.split_mode,
             "target_subject": target_subject,
+            "train_session": args.train_session,
+            "test_session": final_test_session,
+            "validation_ratio": (
+                float(args.validation_ratio)
+                if args.split_mode == "within-subject"
+                else None
+            ),
+            "within_subject": within_subject_metadata,
+            "num_classes": int(config.num_classes),
+            "class_names": list(class_names),
+            "label_mapping": label_mapping,
             "seed": args.seed,
             "best_epoch": best_epoch,
             "population_validation": (

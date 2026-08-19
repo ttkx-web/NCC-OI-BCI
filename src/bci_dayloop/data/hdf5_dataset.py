@@ -84,6 +84,10 @@ class EEGHDF5:
             values = handle["session_ids"].asstr()[:]
         return sorted(set(values.tolist()))
 
+    def available_sessions(self) -> list[str]:
+        """Return session names through the shared trial-reader contract."""
+        return self.sessions()
+
     def trial_metadata(self) -> dict[str, np.ndarray]:
         """Load trial-level identifiers and labels without reading EEG samples."""
         with h5py.File(self.path, "r") as handle:

@@ -11,6 +11,7 @@ _EXPORTS = {
     "align_events_with_csv": (".event_alignment", "align_events_with_csv"),
     "EEGHDF5": (".hdf5_dataset", "EEGHDF5"),
     "HDF5Metadata": (".hdf5_dataset", "HDF5Metadata"),
+    "open_trial_reader": (".trial_reader", "open_trial_reader"),
     "write_hdf5": (".hdf5_dataset", "write_hdf5"),
     "WorkloadHDF5": (".workload", "WorkloadHDF5"),
     "prepare_workload_subject": (".workload", "prepare_workload_subject"),

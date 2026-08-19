@@ -55,7 +55,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from _bootstrap import ROOT
-from bci_dayloop.data.hdf5_dataset import EEGHDF5, HDF5Metadata
+from bci_dayloop.data.hdf5_dataset import HDF5Metadata
+from bci_dayloop.data.trial_reader import (
+    DataReaderName,
+    open_trial_reader,
+    reader_identity,
+)
 from bci_dayloop.data.splits import (
     WithinSubjectTrialSplit,
     resolve_within_subject_trial_split,
@@ -685,6 +690,7 @@ def build_subject_window_bundle(
     *,
     subject_id: int,
     path: Path,
+    data_reader: DataReaderName,
     session_name: str,
     reference_metadata: HDF5Metadata | None,
     window_seconds: float,
@@ -695,7 +701,11 @@ def build_subject_window_bundle(
     window_construction: str,
     direct_trial_anchor: str,
 ) -> tuple[WindowBundle, HDF5Metadata, dict[str, Any]]:
-    dataset = EEGHDF5(path)
+    dataset = open_trial_reader(
+        data_reader=data_reader,
+        path=path,
+        canonical_subject_id=subject_id,
+    )
     metadata = dataset.metadata
 
     if reference_metadata is not None:
@@ -706,8 +716,8 @@ def build_subject_window_bundle(
             path=path,
         )
 
-    session_data = dataset.load(session_name)
-    return build_window_bundle_from_session_data(
+    session_data = dataset.load(session=session_name)
+    bundle, metadata, summary = build_window_bundle_from_session_data(
         subject_id=subject_id,
         path=path,
         session_name=session_name,
@@ -721,6 +731,15 @@ def build_subject_window_bundle(
         window_construction=window_construction,
         direct_trial_anchor=direct_trial_anchor,
     )
+    summary.update(
+        reader_identity(
+            dataset,
+            data_reader=data_reader,
+            canonical_subject_id=subject_id,
+        )
+    )
+    summary["data_reader"] = data_reader
+    return bundle, metadata, summary
 
 
 def build_window_bundle_from_session_data(
@@ -924,6 +943,7 @@ def build_within_subject_splits(
     *,
     subject_id: int,
     path: Path,
+    data_reader: DataReaderName = "eeg",
     train_session: str,
     test_session: str,
     validation_ratio: float,
@@ -943,7 +963,11 @@ def build_within_subject_splits(
     dict[str, np.ndarray],
 ]:
     """Resolve a held-out cross-session split before any window construction."""
-    dataset = EEGHDF5(path)
+    dataset = open_trial_reader(
+        data_reader=data_reader,
+        path=path,
+        canonical_subject_id=subject_id,
+    )
     metadata = dataset.metadata
     class_names = resolve_class_names(
         metadata=metadata,
@@ -962,7 +986,7 @@ def build_within_subject_splits(
         num_classes=len(class_names),
     )
 
-    train_session_data = dataset.load(train_session)
+    train_session_data = dataset.load(session=train_session)
     train_data = select_trial_ids(
         train_session_data,
         all_trial_metadata["trial_ids"][split.train_indices],
@@ -1005,6 +1029,14 @@ def build_within_subject_splits(
     common_paths = {subject_id: path}
     train_summary["selected_trial_ids"] = train_data["trial_ids"].tolist()
     validation_summary["selected_trial_ids"] = validation_data["trial_ids"].tolist()
+    identity = reader_identity(
+        dataset,
+        data_reader=data_reader,
+        canonical_subject_id=subject_id,
+    )
+    for summary in (train_summary, validation_summary):
+        summary.update(identity)
+        summary["data_reader"] = data_reader
     return (
         SplitBuildResult(
             bundle=train_bundle,
@@ -1029,6 +1061,7 @@ def build_within_subject_test_split(
     *,
     subject_id: int,
     path: Path,
+    data_reader: DataReaderName = "eeg",
     metadata: HDF5Metadata,
     class_names: Sequence[str],
     split: WithinSubjectTrialSplit,
@@ -1040,8 +1073,12 @@ def build_within_subject_test_split(
     direct_trial_anchor: str,
 ) -> SplitBuildResult:
     """Build the held-out test windows only after model selection completes."""
-    dataset = EEGHDF5(path)
-    test_session_data = dataset.load(split.test_session)
+    dataset = open_trial_reader(
+        data_reader=data_reader,
+        path=path,
+        canonical_subject_id=subject_id,
+    )
+    test_session_data = dataset.load(session=split.test_session)
     test_data = select_trial_ids(
         test_session_data,
         np.asarray(all_trial_metadata["trial_ids"], dtype=np.int64)[
@@ -1064,6 +1101,14 @@ def build_within_subject_test_split(
         direct_trial_anchor=direct_trial_anchor,
     )
     test_summary["selected_trial_ids"] = test_data["trial_ids"].tolist()
+    test_summary.update(
+        reader_identity(
+            dataset,
+            data_reader=data_reader,
+            canonical_subject_id=subject_id,
+        )
+    )
+    test_summary["data_reader"] = data_reader
     return SplitBuildResult(
         bundle=test_bundle,
         source_trial_summary={f"subject_{subject_id:02d}": test_summary},
@@ -1120,6 +1165,7 @@ def build_population_split(
     subjects: Sequence[int],
     data_root: Path,
     data_pattern: str,
+    data_reader: DataReaderName = "eeg",
     session_name: str,
     window_seconds: float,
     stride_seconds: float,
@@ -1146,6 +1192,7 @@ def build_population_split(
         bundle, metadata, summary = build_subject_window_bundle(
             subject_id=subject_id,
             path=path,
+            data_reader=data_reader,
             session_name=session_name,
             reference_metadata=common_metadata,
             window_seconds=window_seconds,
@@ -1250,6 +1297,8 @@ def save_population_feature_cache(
     split_name: str,
     class_names: Sequence[str],
     subject_ids: Sequence[int],
+    data_reader: DataReaderName,
+    subject_identities: Mapping[str, Mapping[str, int | str]],
     backbone_sha256: str,
     preprocessing_hash: str,
 ) -> None:
@@ -1276,6 +1325,11 @@ def save_population_feature_cache(
                 for source_ids in bundle.window_set.source_trial_ids
             ],
             "subjects": [int(subject) for subject in subject_ids],
+            "data_reader": data_reader,
+            "subject_identities": {
+                str(subject): dict(subject_identities[str(subject)])
+                for subject in subject_ids
+            },
             "class_names": [str(name) for name in class_names],
             "class_counts": class_name_counts(
                 bundle.window_set.labels,
@@ -1283,7 +1337,8 @@ def save_population_feature_cache(
             ),
             "window_construction": bundle.window_set.construction,
             "source_trial_encoding": (
-                "(subject_id << 32) | file_local_trial_id"
+                "(subject_id << 32) | file_local_trial_id; Workload "
+                "file_local_trial_id=(S<n> << 20) | trial_ordinal"
             ),
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
@@ -1321,6 +1376,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Subject filename pattern. It may use {subject}; a static filename "
             "is supported for a single-subject HDF5. "
             "Default: subject_{subject:02d}.h5."
+        ),
+    )
+    parser.add_argument(
+        "--data-reader",
+        choices=("eeg", "workload"),
+        default="eeg",
+        help=(
+            "HDF5 reader format. Default 'eeg' preserves the existing "
+            "flat EEGHDF5 behavior; choose 'workload' for grouped WorkloadHDF5."
         ),
     )
     parser.add_argument(
@@ -1716,7 +1780,9 @@ def main() -> None:
         output_path = population_head_path(
             stage="stage1",
             dataset=(
-                "bnci2014_001"
+                "workload_pbci_hackathon"
+                if args.data_reader == "workload"
+                else "bnci2014_001"
                 if args.split_mode == "loso"
                 else "within_subject"
             ),
@@ -1738,7 +1804,9 @@ def main() -> None:
         run_dir = population_run_dir(
             stage="stage1",
             dataset=(
-                "bnci2014_001"
+                "workload_pbci_hackathon"
+                if args.data_reader == "workload"
+                else "bnci2014_001"
                 if args.split_mode == "loso"
                 else "within_subject"
             ),
@@ -1778,6 +1846,7 @@ def main() -> None:
         print("within-subject split seed:", args.seed)
     print("data root:", data_root)
     print("data pattern:", args.data_pattern)
+    print("data reader:", args.data_reader)
     print("backbone:", checkpoint_path)
     print("output:", output_path)
     print("run dir:", run_dir)
@@ -1808,6 +1877,18 @@ def main() -> None:
         )
         for subject in subjects
     }
+    subject_identities = {
+        str(subject): reader_identity(
+            open_trial_reader(
+                data_reader=args.data_reader,
+                path=path,
+                canonical_subject_id=subject,
+            ),
+            data_reader=args.data_reader,
+            canonical_subject_id=subject,
+        )
+        for subject, path in all_subject_paths.items()
+    }
 
     initial_run_config = {
         "status": "started",
@@ -1831,6 +1912,8 @@ def main() -> None:
         ),
         "data_root": str(data_root),
         "data_pattern": args.data_pattern,
+        "data_reader": args.data_reader,
+        "subject_identities": subject_identities,
         "subject_paths": {
             str(subject): str(path)
             for subject, path in all_subject_paths.items()
@@ -1854,6 +1937,7 @@ def main() -> None:
             subjects=population_subjects,
             data_root=data_root,
             data_pattern=args.data_pattern,
+            data_reader=args.data_reader,
             session_name=args.train_session,
             window_seconds=args.window_sec,
             stride_seconds=args.window_stride_sec,
@@ -1871,6 +1955,7 @@ def main() -> None:
             subjects=population_subjects,
             data_root=data_root,
             data_pattern=args.data_pattern,
+            data_reader=args.data_reader,
             session_name=args.validation_session,
             window_seconds=args.window_sec,
             stride_seconds=args.window_stride_sec,
@@ -1894,6 +1979,7 @@ def main() -> None:
             build_within_subject_splits(
                 subject_id=target_subject,
                 path=all_subject_paths[target_subject],
+                data_reader=args.data_reader,
                 train_session=args.train_session,
                 test_session=str(args.test_session),
                 validation_ratio=args.validation_ratio,
@@ -2313,6 +2399,8 @@ def main() -> None:
             split_name="population_train",
             class_names=class_names,
             subject_ids=train_validation_subjects,
+            data_reader=args.data_reader,
+            subject_identities=subject_identities,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
         )
@@ -2330,6 +2418,8 @@ def main() -> None:
             split_name="population_validation",
             class_names=class_names,
             subject_ids=train_validation_subjects,
+            data_reader=args.data_reader,
+            subject_identities=subject_identities,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
         )
@@ -2645,6 +2735,7 @@ def main() -> None:
             subjects=[target_subject],
             data_root=data_root,
             data_pattern=args.data_pattern,
+            data_reader=args.data_reader,
             session_name=args.final_test_session,
             window_seconds=args.window_sec,
             stride_seconds=args.window_stride_sec,
@@ -2664,6 +2755,7 @@ def main() -> None:
         target_build = build_within_subject_test_split(
             subject_id=target_subject,
             path=all_subject_paths[target_subject],
+            data_reader=args.data_reader,
             metadata=metadata,
             class_names=class_names,
             split=within_subject_split,
@@ -2727,6 +2819,8 @@ def main() -> None:
             split_name="target_final_test",
             class_names=class_names,
             subject_ids=[target_subject],
+            data_reader=args.data_reader,
+            subject_identities=subject_identities,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
         )
@@ -2825,10 +2919,12 @@ def main() -> None:
         extra_metadata={
             "task": (
                 "BNCI2014_001_motor_imagery"
-                if args.split_mode == "loso"
+                if args.data_reader == "eeg" and args.split_mode == "loso"
                 else f"{metadata.dataset_name}_classification"
             ),
             "dataset": metadata.dataset_name,
+            "data_reader": args.data_reader,
+            "subject_identities": subject_identities,
             "mode": experiment_name,
             "stage": "stage1",
             "split_mode": args.split_mode,
@@ -2965,6 +3061,8 @@ def main() -> None:
                 for subject, path in all_subject_paths.items()
             },
         },
+        "data_reader": args.data_reader,
+        "subject_identities": subject_identities,
         "protocol": {
             "all_subjects": subjects,
             "target_subject": target_subject,
@@ -2979,6 +3077,7 @@ def main() -> None:
         },
         "dataset": {
             "name": metadata.dataset_name,
+            "data_reader": args.data_reader,
             "sample_rate": metadata.sample_rate,
             "unit": metadata.unit,
             "channel_names": metadata.channel_names,
@@ -3132,7 +3231,8 @@ def main() -> None:
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
             "source_trial_encoding": (
-                "(subject_id << 32) | file_local_trial_id"
+                "(subject_id << 32) | file_local_trial_id; Workload "
+                "file_local_trial_id=(S<n> << 20) | trial_ordinal"
             ),
         },
     }
@@ -3143,6 +3243,8 @@ def main() -> None:
     summary = {
         "status": "completed",
         "split_mode": args.split_mode,
+        "data_reader": args.data_reader,
+        "subject_identities": subject_identities,
         "target_subject": target_subject,
         "population_subjects": population_subjects,
         "within_subject": within_subject_metadata,

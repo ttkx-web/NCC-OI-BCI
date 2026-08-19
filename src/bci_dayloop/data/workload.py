@@ -12,6 +12,8 @@ from typing import Iterable, Sequence
 import h5py
 import numpy as np
 
+from .hdf5_dataset import HDF5Metadata
+
 
 DATASET_NAME = "workload_pbci_hackathon"
 FORMAT_VERSION = "workload_hdf5_v1"
@@ -748,6 +750,70 @@ class WorkloadHDF5:
                 raise ValueError(f"Workload HDF5 is missing /sessions: {self.path}")
             return sorted(handle["sessions"].keys())
 
+    def available_sessions(self) -> list[str]:
+        """Return session names through the shared trial-reader contract."""
+        return self.sessions()
+
+    @property
+    def source_subject_id(self) -> str:
+        with h5py.File(self.path, "r") as handle:
+            return str(handle.attrs["subject_id"])
+
+    @property
+    def canonical_subject_id(self) -> int:
+        """Return the integer subject identity used by population trainers."""
+        source_id = canonical_subject_id(self.source_subject_id)
+        return int(source_id[1:])
+
+    @property
+    def metadata(self) -> HDF5Metadata:
+        """Expose grouped Workload metadata in the common reader shape."""
+        with h5py.File(self.path, "r") as handle:
+            sessions = sorted(handle["sessions"].keys())
+            if not sessions:
+                raise ValueError(f"Workload HDF5 has no sessions: {self.path}")
+            first = handle["sessions"][sessions[0]]
+            return HDF5Metadata(
+                sample_rate=float(first.attrs["sample_rate"]),
+                channel_names=json.loads(first.attrs["channel_names"]),
+                class_names=json.loads(handle.attrs["class_names"]),
+                unit=str(handle.attrs["unit"]),
+                dataset_name=str(handle.attrs["dataset_name"]),
+            )
+
+    def _trainer_trial_ids(
+        self,
+        *,
+        session: str,
+        trial_ordinals: np.ndarray,
+    ) -> np.ndarray:
+        """Encode (session, trial_ordinal) into a stable file-local int64 ID.
+
+        The population trainer adds the canonical subject in the high 32 bits.
+        Workload ordinals repeat across S1/S2, so the lower 32 bits reserve
+        12 bits for the numeric S<n> session and 20 bits for the ordinal.
+        """
+        if not session.startswith("S") or not session[1:].isdigit():
+            raise ValueError(
+                "Workload session IDs must use the generated S<n> form to "
+                f"derive stable trainer trial IDs; got {session!r}."
+            )
+        session_number = int(session[1:])
+        ordinals = np.asarray(trial_ordinals, dtype=np.int64)
+        if not 0 < session_number < 2**12:
+            raise ValueError(f"Workload session number is out of range: {session!r}.")
+        if np.any(ordinals <= 0) or np.any(ordinals >= 2**20):
+            raise ValueError("Workload trial_ordinals must be in [1, 2**20).")
+        return ((session_number << 20) | ordinals).astype(np.int64, copy=False)
+
+    def trial_metadata(self) -> dict[str, np.ndarray]:
+        """Return all grouped sessions in the trainer's canonical trial view."""
+        loaded = [self.load(session=session) for session in self.sessions()]
+        return {
+            key: np.concatenate([item[key] for item in loaded], axis=0)
+            for key in ("labels", "subject_ids", "session_ids", "trial_ids")
+        }
+
     def load(self, *, session: str) -> dict[str, np.ndarray]:
         with h5py.File(self.path, "r") as handle:
             if "sessions" not in handle or session not in handle["sessions"]:
@@ -756,6 +822,11 @@ class WorkloadHDF5:
                     f"Available: {self.sessions()}"
                 )
             group = handle["sessions"][session]
+            trial_ordinals = group["trial_ordinals"][:].astype(
+                np.int64, copy=False
+            )
+            subject_id = int(canonical_subject_id(str(handle.attrs["subject_id"]))[1:])
+            n_trials = len(trial_ordinals)
             return {
                 "data": group["data"][:].astype(np.float32, copy=False),
                 "labels": group["labels"][:].astype(np.int64, copy=False),
@@ -763,6 +834,18 @@ class WorkloadHDF5:
                 "source_epoch_indices": group["source_epoch_indices"][:].astype(
                     np.int64, copy=False
                 ),
-                "trial_ordinals": group["trial_ordinals"][:].astype(np.int64, copy=False),
+                "trial_ordinals": trial_ordinals,
                 "window_ids": group["window_ids"].asstr()[:],
+                # Canonical in-memory view used by the existing population
+                # trainer. These values are intentionally never written back.
+                "subject_ids": np.full(n_trials, subject_id, dtype=np.int64),
+                "session_ids": np.full(
+                    n_trials,
+                    session,
+                    dtype=f"<U{max(1, len(session))}",
+                ),
+                "trial_ids": self._trainer_trial_ids(
+                    session=session,
+                    trial_ordinals=trial_ordinals,
+                ),
             }

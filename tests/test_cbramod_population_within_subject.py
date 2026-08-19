@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from bci_dayloop.data.hdf5_dataset import HDF5Metadata
+from bci_dayloop.models.cbramod.config import CBraModConfig
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,3 +69,36 @@ def test_cbramod_population_cli_defaults_to_loso_and_resolves_semantics() -> Non
         metadata=metadata,
         explicit_class_names=args.class_names,
     ) == ("left_hand", "right_hand", "both_hand", "rest")
+
+
+def test_cbramod_channel_adaptation_cli_matches_config_defaults() -> None:
+    module = load_trainer_module()
+    parser = module.build_argument_parser()
+    default_args = parser.parse_args(["--target-subject", "1"])
+
+    assert default_args.missing_channel_policy == "error"
+    assert default_args.min_observed_channels is None
+    assert default_args.spline_alpha == 1e-5
+
+    args = parser.parse_args(
+        [
+            "--target-subject",
+            "1",
+            "--missing-channel-policy",
+            "spherical_spline",
+            "--min-observed-channels",
+            "9",
+            "--spline-alpha",
+            "1e-5",
+        ]
+    )
+    config = CBraModConfig(
+        checkpoint_path="unused_checkpoint.pt",
+        missing_channel_policy=args.missing_channel_policy,
+        min_observed_channels=args.min_observed_channels,
+        spline_alpha=args.spline_alpha,
+    )
+
+    assert config.missing_channel_policy == "spherical_spline"
+    assert config.min_observed_channels == 9
+    assert config.spline_alpha == 1e-5

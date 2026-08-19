@@ -42,7 +42,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import numpy as np
 import torch
@@ -74,6 +74,7 @@ from bci_dayloop.models.cbramod.classifier import (
 )
 from bci_dayloop.models.cbramod.config import (
     CBraModConfig,
+    MissingChannelPolicy,
 )
 from bci_dayloop.models.cbramod.preprocessing import (
     CBraModPipelinePreprocessor,
@@ -1672,6 +1673,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--missing-channel-policy",
+        choices=get_args(MissingChannelPolicy),
+        default=CBraModConfig.__dataclass_fields__["missing_channel_policy"].default,
+        help="Missing target-channel policy from CBraModConfig.",
+    )
+
+    parser.add_argument(
+        "--min-observed-channels",
+        type=int,
+        default=CBraModConfig.__dataclass_fields__["min_observed_channels"].default,
+        help="Minimum observed target channels from CBraModConfig.",
+    )
+
+    parser.add_argument(
+        "--spline-alpha",
+        type=float,
+        default=CBraModConfig.__dataclass_fields__["spline_alpha"].default,
+        help="Spherical-spline regularization from CBraModConfig.",
+    )
+
+    parser.add_argument(
         "--head-type",
         choices=["official_mlp", "linear"],
         default="official_mlp",
@@ -1885,6 +1907,9 @@ def main() -> None:
         filter_order=args.filter_order,
         reference_mode=args.reference_mode,
         normalization=args.normalization,
+        missing_channel_policy=args.missing_channel_policy,
+        min_observed_channels=args.min_observed_channels,
+        spline_alpha=args.spline_alpha,
 
         num_classes=len(class_names),
         head_type=args.head_type,

@@ -40,7 +40,9 @@ assert spec.loader is not None
 spec.loader.exec_module(module)
 
 parser = module.build_argument_parser()
-assert parser.parse_args([]).split_mode == "loso"
+default_args = parser.parse_args([])
+assert default_args.split_mode == "loso"
+assert default_args.overwrite is False
 args = parser.parse_args([
     "--split-mode", "within-subject",
     "--target-subject", "1",
@@ -48,10 +50,24 @@ args = parser.parse_args([
     "--test-session", "session_b",
     "--validation-ratio", "0.2",
     "--class-names", "left_hand", "right_hand", "both_hand", "rest",
+    "--overwrite",
 ])
 assert args.split_mode == "within-subject"
 assert args.class_names == ["left_hand", "right_hand", "both_hand", "rest"]
 assert args.validation_ratio == 0.2
+assert args.overwrite is True
+
+with tempfile.TemporaryDirectory() as directory:
+    run_dir = Path(directory) / "existing_run"
+    run_dir.mkdir()
+    try:
+        module.create_run_directory(run_dir, overwrite=False)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("Existing run directory must be rejected by default.")
+    module.create_run_directory(run_dir, overwrite=True)
+    assert run_dir.is_dir()
 
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / "single_subject.h5"

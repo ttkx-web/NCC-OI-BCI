@@ -1407,6 +1407,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "<contract>/<timestamp>/."
         ),
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow an existing --run-dir to be reused, overwriting files "
+            "produced by this training run."
+        ),
+    )
 
     parser.add_argument(
         "--device",
@@ -1595,6 +1603,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def create_run_directory(run_dir: Path, *, overwrite: bool) -> None:
+    """Create a run directory while preserving the default no-overwrite guard."""
+    run_dir.mkdir(parents=True, exist_ok=overwrite)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1739,10 +1752,7 @@ def main() -> None:
             args.run_dir
         )
 
-    run_dir.mkdir(
-        parents=True,
-        exist_ok=False,
-    )
+    create_run_directory(run_dir, overwrite=args.overwrite)
 
     git_commit = current_git_commit()
     backbone_sha256 = sha256_file(checkpoint_path)

@@ -174,6 +174,35 @@ def test_mlp_checkpoint_metadata_round_trips(tmp_path: Path) -> None:
         torch.testing.assert_close(source_parameter, restored_parameter)
 
 
+def test_checkpoint_preserves_explicit_class_semantics(tmp_path: Path) -> None:
+    classifier = build_classifier(tiny_config(num_classes=3))
+    class_names = ["left_hand", "both_hand", "rest"]
+    checkpoint = save_classifier_checkpoint(
+        classifier,
+        tmp_path / "semantic_head.pt",
+        extra_metadata={
+            "num_classes": 3,
+            "class_names": class_names,
+            "label_mapping": {
+                "0": "left_hand",
+                "1": "both_hand",
+                "2": "rest",
+            },
+        },
+    )
+    restored = build_classifier(tiny_config(num_classes=3))
+
+    report = load_classifier_checkpoint(restored, checkpoint)
+
+    assert report.metadata["num_classes"] == 3
+    assert report.metadata["class_names"] == class_names
+    assert report.metadata["label_mapping"] == {
+        "0": "left_hand",
+        "1": "both_hand",
+        "2": "rest",
+    }
+
+
 def test_legacy_linear_checkpoint_defaults_missing_head_metadata(tmp_path: Path) -> None:
     config = tiny_config()
     source = build_classifier(config)

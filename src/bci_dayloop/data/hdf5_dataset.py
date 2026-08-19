@@ -84,6 +84,22 @@ class EEGHDF5:
             values = handle["session_ids"].asstr()[:]
         return sorted(set(values.tolist()))
 
+    def trial_metadata(self) -> dict[str, np.ndarray]:
+        """Load trial-level identifiers and labels without reading EEG samples."""
+        with h5py.File(self.path, "r") as handle:
+            return {
+                "labels": handle["labels"][:].astype(np.int64, copy=False),
+                "subject_ids": handle["subject_ids"][:].astype(
+                    np.int64,
+                    copy=False,
+                ),
+                "session_ids": handle["session_ids"].asstr()[:],
+                "trial_ids": handle["trial_ids"][:].astype(
+                    np.int64,
+                    copy=False,
+                ),
+            }
+
     def load(self, session: str | None = None) -> dict[str, np.ndarray]:
         with h5py.File(self.path, "r") as handle:
             sessions = handle["session_ids"].asstr()[:]
@@ -98,4 +114,3 @@ class EEGHDF5:
                 "session_ids": sessions[indices],
                 "trial_ids": handle["trial_ids"][indices].astype(np.int64, copy=False),
             }
-

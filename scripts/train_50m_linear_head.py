@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from _bootstrap import ROOT
 
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
+from bci_dayloop.data.splits import stratified_source_trial_split
 from bci_dayloop.models.model_50m.backbone import Model50MBackbone
 from bci_dayloop.models.model_50m.classifier import (
     Model50MClassifier,
@@ -131,48 +132,6 @@ def validate_labels(
     missing = sorted(set(range(num_classes)) - set(labels.tolist()))
     if missing:
         raise ValueError(f"{split_name} is missing class(es): {missing}.")
-
-
-def stratified_source_trial_split(
-    labels: np.ndarray,
-    *,
-    val_fraction: float,
-    seed: int,
-    num_classes: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Split source trials before derived-window construction."""
-    if not 0.0 < val_fraction < 1.0:
-        raise ValueError(
-            f"val_fraction must be in (0,1), got {val_fraction}."
-        )
-
-    labels = np.asarray(labels, dtype=np.int64)
-    rng = np.random.default_rng(seed)
-    train_indices: list[int] = []
-    val_indices: list[int] = []
-
-    for class_index in range(num_classes):
-        indices = np.flatnonzero(labels == class_index)
-        if len(indices) < 2:
-            raise ValueError(
-                f"Class {class_index} has only {len(indices)} source trial(s); "
-                "at least 2 are required for train/validation splitting."
-            )
-        rng.shuffle(indices)
-        n_val = max(1, int(round(len(indices) * val_fraction)))
-        n_val = min(n_val, len(indices) - 1)
-        val_indices.extend(int(x) for x in indices[:n_val])
-        train_indices.extend(int(x) for x in indices[n_val:])
-
-    rng.shuffle(train_indices)
-    rng.shuffle(val_indices)
-    train_array = np.asarray(train_indices, dtype=np.int64)
-    val_array = np.asarray(val_indices, dtype=np.int64)
-
-    if set(train_array.tolist()) & set(val_array.tolist()):
-        raise RuntimeError("Source-trial leakage between train and validation.")
-
-    return train_array, val_array
 
 
 def build_same_label_concat_windows(

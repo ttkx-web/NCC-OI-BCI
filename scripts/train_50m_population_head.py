@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 """
-Train a Stage-1 LOSO population classification head on BNCI2014_001.
+Train a Stage-1 50M classification head with LOSO or within-subject splits.
 
 Protocol
 --------
-For one target subject:
+``--split-mode loso`` preserves the Stage-1 BNCI2014_001 protocol. For one
+target subject:
 
 - Population training:
     all non-target subjects / 0train
@@ -16,15 +17,21 @@ For one target subject:
 
 The target subject is never used to train or select the population model.
 
+``--split-mode within-subject`` uses one subject's source session for a
+trial-level stratified train/validation split and a distinct session only for
+final testing.
+
 Important
 ---------
-The BNCI HDF5 files contain 4-second source trials. To preserve the Stage-0.5
-50M input contract, this script constructs temporary 10-second single-label
-windows by concatenating trials only within the same:
+The BNCI HDF5 files contain 4-second source trials. When the legacy
+same-label-concatenation window mode is selected, the script constructs
+temporary single-label windows only within the same:
 
     subject + session + class
 
-It never concatenates trials across subjects, sessions, or labels.
+It never concatenates trials across subjects, sessions, or labels. Direct-trial
+mode continues to use each source trial as its own window, including 2-second
+self-collected trials.
 
 The 50M backbone is frozen. Only the configured classification head is trained.
 """
@@ -49,6 +56,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from _bootstrap import ROOT
 from bci_dayloop.data.hdf5_dataset import EEGHDF5, HDF5Metadata
+from bci_dayloop.data.splits import (
+    WithinSubjectTrialSplit,
+    resolve_within_subject_trial_split,
+)
 from bci_dayloop.models.model_50m.backbone import Model50MBackbone
 from bci_dayloop.models.model_50m.classifier import (
     Model50MClassifier,
@@ -480,8 +491,8 @@ def resolve_subject_file(
         relative_name = pattern.format(subject=subject_id)
     except (KeyError, ValueError) as exc:
         raise ValueError(
-            "--data-pattern must be a valid Python format string using "
-            "{subject}, for example 'subject_{subject:02d}.h5'."
+            "--data-pattern must be a valid Python format string. It may "
+            "use {subject}, for example 'subject_{subject:02d}.h5'."
         ) from exc
 
     candidates = [
@@ -695,8 +706,42 @@ def build_subject_window_bundle(
             path=path,
         )
 
-    num_classes = len(metadata.class_names)
     session_data = dataset.load(session_name)
+    return build_window_bundle_from_session_data(
+        subject_id=subject_id,
+        path=path,
+        session_name=session_name,
+        metadata=metadata,
+        session_data=session_data,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        seed=seed,
+        shuffle_trials_within_class=shuffle_trials_within_class,
+        max_windows_per_class=max_windows_per_class,
+        window_construction=window_construction,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+
+
+def build_window_bundle_from_session_data(
+    *,
+    subject_id: int,
+    path: Path,
+    session_name: str,
+    metadata: HDF5Metadata,
+    session_data: Mapping[str, np.ndarray],
+    class_names: Sequence[str] | None = None,
+    window_seconds: float,
+    stride_seconds: float,
+    seed: int,
+    shuffle_trials_within_class: bool,
+    max_windows_per_class: int | None,
+    window_construction: str,
+    direct_trial_anchor: str,
+) -> tuple[WindowBundle, HDF5Metadata, dict[str, Any]]:
+    """Build windows from an already selected source-trial subset."""
+    effective_class_names = list(class_names or metadata.class_names)
+    num_classes = len(effective_class_names)
     validate_loaded_session(
         session_data,
         expected_subject=subject_id,
@@ -792,13 +837,13 @@ def build_subject_window_bundle(
         "source_trials_total": int(len(session_data["labels"])),
         "source_trials_per_class": class_name_counts(
             np.asarray(session_data["labels"], dtype=np.int64),
-            metadata.class_names,
+            effective_class_names,
         ),
         "direct_trial_selection": direct_trial_selection,
         "derived_windows_total": int(len(window_set.windows)),
         "derived_windows_per_class": class_name_counts(
             window_set.labels,
-            metadata.class_names,
+            effective_class_names,
         ),
         "unique_source_trials_used": int(len(source_id_set(window_set))),
         "window_seconds": float(window_seconds),
@@ -806,6 +851,225 @@ def build_subject_window_bundle(
         "construction": window_set.construction,
     }
     return bundle, metadata, summary
+
+
+def select_trial_rows(
+    trial_data: Mapping[str, np.ndarray],
+    indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Return a trial-level subset without changing the underlying HDF5 data."""
+    indices = np.asarray(indices, dtype=np.int64)
+    return {
+        key: np.asarray(values)[indices]
+        for key, values in trial_data.items()
+    }
+
+
+def select_trial_ids(
+    trial_data: Mapping[str, np.ndarray],
+    trial_ids: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select source trials by ID and fail rather than silently dropping one."""
+    requested = np.asarray(trial_ids, dtype=np.int64)
+    available = np.asarray(trial_data["trial_ids"], dtype=np.int64)
+    mask = np.isin(available, requested)
+    selected = select_trial_rows(trial_data, np.flatnonzero(mask))
+    selected_ids = np.asarray(selected["trial_ids"], dtype=np.int64)
+    if set(selected_ids.tolist()) != set(requested.tolist()):
+        missing = sorted(set(requested.tolist()) - set(selected_ids.tolist()))
+        raise RuntimeError(
+            "Selected source trials are missing from the loaded session: "
+            f"{missing[:10]}."
+        )
+    return selected
+
+
+def resolve_class_names(
+    *,
+    metadata: HDF5Metadata,
+    explicit_class_names: Sequence[str] | None,
+) -> list[str]:
+    """Resolve logit semantics without assuming every 4-class task is BNCI."""
+    num_classes = len(metadata.class_names)
+    if num_classes <= 0:
+        raise ValueError("HDF5 metadata class_names must not be empty.")
+
+    if explicit_class_names is not None:
+        class_names = [str(name).strip() for name in explicit_class_names]
+        source = "--class-names"
+    else:
+        metadata_names = [str(name).strip() for name in metadata.class_names]
+        if len(metadata_names) == num_classes and all(metadata_names):
+            class_names = metadata_names
+            source = "HDF5 metadata"
+        else:
+            class_names = [f"class_{index}" for index in range(num_classes)]
+            source = "numeric fallback"
+
+    if len(class_names) != num_classes:
+        raise ValueError(
+            "class_names length must match the HDF5 class count: "
+            f"{len(class_names)} != {num_classes}."
+        )
+    if not all(class_names):
+        raise ValueError("class_names must not contain empty values.")
+    if len(set(class_names)) != len(class_names):
+        raise ValueError(f"class_names must be unique, got {class_names}.")
+    print(f"Class semantics source: {source}")
+    print("Class semantics:", {index: name for index, name in enumerate(class_names)})
+    return class_names
+
+
+def build_within_subject_splits(
+    *,
+    subject_id: int,
+    path: Path,
+    train_session: str,
+    test_session: str,
+    validation_ratio: float,
+    seed: int,
+    window_seconds: float,
+    stride_seconds: float,
+    max_windows_per_class: int | None,
+    window_construction: str,
+    direct_trial_anchor: str,
+    explicit_class_names: Sequence[str] | None,
+) -> tuple[
+    SplitBuildResult,
+    SplitBuildResult,
+    HDF5Metadata,
+    list[str],
+    WithinSubjectTrialSplit,
+    dict[str, np.ndarray],
+]:
+    """Resolve a held-out cross-session split before any window construction."""
+    dataset = EEGHDF5(path)
+    metadata = dataset.metadata
+    class_names = resolve_class_names(
+        metadata=metadata,
+        explicit_class_names=explicit_class_names,
+    )
+    all_trial_metadata = dataset.trial_metadata()
+    split = resolve_within_subject_trial_split(
+        subject_ids=all_trial_metadata["subject_ids"],
+        session_ids=all_trial_metadata["session_ids"],
+        labels=all_trial_metadata["labels"],
+        subject_id=subject_id,
+        train_session=train_session,
+        test_session=test_session,
+        validation_ratio=validation_ratio,
+        seed=seed,
+        num_classes=len(class_names),
+    )
+
+    train_session_data = dataset.load(train_session)
+    train_data = select_trial_ids(
+        train_session_data,
+        all_trial_metadata["trial_ids"][split.train_indices],
+    )
+    validation_data = select_trial_ids(
+        train_session_data,
+        all_trial_metadata["trial_ids"][split.validation_indices],
+    )
+    train_bundle, _, train_summary = build_window_bundle_from_session_data(
+        subject_id=subject_id,
+        path=path,
+        session_name=train_session,
+        metadata=metadata,
+        session_data=train_data,
+        class_names=class_names,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        seed=seed + 1_000,
+        shuffle_trials_within_class=True,
+        max_windows_per_class=max_windows_per_class,
+        window_construction=window_construction,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+    validation_bundle, _, validation_summary = build_window_bundle_from_session_data(
+        subject_id=subject_id,
+        path=path,
+        session_name=train_session,
+        metadata=metadata,
+        session_data=validation_data,
+        class_names=class_names,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        seed=seed + 2_000,
+        shuffle_trials_within_class=False,
+        max_windows_per_class=max_windows_per_class,
+        window_construction=window_construction,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+
+    common_paths = {subject_id: path}
+    train_summary["selected_trial_ids"] = train_data["trial_ids"].tolist()
+    validation_summary["selected_trial_ids"] = validation_data["trial_ids"].tolist()
+    return (
+        SplitBuildResult(
+            bundle=train_bundle,
+            source_trial_summary={f"subject_{subject_id:02d}": train_summary},
+            subject_paths=common_paths,
+            metadata=metadata,
+        ),
+        SplitBuildResult(
+            bundle=validation_bundle,
+            source_trial_summary={f"subject_{subject_id:02d}": validation_summary},
+            subject_paths=common_paths,
+            metadata=metadata,
+        ),
+        metadata,
+        class_names,
+        split,
+        all_trial_metadata,
+    )
+
+
+def build_within_subject_test_split(
+    *,
+    subject_id: int,
+    path: Path,
+    metadata: HDF5Metadata,
+    class_names: Sequence[str],
+    split: WithinSubjectTrialSplit,
+    all_trial_metadata: Mapping[str, np.ndarray],
+    window_seconds: float,
+    stride_seconds: float,
+    max_windows_per_class: int | None,
+    window_construction: str,
+    direct_trial_anchor: str,
+) -> SplitBuildResult:
+    """Build the held-out test windows only after model selection completes."""
+    dataset = EEGHDF5(path)
+    test_session_data = dataset.load(split.test_session)
+    test_data = select_trial_ids(
+        test_session_data,
+        np.asarray(all_trial_metadata["trial_ids"], dtype=np.int64)[
+            split.test_indices
+        ],
+    )
+    test_bundle, _, test_summary = build_window_bundle_from_session_data(
+        subject_id=subject_id,
+        path=path,
+        session_name=split.test_session,
+        metadata=metadata,
+        session_data=test_data,
+        class_names=class_names,
+        window_seconds=window_seconds,
+        stride_seconds=stride_seconds,
+        seed=0,
+        shuffle_trials_within_class=False,
+        max_windows_per_class=max_windows_per_class,
+        window_construction=window_construction,
+        direct_trial_anchor=direct_trial_anchor,
+    )
+    test_summary["selected_trial_ids"] = test_data["trial_ids"].tolist()
+    return SplitBuildResult(
+        bundle=test_bundle,
+        source_trial_summary={f"subject_{subject_id:02d}": test_summary},
+        subject_paths={subject_id: path},
+        metadata=metadata,
+    )
 
 
 def combine_window_bundles(
@@ -1037,9 +1301,8 @@ def save_population_feature_cache(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a frozen or partially fine-tuned 50M LOSO population "
-            "classification head on "
-            "multi-subject BNCI2014_001 HDF5 files."
+            "Train a frozen or adapted 50M classification head with either "
+            "LOSO population or within-subject HDF5 splits."
         )
     )
 
@@ -1055,8 +1318,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--data-pattern",
         default="subject_{subject:02d}.h5",
         help=(
-            "Subject filename pattern. It must contain {subject}; "
-            "default: subject_{subject:02d}.h5."
+            "Subject filename pattern. It may use {subject}; a static filename "
+            "is supported for a single-subject HDF5. "
+            "Default: subject_{subject:02d}.h5."
         ),
     )
     parser.add_argument(
@@ -1075,10 +1339,46 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "validation. Its 1test session is used only for final testing."
         ),
     )
+    parser.add_argument(
+        "--split-mode",
+        choices=("loso", "within-subject"),
+        default="loso",
+        help=(
+            "Data split protocol. 'loso' preserves the existing population "
+            "training behavior; 'within-subject' uses --target-subject as "
+            "the selected subject."
+        ),
+    )
 
     parser.add_argument("--train-session", default="0train")
     parser.add_argument("--validation-session", default="1test")
     parser.add_argument("--final-test-session", default="1test")
+    parser.add_argument(
+        "--test-session",
+        default=None,
+        help=(
+            "Held-out final-test session for --split-mode within-subject. "
+            "Must differ from --train-session."
+        ),
+    )
+    parser.add_argument(
+        "--validation-ratio",
+        type=float,
+        default=0.2,
+        help=(
+            "Trial-level validation fraction of --train-session for "
+            "--split-mode within-subject (default: 0.2)."
+        ),
+    )
+    parser.add_argument(
+        "--class-names",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional logit semantics in label order, overriding HDF5 "
+            "metadata; for example: left_hand right_hand both_hand rest."
+        ),
+    )
 
     parser.add_argument(
         "--checkpoint",
@@ -1356,20 +1656,36 @@ def main() -> None:
             f"config.py contains {len(STANDARD_64_CHANNELS)}."
         )
 
-    subjects = normalize_subjects(args.subjects)
     target_subject = int(args.target_subject)
-    if target_subject not in subjects:
-        raise ValueError(
-            f"Target subject {target_subject} is not in --subjects {subjects}."
-        )
-
-    population_subjects = [
-        subject for subject in subjects if subject != target_subject
-    ]
-    if not population_subjects:
-        raise ValueError(
-            "LOSO population training requires at least one non-target subject."
-        )
+    if args.split_mode == "loso":
+        subjects = normalize_subjects(args.subjects)
+        if target_subject not in subjects:
+            raise ValueError(
+                f"Target subject {target_subject} is not in --subjects {subjects}."
+            )
+        population_subjects = [
+            subject for subject in subjects if subject != target_subject
+        ]
+        if not population_subjects:
+            raise ValueError(
+                "LOSO population training requires at least one non-target subject."
+            )
+    else:
+        if target_subject <= 0:
+            raise ValueError("--target-subject must be positive.")
+        if args.test_session is None:
+            raise ValueError(
+                "--test-session is required for --split-mode within-subject."
+            )
+        if not 0.0 < args.validation_ratio < 1.0:
+            raise ValueError("--validation-ratio must be in (0,1).")
+        subjects = [target_subject]
+        population_subjects: list[int] = []
+    train_validation_subjects = (
+        population_subjects
+        if args.split_mode == "loso"
+        else [target_subject]
+    )
 
     set_seed(args.seed)
 
@@ -1386,7 +1702,11 @@ def main() -> None:
     if args.output is None:
         output_path = population_head_path(
             stage="stage1",
-            dataset="bnci2014_001",
+            dataset=(
+                "bnci2014_001"
+                if args.split_mode == "loso"
+                else "within_subject"
+            ),
             subject_id=args.target_subject,
             window_seconds=args.window_sec,
             aggregation=args.aggregation,
@@ -1404,7 +1724,11 @@ def main() -> None:
     if args.run_dir is None:
         run_dir = population_run_dir(
             stage="stage1",
-            dataset="bnci2014_001",
+            dataset=(
+                "bnci2014_001"
+                if args.split_mode == "loso"
+                else "within_subject"
+            ),
             subject_id=target_subject,
             window_seconds=args.window_sec,
             aggregation=args.aggregation,
@@ -1424,13 +1748,24 @@ def main() -> None:
     backbone_sha256 = sha256_file(checkpoint_path)
 
     print("=" * 88)
-    print("Stage 1: 50M LOSO population-head training")
+    print(
+        "Stage 1: 50M LOSO population-head training"
+        if args.split_mode == "loso"
+        else "Stage 1: 50M within-subject classification-head training"
+    )
     print("=" * 88)
+    print("split mode:", args.split_mode)
     print("target subject:", target_subject)
-    print("population subjects:", population_subjects)
-    print("population train session:", args.train_session)
-    print("population validation session:", args.validation_session)
-    print("final unseen-subject test:", f"{target_tag}/{args.final_test_session}")
+    if args.split_mode == "loso":
+        print("population subjects:", population_subjects)
+        print("population train session:", args.train_session)
+        print("population validation session:", args.validation_session)
+        print("final unseen-subject test:", f"{target_tag}/{args.final_test_session}")
+    else:
+        print("within-subject train source session:", args.train_session)
+        print("within-subject final test session:", args.test_session)
+        print("within-subject validation ratio:", args.validation_ratio)
+        print("within-subject split seed:", args.seed)
     print("data root:", data_root)
     print("data pattern:", args.data_pattern)
     print("backbone:", checkpoint_path)
@@ -1442,10 +1777,16 @@ def main() -> None:
         "session. Trials are never concatenated across subjects, sessions, "
         "or labels."
     )
-    print(
-        "IMPORTANT: the target subject is not loaded for final evaluation "
-        "until population training and model selection are complete."
-    )
+    if args.split_mode == "loso":
+        print(
+            "IMPORTANT: the target subject is not loaded for final evaluation "
+            "until population training and model selection are complete."
+        )
+    else:
+        print(
+            "IMPORTANT: train/validation are split at source-trial level; "
+            "the held-out test session is only windowed after model selection."
+        )
     print()
 
     # Check all subject file paths before a long run starts.
@@ -1464,11 +1805,20 @@ def main() -> None:
         "git_commit": git_commit,
         "target_subject": target_subject,
         "population_subjects": population_subjects,
-        "sessions": {
-            "population_train": args.train_session,
-            "population_validation": args.validation_session,
-            "final_target_test": args.final_test_session,
-        },
+        "split_mode": args.split_mode,
+        "sessions": (
+            {
+                "population_train": args.train_session,
+                "population_validation": args.validation_session,
+                "final_target_test": args.final_test_session,
+            }
+            if args.split_mode == "loso"
+            else {
+                "within_subject_train": args.train_session,
+                "within_subject_test": args.test_session,
+                "validation_ratio": args.validation_ratio,
+            }
+        ),
         "data_root": str(data_root),
         "data_pattern": args.data_pattern,
         "subject_paths": {
@@ -1483,88 +1833,126 @@ def main() -> None:
     atomic_write_json(run_dir / "run_config.json", initial_run_config)
 
     # ------------------------------------------------------------------
-    # Build population train and validation windows.
+    # Resolve train/validation source trials before any window construction.
     # ------------------------------------------------------------------
 
-    print("Building population training windows...")
-    train_build = build_population_split(
-        subjects=population_subjects,
-        data_root=data_root,
-        data_pattern=args.data_pattern,
-        session_name=args.train_session,
-        window_seconds=args.window_sec,
-        stride_seconds=args.window_stride_sec,
-        base_seed=args.window_seed + 1_000,
-        shuffle_trials_within_class=True,
-        max_windows_per_class_per_subject=(
-            args.max_windows_per_class_per_subject
-        ),
-        window_construction=args.window_construction,
-        direct_trial_anchor=args.direct_trial_anchor,
-    )
+    within_subject_split: WithinSubjectTrialSplit | None = None
+    within_subject_all_trials: dict[str, np.ndarray] | None = None
+    if args.split_mode == "loso":
+        print("Building population training windows...")
+        train_build = build_population_split(
+            subjects=population_subjects,
+            data_root=data_root,
+            data_pattern=args.data_pattern,
+            session_name=args.train_session,
+            window_seconds=args.window_sec,
+            stride_seconds=args.window_stride_sec,
+            base_seed=args.window_seed + 1_000,
+            shuffle_trials_within_class=True,
+            max_windows_per_class_per_subject=(
+                args.max_windows_per_class_per_subject
+            ),
+            window_construction=args.window_construction,
+            direct_trial_anchor=args.direct_trial_anchor,
+        )
 
-    print("Building population validation windows...")
-    val_build = build_population_split(
-        subjects=population_subjects,
-        data_root=data_root,
-        data_pattern=args.data_pattern,
-        session_name=args.validation_session,
-        window_seconds=args.window_sec,
-        stride_seconds=args.window_stride_sec,
-        base_seed=args.window_seed + 2_000,
-        shuffle_trials_within_class=False,
-        max_windows_per_class_per_subject=(
-            args.max_windows_per_class_per_subject
-        ),
-        reference_metadata=train_build.metadata,
-        window_construction=args.window_construction,
-        direct_trial_anchor=args.direct_trial_anchor,
-    )
+        print("Building population validation windows...")
+        val_build = build_population_split(
+            subjects=population_subjects,
+            data_root=data_root,
+            data_pattern=args.data_pattern,
+            session_name=args.validation_session,
+            window_seconds=args.window_sec,
+            stride_seconds=args.window_stride_sec,
+            base_seed=args.window_seed + 2_000,
+            shuffle_trials_within_class=False,
+            max_windows_per_class_per_subject=(
+                args.max_windows_per_class_per_subject
+            ),
+            reference_metadata=train_build.metadata,
+            window_construction=args.window_construction,
+            direct_trial_anchor=args.direct_trial_anchor,
+        )
+        metadata = train_build.metadata
+        class_names = resolve_class_names(
+            metadata=metadata,
+            explicit_class_names=args.class_names,
+        )
+    else:
+        print("Building within-subject training and validation windows...")
+        train_build, val_build, metadata, class_names, within_subject_split, within_subject_all_trials = (
+            build_within_subject_splits(
+                subject_id=target_subject,
+                path=all_subject_paths[target_subject],
+                train_session=args.train_session,
+                test_session=str(args.test_session),
+                validation_ratio=args.validation_ratio,
+                seed=args.seed,
+                window_seconds=args.window_sec,
+                stride_seconds=args.window_stride_sec,
+                max_windows_per_class=args.max_windows_per_class_per_subject,
+                window_construction=args.window_construction,
+                direct_trial_anchor=args.direct_trial_anchor,
+                explicit_class_names=args.class_names,
+            )
+        )
+        print(f"Available sessions for subject {target_subject}:")
+        for session_name in within_subject_split.available_sessions:
+            print(f"- {session_name}")
 
-    metadata = train_build.metadata
-    class_names = list(metadata.class_names)
     num_classes = len(class_names)
-
+    label_mapping = {
+        str(index): str(name)
+        for index, name in enumerate(class_names)
+    }
+    train_split_name = (
+        "population train" if args.split_mode == "loso" else "within-subject train"
+    )
+    validation_split_name = (
+        "population validation"
+        if args.split_mode == "loso"
+        else "within-subject validation"
+    )
     validate_labels(
         train_build.bundle.window_set.labels,
         num_classes=num_classes,
-        split_name="population train windows",
+        split_name=f"{train_split_name} windows",
     )
     validate_labels(
         val_build.bundle.window_set.labels,
         num_classes=num_classes,
-        split_name="population validation windows",
+        split_name=f"{validation_split_name} windows",
     )
-
     validate_no_source_leakage(
         train_build.bundle.window_set,
         val_build.bundle.window_set,
-        left_name="population train",
-        right_name="population validation",
+        left_name=train_split_name,
+        right_name=validation_split_name,
     )
 
-    train_window_subjects = set(
-        train_build.bundle.window_subject_ids.tolist()
-    )
+    train_window_subjects = set(train_build.bundle.window_subject_ids.tolist())
     val_window_subjects = set(val_build.bundle.window_subject_ids.tolist())
-    if target_subject in train_window_subjects:
-        raise RuntimeError("Target subject leaked into population training.")
-    if target_subject in val_window_subjects:
-        raise RuntimeError("Target subject leaked into population validation.")
-    if train_window_subjects != set(population_subjects):
-        raise RuntimeError(
-            "Population train window subjects do not match the requested "
-            f"population subjects: {sorted(train_window_subjects)} vs "
-            f"{population_subjects}."
-        )
-    if val_window_subjects != set(population_subjects):
-        raise RuntimeError(
-            "Population validation window subjects do not match the requested "
-            f"population subjects: {sorted(val_window_subjects)} vs "
-            f"{population_subjects}."
-        )
+    if args.split_mode == "loso":
+        if target_subject in train_window_subjects:
+            raise RuntimeError("Target subject leaked into population training.")
+        if target_subject in val_window_subjects:
+            raise RuntimeError("Target subject leaked into population validation.")
+        if train_window_subjects != set(population_subjects):
+            raise RuntimeError(
+                "Population train window subjects do not match the requested "
+                f"population subjects: {sorted(train_window_subjects)} vs "
+                f"{population_subjects}."
+            )
+        if val_window_subjects != set(population_subjects):
+            raise RuntimeError(
+                "Population validation window subjects do not match the requested "
+                f"population subjects: {sorted(val_window_subjects)} vs "
+                f"{population_subjects}."
+            )
+    elif train_window_subjects != {target_subject} or val_window_subjects != {target_subject}:
+        raise RuntimeError("Within-subject train/validation windows contain another subject.")
 
-    print("Population source and window summary:")
+    print(f"{train_split_name.title()} source and window summary:")
     print(
         "  train windows:",
         len(train_build.bundle.window_set.windows),
@@ -1581,6 +1969,16 @@ def main() -> None:
             class_names,
         ),
     )
+    if within_subject_split is not None:
+        assert within_subject_all_trials is not None
+        test_labels = within_subject_all_trials["labels"][
+            within_subject_split.test_indices
+        ]
+        print(
+            "  held-out test source trials:",
+            len(within_subject_split.test_indices),
+            class_name_counts(test_labels, class_names),
+        )
     print()
 
     # ------------------------------------------------------------------
@@ -1904,7 +2302,7 @@ def main() -> None:
             path=run_dir / "features_population_train.pt",
             split_name="population_train",
             class_names=class_names,
-            subject_ids=population_subjects,
+            subject_ids=train_validation_subjects,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
         )
@@ -1921,7 +2319,7 @@ def main() -> None:
             path=run_dir / "features_population_validation.pt",
             split_name="population_validation",
             class_names=class_names,
-            subject_ids=population_subjects,
+            subject_ids=train_validation_subjects,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
         )
@@ -2220,31 +2618,53 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Only now open the unseen target subject final test set.
+    # Only now construct held-out final-test windows.
     # ------------------------------------------------------------------
 
     print()
     print(
         "Population model selection is complete. "
         "Opening the unseen target-subject final test set..."
+        if args.split_mode == "loso"
+        else "Within-subject model selection is complete. "
+        "Constructing held-out final-test session windows..."
     )
 
-    target_build = build_population_split(
-        subjects=[target_subject],
-        data_root=data_root,
-        data_pattern=args.data_pattern,
-        session_name=args.final_test_session,
-        window_seconds=args.window_sec,
-        stride_seconds=args.window_stride_sec,
-        base_seed=args.window_seed + 3_000,
-        shuffle_trials_within_class=False,
-        max_windows_per_class_per_subject=(
-            args.max_windows_per_class_per_subject
-        ),
-        reference_metadata=metadata,
-        window_construction=args.window_construction,
-        direct_trial_anchor=args.direct_trial_anchor,
-    )
+    if args.split_mode == "loso":
+        target_build = build_population_split(
+            subjects=[target_subject],
+            data_root=data_root,
+            data_pattern=args.data_pattern,
+            session_name=args.final_test_session,
+            window_seconds=args.window_sec,
+            stride_seconds=args.window_stride_sec,
+            base_seed=args.window_seed + 3_000,
+            shuffle_trials_within_class=False,
+            max_windows_per_class_per_subject=(
+                args.max_windows_per_class_per_subject
+            ),
+            reference_metadata=metadata,
+            window_construction=args.window_construction,
+            direct_trial_anchor=args.direct_trial_anchor,
+        )
+        final_test_session = args.final_test_session
+    else:
+        assert within_subject_split is not None
+        assert within_subject_all_trials is not None
+        target_build = build_within_subject_test_split(
+            subject_id=target_subject,
+            path=all_subject_paths[target_subject],
+            metadata=metadata,
+            class_names=class_names,
+            split=within_subject_split,
+            all_trial_metadata=within_subject_all_trials,
+            window_seconds=args.window_sec,
+            stride_seconds=args.window_stride_sec,
+            max_windows_per_class=args.max_windows_per_class_per_subject,
+            window_construction=args.window_construction,
+            direct_trial_anchor=args.direct_trial_anchor,
+        )
+        final_test_session = within_subject_split.test_session
 
     target_subject_values = set(
         target_build.bundle.window_subject_ids.tolist()
@@ -2258,13 +2678,13 @@ def main() -> None:
     validate_no_source_leakage(
         train_build.bundle.window_set,
         target_build.bundle.window_set,
-        left_name="population train",
+        left_name=train_split_name,
         right_name="target final test",
     )
     validate_no_source_leakage(
         val_build.bundle.window_set,
         target_build.bundle.window_set,
-        left_name="population validation",
+        left_name=validation_split_name,
         right_name="target final test",
     )
 
@@ -2333,6 +2753,57 @@ def main() -> None:
         class_names=class_names,
     )
 
+    if within_subject_split is not None:
+        assert within_subject_all_trials is not None
+        within_subject_metadata: dict[str, Any] = {
+            "subject": int(target_subject),
+            "train_session": within_subject_split.train_session,
+            "test_session": within_subject_split.test_session,
+            "validation_ratio": float(args.validation_ratio),
+            "split_seed": int(args.seed),
+            "available_sessions": list(within_subject_split.available_sessions),
+            "train_trial_ids": within_subject_all_trials["trial_ids"][
+                within_subject_split.train_indices
+            ].tolist(),
+            "validation_trial_ids": within_subject_all_trials["trial_ids"][
+                within_subject_split.validation_indices
+            ].tolist(),
+            "test_trial_ids": within_subject_all_trials["trial_ids"][
+                within_subject_split.test_indices
+            ].tolist(),
+            "train_class_counts": class_name_counts(
+                within_subject_all_trials["labels"][within_subject_split.train_indices],
+                class_names,
+            ),
+            "validation_class_counts": class_name_counts(
+                within_subject_all_trials["labels"][within_subject_split.validation_indices],
+                class_names,
+            ),
+            "test_class_counts": class_name_counts(
+                within_subject_all_trials["labels"][within_subject_split.test_indices],
+                class_names,
+            ),
+        }
+    else:
+        within_subject_metadata = None
+
+    experiment_prefix = (
+        "population_loso" if args.split_mode == "loso" else "within_subject"
+    )
+    experiment_name = (
+        f"{experiment_prefix}_lora"
+        if lora_enabled
+        else (
+            f"{experiment_prefix}_partial_finetune"
+            if partial_finetuning_enabled
+            else (
+                f"{experiment_prefix}_linear_probe"
+                if config.head_type == "linear"
+                else f"{experiment_prefix}_mlp_head"
+            )
+        )
+    )
+
     # ------------------------------------------------------------------
     # Save model and reports.
     # ------------------------------------------------------------------
@@ -2342,35 +2813,33 @@ def main() -> None:
         classifier=classifier,
         checkpoint_path=output_path,
         extra_metadata={
-            "task": "BNCI2014_001_motor_imagery",
-            "dataset": metadata.dataset_name,
-            "mode": (
-                "population_loso_lora"
-                if lora_enabled
-                else (
-                    "population_loso_partial_finetune"
-                    if partial_finetuning_enabled
-                    else (
-                        "population_loso_linear_probe"
-                        if config.head_type == "linear"
-                        else "population_loso_mlp_head"
-                    )
-                )
+            "task": (
+                "BNCI2014_001_motor_imagery"
+                if args.split_mode == "loso"
+                else f"{metadata.dataset_name}_classification"
             ),
+            "dataset": metadata.dataset_name,
+            "mode": experiment_name,
             "stage": "stage1",
+            "split_mode": args.split_mode,
             "target_subject": target_subject,
-            "excluded_subjects": [target_subject],
+            "excluded_subjects": (
+                [target_subject] if args.split_mode == "loso" else []
+            ),
             "population_training_subjects": population_subjects,
             "population_validation_subjects": population_subjects,
             "population_train_session": args.train_session,
             "population_validation_session": args.validation_session,
             "final_test_subject": target_subject,
-            "final_test_session": args.final_test_session,
+            "final_test_session": final_test_session,
             "subject_data_paths": {
                 str(subject): str(path)
                 for subject, path in all_subject_paths.items()
             },
             "class_names": class_names,
+            "label_mapping": label_mapping,
+            "num_classes": int(num_classes),
+            "within_subject_split": within_subject_metadata,
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
             "backbone_adaptation": backbone_adaptation,
@@ -2466,23 +2935,15 @@ def main() -> None:
     report = {
         "status": "completed",
         "stage": "stage1",
-        "experiment": (
-            "population_loso_lora"
-            if lora_enabled
-            else (
-                "population_loso_partial_finetune"
-                if partial_finetuning_enabled
-                else (
-                    "population_loso_linear_probe"
-                    if config.head_type == "linear"
-                    else "population_loso_mlp_head"
-                )
-            )
-        ),
+        "experiment": experiment_name,
+        "split_mode": args.split_mode,
         "warning": (
-            "Temporary 10-second baseline: each derived window contains one "
-            "subject, one session, and one class, but may cross original "
-            "4-second trial boundaries."
+            None
+            if args.window_construction == "direct_trial"
+            else (
+                "Samples were constructed by concatenating same-label source "
+                "trials."
+            )
         ),
         "files": {
             "backbone_checkpoint": str(checkpoint_path),
@@ -2500,10 +2961,11 @@ def main() -> None:
             "population_subjects": population_subjects,
             "population_train_session": args.train_session,
             "population_validation_session": args.validation_session,
-            "final_target_test_session": args.final_test_session,
-            "target_subject_used_for_training": False,
-            "target_subject_used_for_validation": False,
+            "final_target_test_session": final_test_session,
+            "target_subject_used_for_training": args.split_mode == "within-subject",
+            "target_subject_used_for_validation": args.split_mode == "within-subject",
             "final_test_opened_after_model_selection": True,
+            "within_subject": within_subject_metadata,
         },
         "dataset": {
             "name": metadata.dataset_name,
@@ -2511,6 +2973,8 @@ def main() -> None:
             "unit": metadata.unit,
             "channel_names": metadata.channel_names,
             "class_names": class_names,
+            "label_mapping": label_mapping,
+            "num_classes": num_classes,
         },
         "source_trials": {
             "population_train": train_build.source_trial_summary,
@@ -2651,6 +3115,8 @@ def main() -> None:
         },
         "best_population_validation": selected_val_metrics.to_dict(),
         "unseen_target_final_test": target_metrics.to_dict(),
+        "best_validation": selected_val_metrics.to_dict(),
+        "final_test": target_metrics.to_dict(),
         "reproducibility": {
             "git_commit": git_commit,
             "backbone_sha256": backbone_sha256,
@@ -2666,8 +3132,20 @@ def main() -> None:
 
     summary = {
         "status": "completed",
+        "split_mode": args.split_mode,
         "target_subject": target_subject,
         "population_subjects": population_subjects,
+        "within_subject": within_subject_metadata,
+        "train_session": args.train_session,
+        "test_session": final_test_session,
+        "validation_ratio": (
+            float(args.validation_ratio)
+            if args.split_mode == "within-subject"
+            else None
+        ),
+        "num_classes": num_classes,
+        "class_names": class_names,
+        "label_mapping": label_mapping,
         "best_epoch": best_epoch,
         "population_validation": selected_val_metrics.to_dict(),
         "unseen_target_final_test": target_metrics.to_dict(),

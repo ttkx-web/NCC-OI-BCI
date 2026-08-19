@@ -22,6 +22,14 @@ def test_hdf5_roundtrip_and_session_split(tmp_path):
     dataset = EEGHDF5(path)
     assert dataset.sessions() == ["0train", "1test"]
     assert dataset.load("1test")["data"].shape == (2, 2, 250)
+    trial_metadata = dataset.trial_metadata()
+    np.testing.assert_array_equal(trial_metadata["labels"], [0, 1, 0, 1])
+    np.testing.assert_array_equal(trial_metadata["subject_ids"], [1, 1, 1, 1])
+    np.testing.assert_array_equal(
+        trial_metadata["session_ids"],
+        ["0train", "0train", "1test", "1test"],
+    )
+    np.testing.assert_array_equal(trial_metadata["trial_ids"], [0, 1, 2, 3])
     assert dataset.metadata.channel_names == ["C3", "C4"]
 
 
@@ -42,4 +50,3 @@ def test_non_eeg_channel_removal():
     selected, names = EEGPreprocessor.select_eeg_channels(data, ["C3", "EOG1", "C4"])
     assert selected.shape == (2, 100)
     assert names == ["C3", "C4"]
-

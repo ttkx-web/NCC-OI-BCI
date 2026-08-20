@@ -2919,7 +2919,8 @@ def main() -> None:
         extra_metadata={
             "task": (
                 "BNCI2014_001_motor_imagery"
-                if args.data_reader == "eeg" and args.split_mode == "loso"
+                if metadata.dataset_name == "bnci2014_001"
+                and args.split_mode == "loso"
                 else f"{metadata.dataset_name}_classification"
             ),
             "dataset": metadata.dataset_name,

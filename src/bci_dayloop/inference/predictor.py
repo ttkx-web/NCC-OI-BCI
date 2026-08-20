@@ -8,7 +8,9 @@ from typing import (
 from bci_dayloop.runtime.types import (
     ModelOutput,
     PreparedModelInput,
+    RawEEGWindow,
 )
+from bci_dayloop.inference.multi_head import MultiHeadPrediction
 
 
 @runtime_checkable
@@ -27,4 +29,19 @@ class PreparedPredictor(Protocol):
         *,
         return_features: bool = False,
     ) -> ModelOutput:
+        ...
+
+
+@runtime_checkable
+class RawWindowPredictor(Protocol):
+    """Predict directly from one runtime EEG window that it preprocesses itself."""
+
+    @property
+    def window_seconds(self) -> float:
+        ...
+
+    def predict(
+        self,
+        window: RawEEGWindow,
+    ) -> MultiHeadPrediction:
         ...

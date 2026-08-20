@@ -238,7 +238,7 @@ class JsonlWindowLogger:
             window_id: int,
             result: Any,
     ) -> None:
-        record = {
+        record: dict[str, Any] = {
             "timestamp": self._timestamp(),
             "status": "success",
             "window_id": window_id,
@@ -246,12 +246,6 @@ class JsonlWindowLogger:
             "expected_class_id": (
                 result.expected_class_id
             ),
-            "prediction": result.prediction,
-            "confidence": result.confidence,
-            "probabilities": (
-                result.probabilities
-            ),
-            "command": result.command,
             "preprocessing_latency_ms": (
                 result.preprocessing_latency_ms
             ),
@@ -274,6 +268,35 @@ class JsonlWindowLogger:
                 result.online_update_applied
             ),
         }
+
+        if hasattr(result.prediction, "workload"):
+            record.update(
+                {
+                    "prediction_type": "multi_head",
+                    "prediction": {
+                        task: {
+                            "label_id": value.label_id,
+                            "label": value.label,
+                            "confidence": value.confidence,
+                            "probabilities": list(value.probabilities),
+                        }
+                        for task, value in (
+                            ("workload", result.prediction.workload),
+                            ("attention", result.prediction.attention),
+                            ("emotion", result.prediction.emotion),
+                        )
+                    },
+                }
+            )
+        else:
+            record.update(
+                {
+                    "prediction": result.prediction,
+                    "confidence": result.confidence,
+                    "probabilities": result.probabilities,
+                    "command": result.command,
+                }
+            )
 
         record.update(
             self._build_trace_payload(result)

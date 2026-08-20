@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -83,12 +84,22 @@ def stratified_source_trial_split(
 @dataclass(frozen=True, slots=True)
 class WithinSubjectTrialSplit:
     subject_id: int
-    train_session: str
+    train_sessions: tuple[str, ...]
     test_session: str
     available_sessions: tuple[str, ...]
     train_indices: np.ndarray
     validation_indices: np.ndarray
     test_indices: np.ndarray
+
+    @property
+    def train_session(self) -> str:
+        """Legacy single-session view retained for existing callers."""
+        if len(self.train_sessions) != 1:
+            raise AttributeError(
+                "train_session is ambiguous for a multi-session split; "
+                "use train_sessions instead."
+            )
+        return self.train_sessions[0]
 
 
 def resolve_within_subject_trial_split(
@@ -97,7 +108,8 @@ def resolve_within_subject_trial_split(
     session_ids: np.ndarray,
     labels: np.ndarray,
     subject_id: int,
-    train_session: str,
+    train_sessions: Sequence[str] | None = None,
+    train_session: str | None = None,
     test_session: str,
     validation_ratio: float,
     seed: int,
@@ -120,11 +132,16 @@ def resolve_within_subject_trial_split(
         )
     if int(subject_id) <= 0:
         raise ValueError(f"subject_id must be positive, got {subject_id}.")
-    if train_session == test_session:
+    if train_sessions is not None and train_session is not None:
         raise ValueError(
-            "within-subject cross-session training requires different "
-            "train and test sessions."
+            "Specify either train_sessions or legacy train_session, not both."
         )
+    if train_sessions is None:
+        normalized_train_sessions = (
+            () if train_session is None else (str(train_session),)
+        )
+    else:
+        normalized_train_sessions = tuple(str(session) for session in train_sessions)
 
     subject_mask = subject_ids == int(subject_id)
     if not np.any(subject_mask):
@@ -136,24 +153,49 @@ def resolve_within_subject_trial_split(
     available_sessions = tuple(
         dict.fromkeys(session_ids[subject_mask].tolist())
     )
+    available_text = ", ".join(available_sessions)
+    context = (
+        f"Requested train sessions: {list(normalized_train_sessions)!r}; "
+        f"requested test session: {test_session!r}. "
+        f"Available sessions: {available_text}."
+    )
+    if not normalized_train_sessions:
+        raise ValueError(
+            "within-subject training requires at least one train session. "
+            + context
+        )
+    if any(not session for session in normalized_train_sessions):
+        raise ValueError(
+            "within-subject train sessions must not contain empty values. "
+            + context
+        )
+    if len(set(normalized_train_sessions)) != len(normalized_train_sessions):
+        raise ValueError(
+            "within-subject train sessions must be unique. " + context
+        )
+    if test_session in normalized_train_sessions:
+        raise ValueError(
+            "within-subject cross-session training requires the held-out test "
+            "session not to appear in train sessions. " + context
+        )
+    requested_sessions = (*normalized_train_sessions, str(test_session))
     missing_sessions = [
-        session
-        for session in (train_session, test_session)
-        if session not in available_sessions
+        session for session in requested_sessions if session not in available_sessions
     ]
     if missing_sessions:
-        available_text = ", ".join(available_sessions)
         raise ValueError(
             f"Subject {subject_id} does not contain session(s) "
-            f"{missing_sessions}. Available sessions: {available_text}."
+            f"{missing_sessions}. {context}"
         )
 
-    source_indices = np.flatnonzero(subject_mask & (session_ids == train_session))
+    source_indices = np.flatnonzero(
+        subject_mask & np.isin(session_ids, normalized_train_sessions)
+    )
     test_indices = np.flatnonzero(subject_mask & (session_ids == test_session))
     validate_label_coverage(
         labels[source_indices],
         num_classes=num_classes,
-        split_name=f"train session {train_session!r}",
+        split_name=f"train sessions {list(normalized_train_sessions)!r}",
     )
     validate_label_coverage(
         labels[test_indices],
@@ -178,7 +220,7 @@ def resolve_within_subject_trial_split(
 
     return WithinSubjectTrialSplit(
         subject_id=int(subject_id),
-        train_session=str(train_session),
+        train_sessions=normalized_train_sessions,
         test_session=str(test_session),
         available_sessions=available_sessions,
         train_indices=train_indices,

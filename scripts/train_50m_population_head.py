@@ -17,9 +17,9 @@ target subject:
 
 The target subject is never used to train or select the population model.
 
-``--split-mode within-subject`` uses one subject's source session for a
-trial-level stratified train/validation split and a distinct session only for
-final testing.
+``--split-mode within-subject`` uses one or more source sessions from one
+subject for one global trial-level stratified train/validation split and keeps
+a distinct session exclusively for final testing.
 
 Important
 ---------
@@ -534,6 +534,7 @@ def validate_loaded_session(
     *,
     expected_subject: int,
     expected_session: str,
+    allowed_sessions: Sequence[str] | None = None,
     num_classes: int,
     path: Path,
 ) -> None:
@@ -572,12 +573,15 @@ def validate_loaded_session(
             f"found {subject_values}."
         )
 
-    session_values = sorted(
-        set(np.asarray(session_data["session_ids"]).astype(str).tolist())
+    session_values = sorted(set(np.asarray(session_data["session_ids"]).astype(str)))
+    expected_sessions = (
+        tuple(str(session) for session in allowed_sessions)
+        if allowed_sessions is not None
+        else (expected_session,)
     )
-    if session_values != [expected_session]:
+    if not session_values or not set(session_values).issubset(expected_sessions):
         raise ValueError(
-            f"{path}: expected only session {expected_session!r}, "
+            f"{path}: expected session values within {list(expected_sessions)!r}, "
             f"found {session_values}."
         )
 
@@ -747,6 +751,7 @@ def build_window_bundle_from_session_data(
     subject_id: int,
     path: Path,
     session_name: str,
+    allowed_sessions: Sequence[str] | None = None,
     metadata: HDF5Metadata,
     session_data: Mapping[str, np.ndarray],
     class_names: Sequence[str] | None = None,
@@ -765,6 +770,7 @@ def build_window_bundle_from_session_data(
         session_data,
         expected_subject=subject_id,
         expected_session=session_name,
+        allowed_sessions=allowed_sessions,
         num_classes=num_classes,
         path=path,
     )
@@ -852,6 +858,7 @@ def build_window_bundle_from_session_data(
         "subject_id": subject_id,
         "path": str(path),
         "session": session_name,
+        "sessions": list(allowed_sessions or (session_name,)),
         "raw_shape": list(np.asarray(session_data["data"]).shape),
         "source_trials_total": int(len(session_data["labels"])),
         "source_trials_per_class": class_name_counts(
@@ -903,6 +910,49 @@ def select_trial_ids(
     return selected
 
 
+def concatenate_session_trial_data(
+    session_data: Sequence[Mapping[str, np.ndarray]],
+    *,
+    sessions: Sequence[str],
+) -> dict[str, np.ndarray]:
+    """Concatenate canonical trial views while preserving trial identity."""
+    if not session_data:
+        raise ValueError("At least one train-session payload is required.")
+    if len(session_data) != len(sessions):
+        raise ValueError(
+            "Train-session payload count does not match requested sessions: "
+            f"{len(session_data)} != {len(sessions)}."
+        )
+
+    required = ("data", "labels", "subject_ids", "session_ids", "trial_ids")
+    combined: dict[str, np.ndarray] = {}
+    for key in required:
+        missing = [index for index, payload in enumerate(session_data) if key not in payload]
+        if missing:
+            raise KeyError(
+                f"Loaded train session payload(s) {missing} are missing {key!r}."
+            )
+        combined[key] = np.concatenate(
+            [np.asarray(payload[key]) for payload in session_data], axis=0
+        )
+
+    combined_session_values = set(combined["session_ids"].astype(str).tolist())
+    requested_session_values = {str(session) for session in sessions}
+    if not combined_session_values.issubset(requested_session_values):
+        raise RuntimeError(
+            "Concatenated train-session data contains unexpected sessions: "
+            f"{sorted(combined_session_values)} not within "
+            f"{list(sessions)!r}."
+        )
+    trial_ids = np.asarray(combined["trial_ids"], dtype=np.int64)
+    if len(np.unique(trial_ids)) != len(trial_ids):
+        raise ValueError(
+            "Within-subject multi-session training requires globally unique "
+            "trial_ids across the requested train sessions."
+        )
+    return combined
+
+
 def resolve_class_names(
     *,
     metadata: HDF5Metadata,
@@ -944,7 +994,7 @@ def build_within_subject_splits(
     subject_id: int,
     path: Path,
     data_reader: DataReaderName = "eeg",
-    train_session: str,
+    train_sessions: Sequence[str],
     test_session: str,
     validation_ratio: float,
     seed: int,
@@ -974,31 +1024,37 @@ def build_within_subject_splits(
         explicit_class_names=explicit_class_names,
     )
     all_trial_metadata = dataset.trial_metadata()
+    normalized_train_sessions = tuple(str(session) for session in train_sessions)
     split = resolve_within_subject_trial_split(
         subject_ids=all_trial_metadata["subject_ids"],
         session_ids=all_trial_metadata["session_ids"],
         labels=all_trial_metadata["labels"],
         subject_id=subject_id,
-        train_session=train_session,
+        train_sessions=normalized_train_sessions,
         test_session=test_session,
         validation_ratio=validation_ratio,
         seed=seed,
         num_classes=len(class_names),
     )
 
-    train_session_data = dataset.load(session=train_session)
+    train_source_data = concatenate_session_trial_data(
+        [dataset.load(session=session) for session in normalized_train_sessions],
+        sessions=normalized_train_sessions,
+    )
     train_data = select_trial_ids(
-        train_session_data,
+        train_source_data,
         all_trial_metadata["trial_ids"][split.train_indices],
     )
     validation_data = select_trial_ids(
-        train_session_data,
+        train_source_data,
         all_trial_metadata["trial_ids"][split.validation_indices],
     )
+    train_session_name = ",".join(normalized_train_sessions)
     train_bundle, _, train_summary = build_window_bundle_from_session_data(
         subject_id=subject_id,
         path=path,
-        session_name=train_session,
+        session_name=train_session_name,
+        allowed_sessions=normalized_train_sessions,
         metadata=metadata,
         session_data=train_data,
         class_names=class_names,
@@ -1013,7 +1069,8 @@ def build_within_subject_splits(
     validation_bundle, _, validation_summary = build_window_bundle_from_session_data(
         subject_id=subject_id,
         path=path,
-        session_name=train_session,
+        session_name=train_session_name,
+        allowed_sessions=normalized_train_sessions,
         metadata=metadata,
         session_data=validation_data,
         class_names=class_names,
@@ -1037,6 +1094,7 @@ def build_within_subject_splits(
     for summary in (train_summary, validation_summary):
         summary.update(identity)
         summary["data_reader"] = data_reader
+        summary["train_sessions"] = list(normalized_train_sessions)
     return (
         SplitBuildResult(
             bundle=train_bundle,
@@ -1115,6 +1173,43 @@ def build_within_subject_test_split(
         subject_paths={subject_id: path},
         metadata=metadata,
     )
+
+
+def build_within_subject_split_metadata(
+    *,
+    subject_id: int,
+    split: WithinSubjectTrialSplit,
+    all_trial_metadata: Mapping[str, np.ndarray],
+    class_names: Sequence[str],
+    validation_ratio: float,
+    seed: int,
+) -> dict[str, Any]:
+    """Serialize exact within-subject source-trial provenance."""
+    labels = np.asarray(all_trial_metadata["labels"], dtype=np.int64)
+    trial_ids = np.asarray(all_trial_metadata["trial_ids"], dtype=np.int64)
+    return {
+        "subject": int(subject_id),
+        "train_session": (
+            split.train_sessions[0] if len(split.train_sessions) == 1 else None
+        ),
+        "train_sessions": list(split.train_sessions),
+        "test_session": split.test_session,
+        "validation_ratio": float(validation_ratio),
+        "split_seed": int(seed),
+        "available_sessions": list(split.available_sessions),
+        "train_trial_ids": trial_ids[split.train_indices].tolist(),
+        "validation_trial_ids": trial_ids[split.validation_indices].tolist(),
+        "test_trial_ids": trial_ids[split.test_indices].tolist(),
+        "train_class_counts": class_name_counts(
+            labels[split.train_indices], class_names
+        ),
+        "validation_class_counts": class_name_counts(
+            labels[split.validation_indices], class_names
+        ),
+        "test_class_counts": class_name_counts(
+            labels[split.test_indices], class_names
+        ),
+    }
 
 
 def combine_window_bundles(
@@ -1289,6 +1384,30 @@ def extend_metrics(
 # ---------------------------------------------------------------------------
 
 
+def build_feature_cache_split_identity(
+    *,
+    split_mode: str,
+    train_sessions: Sequence[str],
+    test_session: str | None,
+    validation_session: str | None,
+    validation_ratio: float | None,
+    split_seed: int | None,
+) -> dict[str, Any]:
+    """Return deterministic split provenance for a frozen feature artifact."""
+    return {
+        "split_mode": str(split_mode),
+        "train_sessions": [str(session) for session in train_sessions],
+        "test_session": None if test_session is None else str(test_session),
+        "validation_session": (
+            None if validation_session is None else str(validation_session)
+        ),
+        "validation_ratio": (
+            None if validation_ratio is None else float(validation_ratio)
+        ),
+        "split_seed": None if split_seed is None else int(split_seed),
+    }
+
+
 def save_population_feature_cache(
     *,
     dataset: TensorDataset,
@@ -1301,6 +1420,7 @@ def save_population_feature_cache(
     subject_identities: Mapping[str, Mapping[str, int | str]],
     backbone_sha256: str,
     preprocessing_hash: str,
+    split_identity: Mapping[str, Any],
 ) -> None:
     features, labels = dataset.tensors
     if len(features) != len(bundle.window_set.windows):
@@ -1342,6 +1462,7 @@ def save_population_feature_cache(
             ),
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
+            "split_identity": dict(split_identity),
         },
         temporary,
     )
@@ -1414,7 +1535,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    parser.add_argument("--train-session", default="0train")
+    parser.add_argument(
+        "--train-session",
+        nargs="+",
+        default=["0train"],
+        help=(
+            "One or more source sessions. LOSO accepts exactly one session; "
+            "within-subject concatenates all requested train sessions before "
+            "one global stratified validation split."
+        ),
+    )
     parser.add_argument("--validation-session", default="1test")
     parser.add_argument("--final-test-session", default="1test")
     parser.add_argument(
@@ -1422,7 +1552,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Held-out final-test session for --split-mode within-subject. "
-            "Must differ from --train-session."
+            "Must not appear in --train-session."
         ),
     )
     parser.add_argument(
@@ -1430,7 +1560,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.2,
         help=(
-            "Trial-level validation fraction of --train-session for "
+            "Trial-level validation fraction of the combined --train-session "
+            "source trials for "
             "--split-mode within-subject (default: 0.2)."
         ),
     )
@@ -1734,7 +1865,15 @@ def main() -> None:
         )
 
     target_subject = int(args.target_subject)
+    requested_train_sessions = [str(session) for session in args.train_session]
     if args.split_mode == "loso":
+        if len(requested_train_sessions) != 1:
+            raise ValueError(
+                "--split-mode loso accepts exactly one --train-session. "
+                f"Received {requested_train_sessions!r}."
+            )
+        loso_train_session = requested_train_sessions[0]
+        within_subject_train_sessions: list[str] = []
         subjects = normalize_subjects(args.subjects)
         if target_subject not in subjects:
             raise ValueError(
@@ -1748,6 +1887,8 @@ def main() -> None:
                 "LOSO population training requires at least one non-target subject."
             )
     else:
+        loso_train_session = None
+        within_subject_train_sessions = requested_train_sessions
         if target_subject <= 0:
             raise ValueError("--target-subject must be positive.")
         if args.test_session is None:
@@ -1836,11 +1977,14 @@ def main() -> None:
     print("target subject:", target_subject)
     if args.split_mode == "loso":
         print("population subjects:", population_subjects)
-        print("population train session:", args.train_session)
+        print("population train session:", loso_train_session)
         print("population validation session:", args.validation_session)
         print("final unseen-subject test:", f"{target_tag}/{args.final_test_session}")
     else:
-        print("within-subject train source session:", args.train_session)
+        print(
+            "within-subject train source sessions:",
+            ", ".join(within_subject_train_sessions),
+        )
         print("within-subject final test session:", args.test_session)
         print("within-subject validation ratio:", args.validation_ratio)
         print("within-subject split seed:", args.seed)
@@ -1899,13 +2043,13 @@ def main() -> None:
         "split_mode": args.split_mode,
         "sessions": (
             {
-                "population_train": args.train_session,
+                "population_train": loso_train_session,
                 "population_validation": args.validation_session,
                 "final_target_test": args.final_test_session,
             }
             if args.split_mode == "loso"
             else {
-                "within_subject_train": args.train_session,
+                "within_subject_train_sessions": within_subject_train_sessions,
                 "within_subject_test": args.test_session,
                 "validation_ratio": args.validation_ratio,
             }
@@ -1938,7 +2082,7 @@ def main() -> None:
             data_root=data_root,
             data_pattern=args.data_pattern,
             data_reader=args.data_reader,
-            session_name=args.train_session,
+            session_name=str(loso_train_session),
             window_seconds=args.window_sec,
             stride_seconds=args.window_stride_sec,
             base_seed=args.window_seed + 1_000,
@@ -1980,7 +2124,7 @@ def main() -> None:
                 subject_id=target_subject,
                 path=all_subject_paths[target_subject],
                 data_reader=args.data_reader,
-                train_session=args.train_session,
+                train_sessions=within_subject_train_sessions,
                 test_session=str(args.test_session),
                 validation_ratio=args.validation_ratio,
                 seed=args.seed,
@@ -2067,6 +2211,37 @@ def main() -> None:
     )
     if within_subject_split is not None:
         assert within_subject_all_trials is not None
+        train_session_counts = {
+            session: int(
+                np.sum(
+                    np.asarray(within_subject_all_trials["session_ids"]).astype(str)
+                    == session
+                )
+            )
+            for session in within_subject_split.train_sessions
+        }
+        print("Within-subject train source sessions:")
+        for session, count in train_session_counts.items():
+            print(f"  {session}: {count}")
+        print(
+            "Combined train-source trials:",
+            sum(train_session_counts.values()),
+            class_name_counts(
+                within_subject_all_trials["labels"][
+                    np.isin(
+                        np.asarray(within_subject_all_trials["session_ids"]).astype(str),
+                        within_subject_split.train_sessions,
+                    )
+                ],
+                class_names,
+            ),
+        )
+        print(
+            "Train / validation source trials:",
+            len(within_subject_split.train_indices),
+            "/",
+            len(within_subject_split.validation_indices),
+        )
         test_labels = within_subject_all_trials["labels"][
             within_subject_split.test_indices
         ]
@@ -2351,6 +2526,24 @@ def main() -> None:
     cache_dtype = feature_cache_dtype_from_name(
         args.feature_cache_dtype
     )
+    feature_cache_split_identity = build_feature_cache_split_identity(
+        split_mode=args.split_mode,
+        train_sessions=(
+            [str(loso_train_session)]
+            if args.split_mode == "loso"
+            else within_subject_train_sessions
+        ),
+        test_session=(
+            args.final_test_session if args.split_mode == "loso" else args.test_session
+        ),
+        validation_session=(
+            args.validation_session if args.split_mode == "loso" else None
+        ),
+        validation_ratio=(
+            None if args.split_mode == "loso" else args.validation_ratio
+        ),
+        split_seed=(None if args.split_mode == "loso" else args.seed),
+    )
 
     if requires_live_backbone_forward:
         train_features = tokenize_windows_for_finetuning(
@@ -2403,6 +2596,7 @@ def main() -> None:
             subject_identities=subject_identities,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
+            split_identity=feature_cache_split_identity,
         )
 
     if args.save_feature_cache and not feature_cache_enabled:
@@ -2422,6 +2616,7 @@ def main() -> None:
             subject_identities=subject_identities,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
+            split_identity=feature_cache_split_identity,
         )
 
     head_train_batch_size = min(args.head_batch_size, len(train_features))
@@ -2823,6 +3018,7 @@ def main() -> None:
             subject_identities=subject_identities,
             backbone_sha256=backbone_sha256,
             preprocessing_hash=preprocessing_hash,
+            split_identity=feature_cache_split_identity,
         )
 
     target_loader = DataLoader(
@@ -2859,35 +3055,14 @@ def main() -> None:
 
     if within_subject_split is not None:
         assert within_subject_all_trials is not None
-        within_subject_metadata: dict[str, Any] = {
-            "subject": int(target_subject),
-            "train_session": within_subject_split.train_session,
-            "test_session": within_subject_split.test_session,
-            "validation_ratio": float(args.validation_ratio),
-            "split_seed": int(args.seed),
-            "available_sessions": list(within_subject_split.available_sessions),
-            "train_trial_ids": within_subject_all_trials["trial_ids"][
-                within_subject_split.train_indices
-            ].tolist(),
-            "validation_trial_ids": within_subject_all_trials["trial_ids"][
-                within_subject_split.validation_indices
-            ].tolist(),
-            "test_trial_ids": within_subject_all_trials["trial_ids"][
-                within_subject_split.test_indices
-            ].tolist(),
-            "train_class_counts": class_name_counts(
-                within_subject_all_trials["labels"][within_subject_split.train_indices],
-                class_names,
-            ),
-            "validation_class_counts": class_name_counts(
-                within_subject_all_trials["labels"][within_subject_split.validation_indices],
-                class_names,
-            ),
-            "test_class_counts": class_name_counts(
-                within_subject_all_trials["labels"][within_subject_split.test_indices],
-                class_names,
-            ),
-        }
+        within_subject_metadata = build_within_subject_split_metadata(
+            subject_id=target_subject,
+            split=within_subject_split,
+            all_trial_metadata=within_subject_all_trials,
+            class_names=class_names,
+            validation_ratio=args.validation_ratio,
+            seed=args.seed,
+        )
     else:
         within_subject_metadata = None
 
@@ -2935,7 +3110,7 @@ def main() -> None:
             ),
             "population_training_subjects": population_subjects,
             "population_validation_subjects": population_subjects,
-            "population_train_session": args.train_session,
+            "population_train_session": loso_train_session,
             "population_validation_session": args.validation_session,
             "final_test_subject": target_subject,
             "final_test_session": final_test_session,
@@ -3068,7 +3243,7 @@ def main() -> None:
             "all_subjects": subjects,
             "target_subject": target_subject,
             "population_subjects": population_subjects,
-            "population_train_session": args.train_session,
+            "population_train_session": loso_train_session,
             "population_validation_session": args.validation_session,
             "final_target_test_session": final_test_session,
             "target_subject_used_for_training": args.split_mode == "within-subject",
@@ -3249,7 +3424,20 @@ def main() -> None:
         "target_subject": target_subject,
         "population_subjects": population_subjects,
         "within_subject": within_subject_metadata,
-        "train_session": args.train_session,
+        "train_session": (
+            loso_train_session
+            if args.split_mode == "loso"
+            else (
+                within_subject_train_sessions[0]
+                if len(within_subject_train_sessions) == 1
+                else None
+            )
+        ),
+        "train_sessions": (
+            [loso_train_session]
+            if args.split_mode == "loso"
+            else within_subject_train_sessions
+        ),
         "test_session": final_test_session,
         "validation_ratio": (
             float(args.validation_ratio)

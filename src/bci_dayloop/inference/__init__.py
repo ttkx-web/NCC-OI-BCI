@@ -22,6 +22,10 @@ from .multi_head import (
     MultiHeadPrediction,
     MultiHeadPredictor,
 )
+from .window_inference import (
+    infer_eeg_window,
+    named_predictions,
+)
 
 __all__ = [
     "DecodeResult",
@@ -35,4 +39,6 @@ __all__ = [
     "NeuroOnlineStrategy",
     "SlidingWindowDecoder",
     "build_neuroonline_forward",
+    "infer_eeg_window",
+    "named_predictions",
 ]

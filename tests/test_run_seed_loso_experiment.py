@@ -101,6 +101,85 @@ def test_subject_output_paths_preserve_seed_identity() -> None:
     ).as_posix() == "experiments/seed_loso/subject_01/labram/evaluation"
 
 
+def test_full_loso_expansion_isolated_and_builds_both_model_commands() -> None:
+    module = _module()
+    args = module.build_parser().parse_args(
+        [
+            "--labram-checkpoint",
+            "models/labram-base.pth",
+            "--cbramod-checkpoint",
+            "models/cbramod.pth",
+            "--dry-run",
+        ]
+    )
+    plans = module.build_plans(args)
+
+    expected_subjects = tuple(range(1, 16))
+    assert tuple(plan.target_subject for plan in plans) == expected_subjects
+    assert len({plan.output_dir for plan in plans}) == 15
+
+    for plan in plans:
+        target = plan.target_subject
+        expected_population = tuple(
+            subject for subject in expected_subjects if subject != target
+        )
+        assert plan.population_subjects == expected_population
+        assert target not in plan.population_subjects
+        assert plan.output_dir == (
+            Path("experiments/seed_loso") / f"subject_{target:02d}"
+        )
+
+        commands = {
+            command.name: command.argv for command in plan.commands
+        }
+        assert tuple(commands) == (
+            "train_labram",
+            "export_labram",
+            "evaluate_labram",
+            "train_cbramod",
+            "export_cbramod",
+            "evaluate_cbramod",
+        )
+
+        for train_name in ("train_labram", "train_cbramod"):
+            train = commands[train_name]
+            subjects_start = train.index("--subjects") + 1
+            target_flag = train.index("--target-subject")
+            assert train[subjects_start:target_flag] == tuple(
+                str(subject) for subject in expected_subjects
+            )
+            assert _arg_after(train, "--target-subject") == str(target)
+            assert _arg_after(train, "--train-session") == "S1"
+            assert _arg_after(train, "--validation-session") == "S2"
+            assert _arg_after(train, "--final-test-session") == "S3"
+            assert _arg_after(train, "--window-sec") == "2"
+
+        subject_data = (
+            Path("data/processed/seed")
+            / f"subject_{target:02d}.h5"
+        )
+        assert Path(
+            _arg_after(commands["export_labram"], "--data")
+        ) == subject_data
+        assert Path(
+            _arg_after(commands["export_cbramod"], "--data")
+        ) == subject_data
+
+        for model in ("labram", "cbramod"):
+            export = commands[f"export_{model}"]
+            evaluate = commands[f"evaluate_{model}"]
+            model_dir = plan.output_dir / model
+            assert Path(_arg_after(export, "--output")) == (
+                model_dir / "package"
+            )
+            assert Path(_arg_after(evaluate, "--model-package")) == (
+                model_dir / "package"
+            )
+            assert Path(_arg_after(evaluate, "--output-dir")) == (
+                model_dir / "evaluation"
+            )
+
+
 def test_dry_run_prints_commands_without_executing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

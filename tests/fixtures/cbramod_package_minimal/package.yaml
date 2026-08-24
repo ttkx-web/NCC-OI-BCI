@@ -1,0 +1,69 @@
+schema_version: 2
+
+package:
+  id: cbramod_loader_minimal_fixture
+  version: v1
+  is_test_head: true
+  warning_message: Test-only lightweight package fixture.
+
+model:
+  type: cbramod
+  name: cbramod-frozen-head
+  class_names:
+    - negative
+    - neutral
+    - positive
+  num_classes: 3
+  head_type: linear
+  backbone_output_dim: 200
+  head_hidden_dim_1: 8
+  head_hidden_dim_2: 4
+  head_dropout: 0.0
+
+files:
+  backbone: backbone.pt
+  classifier: classifier.pt
+  preprocessing: preprocessing.yaml
+  metrics: metrics.json
+  sha256: {}
+
+input_contract:
+  channel_names:
+    - Fz
+    - FC3
+    - FC1
+    - FCz
+    - FC2
+    - FC4
+    - C5
+    - C3
+    - C1
+    - Cz
+    - C2
+    - C4
+    - C6
+    - CP3
+    - CP1
+    - CPz
+    - CP2
+    - CP4
+    - P1
+    - Pz
+    - P2
+    - POz
+  sample_rate: 200.0
+  window_sec: 1.0
+  num_samples: 200
+  input_unit: uV
+  tensor_layout: BCTP
+  strict_window_duration: true
+  model_input_keys:
+    - signal
+
+runtime:
+  step_sec: 0.5
+  confidence_threshold: 0.0
+  command_map:
+    "0": negative
+    "1": neutral
+    "2": positive

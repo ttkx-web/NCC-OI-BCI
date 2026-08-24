@@ -16,7 +16,11 @@ import torch
 
 from _bootstrap import ROOT
 
-from bci_dayloop.data.sequential_dataset import SequentialDataset, load_sequential_dataset
+from bci_dayloop.data.sequential_dataset import (
+    SequentialDataset,
+    SequentialDatasetMetadata,
+    load_sequential_dataset,
+)
 from bci_dayloop.models.cbramod.runtime import (
     CBraModRuntime,
     build_cbramod_runtime,
@@ -35,6 +39,56 @@ DEFAULT_COMMANDS = {
     "feet": "FORWARD",
     "tongue": "STOP",
 }
+
+
+def _safe_slug(value: object) -> str:
+    characters = [
+        character.lower() if character.isalnum() else "_"
+        for character in str(value).strip()
+    ]
+    slug = "_".join(
+        part for part in "".join(characters).split("_") if part
+    )
+    if not slug:
+        raise ValueError("Package identity component must be non-empty.")
+    return slug
+
+
+def build_cbramod_package_id(
+    *,
+    metadata: SequentialDatasetMetadata,
+    training_report: Mapping[str, Any],
+    window_seconds: float,
+) -> str:
+    subject = training_report.get(
+        "target_subject", training_report.get("subject")
+    )
+    if subject is None:
+        raise ValueError(
+            "Training report must define target_subject or subject."
+        )
+
+    subject_text = str(subject).strip()
+    normalized_subject = subject_text.lower()
+    if normalized_subject.startswith("subject_"):
+        subject_text = subject_text[len("subject_") :]
+    elif normalized_subject.startswith("p") and subject_text[1:].isdigit():
+        subject_text = subject_text[1:]
+
+    subject_slug = (
+        f"{int(subject_text):02d}"
+        if subject_text.isdigit()
+        else _safe_slug(subject_text)
+    )
+    window_value = float(window_seconds)
+    if window_value <= 0:
+        raise ValueError("window_seconds must be positive.")
+
+    return (
+        f"cbramod_{_safe_slug(metadata.dataset_name)}_"
+        f"subject_{subject_slug}_population_"
+        f"{window_value:g}s_frozen_head"
+    )
 
 
 def resolve_repo_path(
@@ -1382,10 +1436,12 @@ def main() -> None:
             class_names=class_names,
             command_map=command_map,
             runtime_kwargs=runtime_kwargs,
-            package_id=(
-                "cbramod_bnci2014_001_"
-                f"subject_{int(report['target_subject']):02d}_"
-                f"population_{window_tag}_frozen_head"
+            package_id=build_cbramod_package_id(
+                metadata=metadata,
+                training_report=report,
+                window_seconds=float(
+                    runtime_kwargs["window_seconds"]
+                ),
             ),
             package_version=output_path.name,
             dataset_name=str(metadata.dataset_name),

@@ -216,3 +216,52 @@ def test_extract_first_trial_window_preserves_dataset_identity_and_samples() -> 
             window_seconds=1.0,
             anchor="end",
         )
+
+
+@pytest.mark.parametrize(
+    ("dataset_name", "target_subject", "window_seconds", "expected"),
+    [
+        (
+            "seed_emotion",
+            1,
+            2.0,
+            "cbramod_seed_emotion_subject_01_population_2s_frozen_head",
+        ),
+        (
+            "workload_pbci_hackathon",
+            "P01",
+            2.0,
+            "cbramod_workload_pbci_hackathon_"
+            "subject_01_population_2s_frozen_head",
+        ),
+        (
+            "bnci2014_001",
+            3,
+            4.0,
+            "cbramod_bnci2014_001_subject_03_population_4s_frozen_head",
+        ),
+    ],
+)
+def test_package_id_uses_sequential_dataset_identity(
+    dataset_name: str,
+    target_subject: int | str,
+    window_seconds: float,
+    expected: str,
+) -> None:
+    module = _exporter_module(
+        f"test_cbramod_package_id_{dataset_name}"
+    )
+    metadata = SequentialDatasetMetadata(
+        sample_rate=200.0,
+        channel_names=BCICIV2A_22_CHANNELS,
+        class_names=("class_0", "class_1", "class_2"),
+        unit="uV",
+        dataset_name=dataset_name,
+        window_sec=window_seconds,
+    )
+
+    assert module.build_cbramod_package_id(
+        metadata=metadata,
+        training_report={"target_subject": target_subject},
+        window_seconds=window_seconds,
+    ) == expected

@@ -12,6 +12,7 @@ from _bootstrap import ROOT
 from bci_dayloop.data.trial_reader import open_trial_reader
 from bci_dayloop.inference import MultiHeadDecodeResult, SlidingWindowDecoder
 from bci_dayloop.packages import load_multi_head_runtime_package
+from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS
 
 
 def _path(value: str) -> Path:
@@ -26,9 +27,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--package", required=True)
     parser.add_argument(
         "--input-h5",
-        default="data/processed/yaxin/smr_control_yaxin_0819_combined.h5",
+        default=DEFAULT_PATHS["input_h5"],
     )
-    parser.add_argument("--session", default="S6")
+    parser.add_argument("--session", default=DEFAULT_PATHS["session"])
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "mps"))
     parser.add_argument("--max-trials", type=int)
     return parser

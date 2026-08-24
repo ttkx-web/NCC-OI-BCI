@@ -10,10 +10,13 @@ import torch.nn as nn
 from bci_dayloop.data.trial_reader import open_trial_reader
 from bci_dayloop.inference.multi_head import (
     HeadCheckpointInfo,
+    MultiHeadPrediction,
     MultiHeadPredictor,
     TASK_OUTPUT_DIMS,
     _LoadedHead,
 )
+from bci_dayloop.applications.three_mental_states.contract import TASKS, ThreeMentalStatePrediction
+from bci_dayloop.applications.three_mental_states.predictor import ThreeMentalStatePredictor
 from bci_dayloop.models.model_50m.config import Model50MConfig
 from bci_dayloop.models.model_50m.preprocessing import PreprocessResult
 from bci_dayloop.runtime.types import RawEEGWindow
@@ -191,6 +194,13 @@ def test_predictor_uses_one_shared_feature_and_returns_stable_results() -> None:
     assert not backbone.training
     assert all(not module.training for module in modules.values())
     assert all(not parameter.requires_grad for module in modules.values() for parameter in module.parameters())
+
+
+def test_three_state_contract_order_dimensions_and_legacy_aliases() -> None:
+    assert TASKS == ("workload", "attention", "emotion")
+    assert TASK_OUTPUT_DIMS == {"workload": 2, "attention": 3, "emotion": 3}
+    assert MultiHeadPredictor is ThreeMentalStatePredictor
+    assert MultiHeadPrediction is ThreeMentalStatePrediction
 
 
 def test_predictor_fails_fast_for_incompatible_head_feature_dim() -> None:

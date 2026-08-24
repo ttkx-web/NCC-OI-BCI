@@ -1,4 +1,4 @@
-# Localhost inference service
+# 三状态 localhost inference service
 
 `scripts/serve_inference.py` exposes the formal three-head Runtime Model Package
 as a local IPC service. It listens on `127.0.0.1:8767` by default and loads the
@@ -43,10 +43,45 @@ window. NCC-OI-BCI owns channel adaptation, resampling, filtering,
 normalization, model preprocessing, and model inference. The service does not
 perform sliding-window segmentation.
 
+## 三状态调用链与脚本
+
+任务顺序固定为 `workload`、`attention`、`emotion`。各任务的类别名称与输出维度来自 Package metadata；单窗口始终只进行一次 Python 预处理、一次共享 50M Backbone forward 和每个 Head 一次 forward。
+
+```text
+HDF5 / client [C,T] window → Python channel adaptation / resample / filter / normalize
+→ shared 50M Backbone → workload, attention, emotion heads → JSON response
+```
+
+导出自包含 Package：
+
+```bash
+python scripts/export_50m_multi_head_model_package.py --output-dir model_packages/50m_three_mental_states
+```
+
+正式三状态脚本只有四个：
+
+- `scripts/export_50m_multi_head_model_package.py`
+- `scripts/serve_inference.py`
+- `scripts/run_multi_head_trials.py`
+- `scripts/verify_three_state_inference.py`
+
+统一验证脚本支持 `--mode direct|package|decoder|http|all`，并比较完整 probability vector。`http` 默认启临时 localhost 服务，也可用 `--server-url` 指向已启动服务；`--export-request` 和 `--export-reference` 可导出 fixture。
+
+```bash
+python scripts/verify_three_state_inference.py \
+  --mode http \
+  --model-package model_packages/50m_three_mental_states \
+  --input-h5 data/processed/bnci2014_001/subject_01.h5
+```
+
+此前分散的 direct、Package、Decoder 和 HTTP smoke 验证已分别合并到上述 `direct`、`package`、`decoder` 和 `http` mode。
+
+Rust/设备端只负责采集、窗口切分、单位转换和 HTTP 调用；Python Runtime 仍负责通道适配、重采样、滤波、归一化和模型推理。服务不负责滑窗切分。
+
 To make a real-data direct-vs-HTTP check with the same exact window:
 
 ```bash
-python scripts/test_inference_service_offline.py \
+python scripts/verify_three_state_inference.py --mode http \
   --model-package model_packages/50m_three_mental_states \
   --input-h5 data/processed/bnci2014_001/subject_01.h5 \
   --device cpu

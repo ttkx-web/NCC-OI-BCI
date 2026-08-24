@@ -31,7 +31,7 @@ from bci_dayloop.inference.predictor import (
     PreparedPredictor,
     RawWindowPredictor,
 )
-from bci_dayloop.inference.multi_head import MultiHeadPrediction
+from bci_dayloop.applications.three_mental_states.contract import ThreeMentalStatePrediction
 
 OnlineObservationHandler = Callable[
     [OnlineObservation, int | None],
@@ -86,7 +86,7 @@ class DecodeResult:
 class MultiHeadDecodeResult:
     """Decoder metadata paired with one shared-feature multi-head prediction."""
 
-    prediction: MultiHeadPrediction
+    prediction: ThreeMentalStatePrediction
     latency_ms: float
 
     trial_id: int | None = None

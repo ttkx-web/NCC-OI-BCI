@@ -8,6 +8,7 @@ from pathlib import Path
 from _bootstrap import ROOT
 from bci_dayloop.models.model_50m.config import Model50MConfig
 from bci_dayloop.packages.multi_head import export_50m_multi_head_runtime_package
+from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS
 
 
 def _path(value: str) -> Path:
@@ -17,10 +18,10 @@ def _path(value: str) -> Path:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export a self-contained 50M multi-head runtime package.")
-    parser.add_argument("--backbone-checkpoint", default="checkpoints/backbones/50m/model_deploy.pt")
-    parser.add_argument("--workload-head", default="checkpoints/heads/stage1/bnci2014_001/subject_01/Workload/subject_01/population/2s_flatten/head.pt")
-    parser.add_argument("--attention-head", default="checkpoints/heads/stage1/bnci2014_001/subject_01/MEMA/subject_01/population/2s_flatten/head.pt")
-    parser.add_argument("--emotion-head", default="checkpoints/heads/stage1/bnci2014_001/subject_01/SEED/subject_01/population/2s_flatten/head.pt")
+    parser.add_argument("--backbone-checkpoint", default=DEFAULT_PATHS["backbone_checkpoint"])
+    parser.add_argument("--workload-head", default=DEFAULT_PATHS["workload_head"])
+    parser.add_argument("--attention-head", default=DEFAULT_PATHS["attention_head"])
+    parser.add_argument("--emotion-head", default=DEFAULT_PATHS["emotion_head"])
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--step-sec", type=float, default=2.0)

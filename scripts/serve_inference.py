@@ -9,6 +9,7 @@ from pathlib import Path
 from _bootstrap import ROOT
 from bci_dayloop.inference.http_service import InferenceServiceRuntime, create_inference_server
 from bci_dayloop.packages import load_multi_head_runtime_package
+from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS
 
 
 def _path(value: str) -> Path:
@@ -20,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Serve one complete [C,T] EEG window through the formal multi-head runtime package."
     )
-    parser.add_argument("--model-package", default="model_packages/50m_three_mental_states")
+    parser.add_argument("--model-package", default=DEFAULT_PATHS["model_package"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8767)
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "mps"))

@@ -26,6 +26,10 @@ BNCI2014_001 四分类运动想象：
 - **CBraMod**：已完成统一 Runtime 与 NeuroOnline token 接口接入的公开基线；
 - BIOT / REVE：按后续实验需要再扩展。
 
+### 三状态推理
+
+workload、attention、emotion 使用一个共享 50M Backbone 和三个固定分类头。导出、服务、离线 trial 与等价性验证的入口分别是 `export_50m_multi_head_model_package.py`、`serve_inference.py`、`run_multi_head_trials.py` 和 `verify_three_state_inference.py`；完整调用契约见 [推理服务文档](docs/inference_service.md)。
+
 ---
 
 ## 2. 阶段进度

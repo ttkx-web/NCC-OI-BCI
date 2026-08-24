@@ -10,7 +10,7 @@ from bci_dayloop.runtime.types import (
     PreparedModelInput,
     RawEEGWindow,
 )
-from bci_dayloop.inference.multi_head import MultiHeadPrediction
+from bci_dayloop.applications.three_mental_states.contract import ThreeMentalStatePrediction
 
 
 @runtime_checkable
@@ -43,5 +43,5 @@ class RawWindowPredictor(Protocol):
     def predict(
         self,
         window: RawEEGWindow,
-    ) -> MultiHeadPrediction:
+    ) -> ThreeMentalStatePrediction:
         ...

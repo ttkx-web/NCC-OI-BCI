@@ -13,7 +13,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import test_inference_service_offline as offline  # noqa: E402
+import verify_three_state_inference as offline  # noqa: E402
 from bci_dayloop.inference.inference_schema import EEGInferenceRequest, Prediction
 
 
@@ -62,3 +62,13 @@ def test_explicit_channel_subset_preserves_requested_order() -> None:
     selected, names = offline.select_input_channels(eeg, ["Fz", "C3", "C4"], "C4,Fz")
     assert names == ["C4", "Fz"]
     np.testing.assert_array_equal(selected, eeg[[2, 0]])
+
+
+def test_verify_cli_exposes_all_modes_and_fixture_options() -> None:
+    parser = offline.build_parser()
+    assert parser.parse_args(["--mode", "direct"]).mode == "direct"
+    assert parser.parse_args(["--mode", "package"]).mode == "package"
+    assert parser.parse_args(["--mode", "decoder"]).mode == "decoder"
+    args = parser.parse_args(["--mode", "http", "--server-url", "http://127.0.0.1:8767"])
+    assert args.server_url == "http://127.0.0.1:8767"
+    assert parser.parse_args(["--mode", "all", "--export-request", "request.json"]).mode == "all"

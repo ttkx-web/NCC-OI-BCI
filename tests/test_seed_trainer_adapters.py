@@ -11,12 +11,15 @@ import pytest
 import torch
 from torch import nn
 
+from bci_dayloop.data.preprocessing import PreprocessingConfig
 from bci_dayloop.data.sequential_dataset import load_sequential_dataset
 from bci_dayloop.models.cbramod.config import (
     BCICIV2A_22_CHANNELS,
     CBraModConfig,
 )
 from bci_dayloop.models.labram_linear import LaBraMLinearAdapter
+from bci_dayloop.packages.exporter import export_labram_runtime_package
+from bci_dayloop.utils.config import load_yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -246,10 +249,15 @@ def test_seed_cbramod_trainer_and_package_contract_are_compatible(
     assert package_payload["model"]["num_classes"] == 3
     assert tuple(package_payload["model"]["class_names"]) == SEED_CLASSES
     assert package_payload["input_contract"]["window_sec"] == 2.0
+    assert package_payload["input_contract"]["sample_rate"] == 200.0
+    assert package_payload["input_contract"]["num_samples"] == 400
+    assert package_payload["input_contract"]["tensor_layout"] == "BCTP"
     assert tuple(package_payload["input_contract"]["channel_names"]) == (
         BCICIV2A_22_CHANNELS
     )
     assert preprocessing_payload["transform"]["time_segments"] == 2
+    assert preprocessing_payload["transform"]["points_per_patch"] == 200
+    assert preprocessing_payload["transform"]["normalization"] == "none"
 
 
 def test_seed_subject_session_labels_and_source_order_are_preserved(
@@ -273,3 +281,99 @@ def test_seed_subject_session_labels_and_source_order_are_preserved(
     assert not np.array_equal(s1.data, s2.data)
     with pytest.raises(ValueError, match="session is missing"):
         load_sequential_dataset(path, session="S3")
+
+
+def test_seed_trainer_clis_accept_shared_dataset_and_split_contract() -> None:
+    common = [
+        "--data-root",
+        "data/processed/seed",
+        "--data-pattern",
+        "subject_{subject:02d}.h5",
+        "--subjects",
+        "1",
+        "2",
+        "3",
+        "--target-subject",
+        "1",
+        "--train-session",
+        "S1",
+        "--validation-session",
+        "S2",
+        "--final-test-session",
+        "S3",
+    ]
+    labram = _script_module(
+        "train_labram_population_head.py", "test_seed_labram_cli"
+    )
+    labram_args = labram.build_parser().parse_args(
+        [*common, "--dataset-name", "seed", "--window-sec", "2"]
+    )
+    assert labram_args.dataset_name == "seed"
+    assert labram_args.subjects == [1, 2, 3]
+    assert (
+        labram_args.train_session,
+        labram_args.validation_session,
+        labram_args.final_test_session,
+    ) == ("S1", "S2", "S3")
+    assert labram_args.window_sec == 2.0
+
+    cbramod = _script_module(
+        "train_cbramod_population_head.py", "test_seed_cbramod_cli"
+    )
+    cbramod_args = cbramod.build_argument_parser().parse_args(
+        [*common, "--window-sec", "2"]
+    )
+    assert cbramod_args.subjects == [1, 2, 3]
+    assert (
+        cbramod_args.train_session,
+        cbramod_args.validation_session,
+        cbramod_args.final_test_session,
+    ) == ("S1", "S2", "S3")
+    assert cbramod_args.window_seconds == 2.0
+
+
+def test_seed_labram_runtime_package_export_contract(
+    tmp_path: Path,
+) -> None:
+    adapter = LaBraMLinearAdapter(
+        channel_names=list(BCICIV2A_22_CHANNELS),
+        n_classes=len(SEED_CLASSES),
+        device="cpu",
+        amp=False,
+        freeze_encoder=True,
+        n_patches=2,
+        encoder=_TinyLaBraMEncoder(),
+    )
+    source_backbone = tmp_path / "seed_labram_backbone.pt"
+    source_classifier = tmp_path / "seed_labram_head.pt"
+    source_backbone.write_bytes(b"synthetic-backbone-provenance")
+    source_classifier.write_bytes(b"synthetic-head-provenance")
+
+    package_dir = export_labram_runtime_package(
+        output_dir=tmp_path / "seed_labram_package",
+        adapter=adapter,
+        backbone_checkpoint=source_backbone,
+        classifier_checkpoint=source_classifier,
+        preprocessing_config=PreprocessingConfig(
+            target_sample_rate=200.0,
+            patch_samples=200,
+        ),
+        class_names=SEED_CLASSES,
+        command_map={},
+        dataset_name="seed",
+        package_id="labram_seed_subject_01_population_2s",
+        package_version="v1",
+    )
+
+    payload = load_yaml(package_dir / "package.yaml")
+    contract = payload["input_contract"]
+    assert payload["schema_version"] == 2
+    assert payload["model"]["type"] == "labram"
+    assert payload["model"]["dataset"] == "seed"
+    assert payload["model"]["class_names"] == list(SEED_CLASSES)
+    assert payload["model"]["num_classes"] == 3
+    assert contract["channel_names"] == list(BCICIV2A_22_CHANNELS)
+    assert contract["sample_rate"] == 200.0
+    assert contract["window_sec"] == 2.0
+    assert contract["num_samples"] == 400
+    assert contract["tensor_layout"] == "BCTP"

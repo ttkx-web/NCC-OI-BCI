@@ -69,6 +69,34 @@ def resolve_repo_path(
     return path.resolve()
 
 
+def resolve_default_artifact_paths(
+    *,
+    metadata: SequentialDatasetMetadata,
+    target_subject: int,
+    window_seconds: float,
+) -> tuple[Path, Path]:
+    dataset_name = str(metadata.dataset_name).strip()
+    if not dataset_name:
+        raise ValueError("Loaded dataset_name must be non-empty.")
+
+    return (
+        population_head_path(
+            stage="stage0",
+            dataset=dataset_name,
+            subject_id=target_subject,
+            window_seconds=window_seconds,
+            aggregation="labram",
+        ),
+        population_run_dir(
+            stage="stage0",
+            dataset=dataset_name,
+            subject_id=target_subject,
+            window_seconds=window_seconds,
+            aggregation="labram",
+        ),
+    )
+
+
 def current_git_commit() -> str | None:
     try:
         result = subprocess.run(
@@ -962,31 +990,25 @@ def main() -> None:
         for subject in subjects
     }
 
+    identity_metadata = load_sequential_dataset(
+        subject_paths[population_subjects[0]],
+        session=split_plan.train_session,
+    ).metadata
+    default_output_path, default_run_dir = resolve_default_artifact_paths(
+        metadata=identity_metadata,
+        target_subject=target_subject,
+        window_seconds=args.window_sec,
+    )
+
     if args.output is None:
-        output_path = population_head_path(
-            stage="stage0",
-            dataset=args.dataset_name,
-            subject_id=target_subject,
-            window_seconds=(
-                args.window_sec
-            ),
-            aggregation="labram",
-        )
+        output_path = default_output_path
     else:
         output_path = resolve_repo_path(
             args.output
         )
 
     if args.run_dir is None:
-        run_dir = population_run_dir(
-            stage="stage0",
-            dataset=args.dataset_name,
-            subject_id=target_subject,
-            window_seconds=(
-                args.window_sec
-            ),
-            aggregation="labram",
-        )
+        run_dir = default_run_dir
     else:
         run_dir = resolve_repo_path(
             args.run_dir
@@ -1044,6 +1066,7 @@ def main() -> None:
 
     run_config   = {
         "status": "started",
+        "dataset": str(identity_metadata.dataset_name),
         "created_at": (
             datetime.now().isoformat()
         ),

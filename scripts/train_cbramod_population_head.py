@@ -230,6 +230,39 @@ def resolve_repo_path(
     return path.resolve()
 
 
+def resolve_default_artifact_paths(
+    *,
+    metadata: SequentialDatasetMetadata,
+    target_subject: int,
+    window_tag: str,
+) -> tuple[Path, Path]:
+    dataset_name = str(metadata.dataset_name).strip()
+    if not dataset_name:
+        raise ValueError("Loaded dataset_name must be non-empty.")
+
+    run_dir = (
+        ROOT
+        / "runs"
+        / "stage1"
+        / dataset_name
+        / f"subject_{target_subject:02d}"
+        / "cbramod"
+        / window_tag
+    )
+    head_path = (
+        ROOT
+        / "checkpoints"
+        / "heads"
+        / "stage1"
+        / dataset_name
+        / f"subject_{target_subject:02d}"
+        / "cbramod"
+        / window_tag
+        / "head.pt"
+    )
+    return head_path, run_dir
+
+
 def atomic_write_json(
     path: Path,
     payload: Mapping[str, Any],
@@ -1481,45 +1514,6 @@ def main() -> None:
             f"{checkpoint_path}"
         )
 
-    default_run_dir = (
-        ROOT
-        / "runs"
-        / "stage1"
-        / "bnci2014_001"
-        / f"subject_{target_subject:02d}"
-        / "cbramod"
-        / window_tag
-    )
-
-    run_dir = (
-        resolve_repo_path(args.run_dir)
-        if args.run_dir is not None
-        else default_run_dir
-    )
-
-    default_head_path = (
-        ROOT
-        / "checkpoints"
-        / "heads"
-        / "stage1"
-        / "bnci2014_001"
-        / f"subject_{target_subject:02d}"
-        / "cbramod"
-        / window_tag
-        / "head.pt"
-    )
-
-    output_head_path = (
-        resolve_repo_path(args.output_head)
-        if args.output_head is not None
-        else default_head_path
-    )
-
-    run_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
     class_names: tuple[str, ...] | None = None
     reference_metadata: SequentialDatasetMetadata | None = None
     subject_paths: dict[int, Path] = {}
@@ -1557,6 +1551,26 @@ def main() -> None:
         raise RuntimeError(
             "Could not resolve dataset metadata."
         )
+
+    default_head_path, default_run_dir = resolve_default_artifact_paths(
+        metadata=reference_metadata,
+        target_subject=target_subject,
+        window_tag=window_tag,
+    )
+    run_dir = (
+        resolve_repo_path(args.run_dir)
+        if args.run_dir is not None
+        else default_run_dir
+    )
+    output_head_path = (
+        resolve_repo_path(args.output_head)
+        if args.output_head is not None
+        else default_head_path
+    )
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
 
     config = CBraModConfig(
@@ -1603,6 +1617,7 @@ def main() -> None:
 
     run_config = {
         "model_name": "cbramod-frozen-head",
+        "dataset": str(reference_metadata.dataset_name),
         "target_subject": target_subject,
         "population_subjects": population_subjects,
         "train_session": args.train_session,
@@ -1939,6 +1954,7 @@ def main() -> None:
         config=config,
         class_names=class_names,
         extra_metadata={
+            "dataset": str(reference_metadata.dataset_name),
             "target_subject": target_subject,
             "population_training_subjects": (
                 population_subjects
@@ -1983,6 +1999,7 @@ def main() -> None:
 
     report = {
         "model_name": "cbramod-frozen-head",
+        "dataset": str(reference_metadata.dataset_name),
         "protocol": "LOSO population head",
         "target_subject": target_subject,
         "population_training_subjects": population_subjects,

@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,60 @@ DEFAULT_COMMANDS = {
     "feet": "FORWARD",
     "tongue": "STOP",
 }
+
+
+def _safe_slug(value: object) -> str:
+    slug = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        str(value).strip().lower(),
+    ).strip("_")
+    if not slug:
+        raise ValueError("Package identity field cannot be empty.")
+    return slug
+
+
+def build_labram_package_id(
+    *,
+    dataset_name: str,
+    metadata: Mapping[str, Any],
+) -> str:
+    subject = metadata.get(
+        "target_subject",
+        metadata.get("subject"),
+    )
+    if subject is None:
+        raise ValueError(
+            "LaBraM head metadata must contain target_subject or subject."
+        )
+
+    subject_text = str(subject).strip()
+    subject_match = re.fullmatch(
+        r"(?:subject[_-]?|p)?0*(\d+)",
+        subject_text,
+        flags=re.IGNORECASE,
+    )
+    subject_slug = (
+        f"{int(subject_match.group(1)):02d}"
+        if subject_match is not None
+        else _safe_slug(subject_text)
+    )
+
+    window_seconds = float(metadata["window_seconds"])
+    if not np.isfinite(window_seconds) or window_seconds <= 0:
+        raise ValueError(
+            "LaBraM head metadata window_seconds must be finite and positive."
+        )
+    window_slug = (
+        str(int(round(window_seconds)))
+        if np.isclose(window_seconds, round(window_seconds))
+        else format(window_seconds, "g").replace(".", "p")
+    )
+
+    return (
+        f"labram_{_safe_slug(dataset_name)}_"
+        f"subject_{subject_slug}_population_{window_slug}s"
+    )
 
 
 def resolve_repo_path(
@@ -398,9 +454,11 @@ def main() -> None:
                 dataset_name=str(
                     data_metadata.dataset_name
                 ),
-                package_id=(
-                    "labram_bnci2014_001_"
-                    "subject_01_population_4s"
+                package_id=build_labram_package_id(
+                    dataset_name=str(
+                        data_metadata.dataset_name
+                    ),
+                    metadata=metadata,
                 ),
                 package_version=(
                     output_path.name

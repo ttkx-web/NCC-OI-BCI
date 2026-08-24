@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -85,6 +86,24 @@ def _write_workload(path: Path) -> Path:
     )
 
 
+def _write_seed(path: Path) -> Path:
+    data = np.arange(3 * 2 * 4, dtype=np.float32).reshape(3, 2, 4)
+    with h5py.File(path, "w") as handle:
+        handle.attrs["dataset_name"] = "seed"
+        handle.attrs["subject_id"] = "SEED-01"
+        handle.attrs["class_names"] = json.dumps(["negative", "neutral", "positive"])
+        handle.attrs["unit"] = "uV"
+        handle.attrs["window_sec"] = 2.0
+        group = handle.create_group("sessions").create_group("session_1")
+        group.attrs["sample_rate"] = 2.0
+        group.attrs["channel_names"] = json.dumps(["FP1", "FP2"])
+        group.create_dataset("data", data=data)
+        group.create_dataset("labels", data=np.asarray([2, 0, 1], dtype=np.int64))
+        group.create_dataset("trial_ids", data=np.asarray([b"trial-30", b"trial-10", b"trial-20"]))
+        group.create_dataset("trial_ordinals", data=np.asarray([1, 2, 3], dtype=np.int64))
+    return path
+
+
 def test_bnci_adapter_preserves_four_second_hdf5_order(tmp_path: Path) -> None:
     dataset = load_sequential_dataset(_write_bnci(tmp_path / "bnci.h5"), session="1test")
 
@@ -127,6 +146,32 @@ def test_workload_adapter_rejects_noncausal_trial_ordinals(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="trial_ordinals must preserve"):
         load_sequential_dataset(path, session="S1")
+
+
+def test_seed_adapter_preserves_trials_metadata_and_chronological_order(
+    tmp_path: Path,
+) -> None:
+    path = _write_seed(tmp_path / "seed.h5")
+    dataset = load_sequential_dataset(path, session="session_1")
+
+    assert dataset.metadata.dataset_name == "seed"
+    assert dataset.metadata.sample_rate == pytest.approx(2.0)
+    assert dataset.metadata.channel_names == ("FP1", "FP2")
+    assert dataset.metadata.class_names == ("negative", "neutral", "positive")
+    assert dataset.metadata.unit == "uV"
+    assert dataset.subject_ids.tolist() == ["SEED-01"] * 3
+    assert dataset.session_ids.tolist() == ["session_1"] * 3
+    assert dataset.trial_ids.tolist() == ["trial-30", "trial-10", "trial-20"]
+    assert dataset.labels.tolist() == [2, 0, 1]
+    assert dataset.trial_ordinals.tolist() == [1, 2, 3]
+    assert dataset.window_ids.tolist() == [
+        "SEED-01:session_1:trial-30",
+        "SEED-01:session_1:trial-10",
+        "SEED-01:session_1:trial-20",
+    ]
+    assert dataset.data.shape == (3, 2, 4)
+    with h5py.File(path, "r") as handle:
+        np.testing.assert_array_equal(dataset.data, handle["sessions"]["session_1"]["data"][:])
 
 
 def test_dataset_package_window_mismatch_is_fail_closed(tmp_path: Path) -> None:

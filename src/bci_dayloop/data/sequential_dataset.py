@@ -289,6 +289,109 @@ def _load_workload_hdf5(path: Path, *, session: str) -> SequentialDataset:
     return dataset
 
 
+def _decode_json_attribute(
+    attributes: h5py.AttributeManager,
+    key: str,
+) -> tuple[str, ...]:
+    if key not in attributes:
+        raise ValueError(f"SEED HDF5 is missing required attribute: {key}.")
+    raw_value = attributes[key]
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8")
+    try:
+        values = json.loads(str(raw_value))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"SEED HDF5 attribute {key} must be a JSON array."
+        ) from error
+    if not isinstance(values, list) or not values:
+        raise ValueError(
+            f"SEED HDF5 attribute {key} must be a non-empty JSON array."
+        )
+    return tuple(str(value) for value in values)
+
+
+def _seed_subject_id(attributes: h5py.AttributeManager) -> str:
+    for key in ("subject_id", "subject"):
+        if key in attributes:
+            value = attributes[key]
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            subject_id = str(value).strip()
+            if subject_id:
+                return subject_id
+    raise ValueError(
+        "SEED HDF5 requires a non-empty root subject_id or subject attribute."
+    )
+
+
+def _load_seed_hdf5(path: Path, *, session: str) -> SequentialDataset:
+    """Load persisted SEED trials without changing their chronological rows."""
+    with h5py.File(path, "r") as handle:
+        sessions = handle.get("sessions")
+        if not isinstance(sessions, h5py.Group) or session not in sessions:
+            raise ValueError(f"SEED HDF5 session is missing: {session!r}.")
+        group = sessions[session]
+        if not isinstance(group, h5py.Group):
+            raise ValueError(f"SEED HDF5 session is not a group: {session!r}.")
+        for key in ("data", "labels", "trial_ids", "trial_ordinals"):
+            if key not in group:
+                raise ValueError(
+                    f"SEED HDF5 session {session!r} is missing required dataset: {key}."
+                )
+        if "sample_rate" not in group.attrs:
+            raise ValueError(
+                f"SEED HDF5 session {session!r} is missing required attribute: sample_rate."
+            )
+        if "unit" not in handle.attrs:
+            raise ValueError("SEED HDF5 is missing required root attribute: unit.")
+        if "window_sec" not in handle.attrs:
+            raise ValueError("SEED HDF5 is missing required root attribute: window_sec.")
+
+        data = np.asarray(group["data"], dtype=np.float32)
+        num_trials = int(data.shape[0]) if data.ndim >= 1 else 0
+        subject_id = _seed_subject_id(handle.attrs)
+        common_metadata = SequentialDatasetMetadata(
+            sample_rate=float(group.attrs["sample_rate"]),
+            channel_names=_decode_json_attribute(group.attrs, "channel_names"),
+            class_names=_decode_json_attribute(handle.attrs, "class_names"),
+            unit=str(handle.attrs["unit"]),
+            dataset_name="seed",
+            window_sec=float(handle.attrs["window_sec"]),
+        )
+        trial_ids = _as_trial_vector(
+            group["trial_ids"], name="trial_ids", expected=num_trials
+        ).astype(str)
+        labels = _as_trial_vector(
+            group["labels"], name="labels", expected=num_trials
+        )
+        trial_ordinals = _as_trial_vector(
+            group["trial_ordinals"],
+            name="trial_ordinals",
+            expected=num_trials,
+        )
+
+    dataset = SequentialDataset(
+        metadata=common_metadata,
+        data=data,
+        labels=labels,
+        subject_ids=np.repeat(
+            np.asarray([subject_id], dtype=str), num_trials
+        ),
+        session_ids=np.repeat(
+            np.asarray([str(session)], dtype=str), num_trials
+        ),
+        trial_ids=trial_ids,
+        trial_ordinals=trial_ordinals,
+        window_ids=np.asarray(
+            [f"{subject_id}:{session}:{trial_id}" for trial_id in trial_ids],
+            dtype=str,
+        ),
+    )
+    _validate_dataset(dataset)
+    return dataset
+
+
 def load_sequential_dataset(
     path: str | Path,
     *,
@@ -303,17 +406,24 @@ def load_sequential_dataset(
     with h5py.File(target, "r") as handle:
         has_flat_eeg = "data" in handle
         has_workload_sessions = "sessions" in handle
+        dataset_name = str(handle.attrs.get("dataset_name", "")).strip().lower()
     if has_flat_eeg == has_workload_sessions:
         raise ValueError(
             "Unsupported sequential HDF5 layout: expected exactly one of "
             "root /data or grouped /sessions."
         )
 
-    dataset = (
-        _load_eeg_hdf5(target, session=session)
-        if has_flat_eeg
-        else _load_workload_hdf5(target, session=session)
-    )
+    if has_flat_eeg:
+        dataset = _load_eeg_hdf5(target, session=session)
+    elif dataset_name == "workload_pbci_hackathon":
+        dataset = _load_workload_hdf5(target, session=session)
+    elif dataset_name == "seed":
+        dataset = _load_seed_hdf5(target, session=session)
+    else:
+        raise ValueError(
+            "Unsupported grouped sequential dataset_name: "
+            f"{dataset_name!r}."
+        )
     return _limit_prefix(dataset, max_trials)
 
 

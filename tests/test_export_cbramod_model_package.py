@@ -153,12 +153,24 @@ def test_workload_training_report_package_and_reload_contract_parity(
         return sentinel
 
     monkeypatch.setattr(module, "build_cbramod_runtime", fake_build_runtime)
+    module.build_cbramod_runtime(
+        checkpoint_path=backbone,
+        classifier_path=classifier,
+        class_names=("low_workload", "high_workload"),
+        device="cpu",
+        **module.runtime_build_kwargs(runtime_kwargs),
+    )
+    assert "source_unit" not in captured
+    assert captured["standard_channels"] == BCICIV2A_22_CHANNELS
+
+    captured.clear()
     loaded = module.load_package_runtime_for_smoke_test(
         package_path=package_dir,
         device="cpu",
         verify_hashes=True,
     )
     assert loaded is sentinel
+    assert "source_unit" not in captured
     assert captured["input_unit"] == "uV"
     assert captured["normalization"] == "fixed_100uv"
     assert captured["window_seconds"] == 2.0
@@ -204,4 +216,3 @@ def test_extract_first_trial_window_preserves_dataset_identity_and_samples() -> 
             window_seconds=1.0,
             anchor="end",
         )
-

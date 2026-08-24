@@ -376,6 +376,17 @@ def runtime_kwargs_from_training_report(
     }
 
 
+def runtime_build_kwargs(
+    runtime_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Remove provenance-only fields before constructing a Runtime."""
+    return {
+        key: value
+        for key, value in runtime_kwargs.items()
+        if key != "source_unit"
+    }
+
+
 def extract_first_trial_window(
     *,
     dataset: SequentialDataset,
@@ -1315,11 +1326,7 @@ def main() -> None:
         classifier_path=classifier_path,
         class_names=class_names,
         device=args.device,
-        **{
-            key: value
-            for key, value in runtime_kwargs.items()
-            if key != "standard_channels"
-        },
+        **runtime_build_kwargs(runtime_kwargs),
     )
 
     raw_window = extract_first_trial_window(

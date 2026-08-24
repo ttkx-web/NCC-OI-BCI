@@ -8,8 +8,9 @@ from pathlib import Path
 
 from _bootstrap import ROOT
 from bci_dayloop.inference.http_service import InferenceServiceRuntime, create_inference_server
-from bci_dayloop.packages import load_multi_head_runtime_package
-from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS
+from bci_dayloop.packages import load_inference_package
+from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS, TASKS
+from bci_dayloop.packages.inference import THREE_MENTAL_STATES_PREDICTION_MODE
 
 
 def _path(value: str) -> Path:
@@ -35,11 +36,14 @@ def main() -> None:
 
     package_path = _path(args.model_package)
     # Loading happens exactly once, before the server accepts any HTTP request.
-    predictor = load_multi_head_runtime_package(package_path, device=args.device)
+    loaded = load_inference_package(package_path, device=args.device)
+    if loaded.prediction_mode != THREE_MENTAL_STATES_PREDICTION_MODE or tuple(task.task_id for task in loaded.tasks) != TASKS:
+        raise ValueError("serve_inference.py requires a three-mental-state Runtime Package (workload, attention, emotion).")
+    predictor = loaded.predictor
     runtime = InferenceServiceRuntime(
         predictor=predictor,
         model_package=str(package_path),
-        device=str(predictor.device),
+        device=str(getattr(predictor, "device")),
     )
     server = create_inference_server(args.host, args.port, runtime)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

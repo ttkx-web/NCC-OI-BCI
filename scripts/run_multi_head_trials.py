@@ -11,8 +11,9 @@ import numpy as np
 from _bootstrap import ROOT
 from bci_dayloop.data.trial_reader import open_trial_reader
 from bci_dayloop.inference import MultiHeadDecodeResult, SlidingWindowDecoder
-from bci_dayloop.packages import load_multi_head_runtime_package
-from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS
+from bci_dayloop.packages import load_inference_package
+from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS, TASKS
+from bci_dayloop.packages.inference import THREE_MENTAL_STATES_PREDICTION_MODE
 
 
 def _path(value: str) -> Path:
@@ -81,7 +82,10 @@ def main() -> None:
         data = data[:args.max_trials]
         trial_ids = trial_ids[:args.max_trials]
 
-    predictor = load_multi_head_runtime_package(package_path, device=args.device)
+    loaded = load_inference_package(package_path, device=args.device)
+    if loaded.prediction_mode != THREE_MENTAL_STATES_PREDICTION_MODE or tuple(task.task_id for task in loaded.tasks) != TASKS:
+        raise ValueError("run_multi_head_trials.py requires workload, attention, emotion tasks.")
+    predictor = loaded.predictor
     decoder = SlidingWindowDecoder(
         predictor=predictor,
         channel_names=reader.metadata.channel_names,

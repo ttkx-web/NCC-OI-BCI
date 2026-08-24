@@ -58,6 +58,26 @@ HDF5 / client [C,T] window → Python channel adaptation / resample / filter / n
 python scripts/export_50m_multi_head_model_package.py --output-dir model_packages/50m_three_mental_states
 ```
 
+导出参数默认来自 `configs/three_mental_states/export.yaml`（Backbone、三个 Head、50M runtime 契约和 Package 标识）。显式 CLI 参数优先于 YAML，例如：
+
+```bash
+python scripts/export_50m_multi_head_model_package.py \
+  --package-version 2 \
+  --overwrite
+```
+
+也可以仅使用该 YAML：
+
+```bash
+python scripts/export_50m_multi_head_model_package.py
+```
+
+导出 YAML 仅用于从训练产物构建 Package；部署只需要生成的 Runtime Model Package，不需要 YAML 或训练 checkpoint。
+
+Python 推理调用方可使用 `load_inference_package(...)` 统一读取单头 50M、LaBraM、CBraMod 和三状态 Package。它按 `package.yaml` 的 `model.type` 分发到既有 loader，并返回路径、输入契约、window/step、predictor 与 task class names。`load_runtime_package(...)` 和 `load_multi_head_runtime_package(...)` 仍保留，以保证现有调用方兼容。
+
+三状态脚本会在加载后确认 prediction mode 与任务顺序为 workload、attention、emotion；将单头 Package 传给三状态服务会在 HTTP server 启动前直接失败。
+
 正式三状态脚本只有四个：
 
 - `scripts/export_50m_multi_head_model_package.py`

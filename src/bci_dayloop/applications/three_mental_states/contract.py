@@ -18,10 +18,6 @@ SHARED_FEATURE_CONTRACT: dict[str, Any] = {
 }
 
 DEFAULT_PATHS = {
-    "backbone_checkpoint": "checkpoints/backbones/50m/model_deploy.pt",
-    "workload_head": "checkpoints/heads/stage1/bnci2014_001/subject_01/Workload/subject_01/population/2s_flatten/head.pt",
-    "attention_head": "checkpoints/heads/stage1/bnci2014_001/subject_01/MEMA/subject_01/population/2s_flatten/head.pt",
-    "emotion_head": "checkpoints/heads/stage1/bnci2014_001/subject_01/SEED/subject_01/population/2s_flatten/head.pt",
     "input_h5": "data/processed/yaxin/smr_control_yaxin_0819_combined.h5",
     "model_package": "model_packages/50m_three_mental_states",
     "session": "S6",

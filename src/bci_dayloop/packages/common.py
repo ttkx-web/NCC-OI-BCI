@@ -25,7 +25,7 @@ def safe_torch_load(path: Path) -> Mapping[str, Any]:
 
 def required_mapping(payload: Mapping[str, Any], key: str, *, source: Path) -> dict[str, Any]:
     value = payload.get(key)
-    if not isinstance(value, Mapping):
+    if not isinstance(value, dict):
         raise ValueError(f"{source} field {key!r} must be a mapping.")
     return dict(value)
 

@@ -8,19 +8,22 @@ from urllib.request import Request, urlopen
 import numpy as np
 from _bootstrap import ROOT
 from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS, TASKS
+from bci_dayloop.applications.three_mental_states.export_config import load_three_mental_state_export_config
 from bci_dayloop.applications.three_mental_states.predictor import ThreeMentalStatePredictor
 from bci_dayloop.applications.three_mental_states.service import EEGInferenceRequest, EEGInferenceResponse, InferenceServiceRuntime, Prediction, SCHEMA_VERSION, create_inference_server, infer_eeg_window, named_predictions
 from bci_dayloop.data.trial_reader import open_trial_reader
 from bci_dayloop.inference import MultiHeadDecodeResult, SlidingWindowDecoder
-from bci_dayloop.packages import load_multi_head_runtime_package
+from bci_dayloop.packages import load_inference_package
+from bci_dayloop.packages.inference import THREE_MENTAL_STATES_PREDICTION_MODE
 from bci_dayloop.runtime.types import RawEEGWindow
 def _path(value: str) -> Path:
     path = Path(value).expanduser(); return path if path.is_absolute() else (ROOT / path).resolve()
 def build_parser() -> argparse.ArgumentParser:
+    export_defaults = load_three_mental_state_export_config().sources
     parser = argparse.ArgumentParser(description="Verify equivalent three-mental-state inference paths.")
     parser.add_argument("--mode", choices=("direct", "package", "decoder", "http", "all"), default="all")
     parser.add_argument("--input-h5", default=DEFAULT_PATHS["input_h5"]); parser.add_argument("--session", default=DEFAULT_PATHS["session"]); parser.add_argument("--trial-index", type=int, default=0)
-    parser.add_argument("--backbone-checkpoint", default=DEFAULT_PATHS["backbone_checkpoint"]); parser.add_argument("--workload-head", default=DEFAULT_PATHS["workload_head"]); parser.add_argument("--attention-head", default=DEFAULT_PATHS["attention_head"]); parser.add_argument("--emotion-head", default=DEFAULT_PATHS["emotion_head"])
+    parser.add_argument("--backbone-checkpoint", default=str(export_defaults.backbone_checkpoint)); parser.add_argument("--workload-head", default=str(export_defaults.workload_head)); parser.add_argument("--attention-head", default=str(export_defaults.attention_head)); parser.add_argument("--emotion-head", default=str(export_defaults.emotion_head))
     parser.add_argument("--model-package", "--package", dest="model_package", default=DEFAULT_PATHS["model_package"]); parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cpu"); parser.add_argument("--server-url")
     parser.add_argument("--input-channels", help="Optional comma-separated source channel subset."); parser.add_argument("--export-request"); parser.add_argument("--export-reference"); parser.add_argument("--export-only", action="store_true")
     return parser
@@ -73,7 +76,10 @@ def main() -> None:
     if any(mode in modes for mode in ("direct","package","decoder")):
         direct=ThreeMentalStatePredictor.from_checkpoints(backbone_checkpoint=_path(args.backbone_checkpoint),workload_head=_path(args.workload_head),attention_head=_path(args.attention_head),emotion_head=_path(args.emotion_head),device=args.device)
         direct_result=direct.predict(RawEEGWindow(data=eeg,channel_names=names,sample_rate=request.sample_rate_hz,unit="uV")); summary["checks"]["direct"]={"prediction":_json({task:getattr(direct_result,task).probabilities for task in TASKS})}
-    if "package" in modes or "decoder" in modes or "http" in modes: packaged=load_multi_head_runtime_package(_path(args.model_package),device=args.device)
+    if "package" in modes or "decoder" in modes or "http" in modes:
+        loaded_package=load_inference_package(_path(args.model_package),device=args.device)
+        if loaded_package.prediction_mode != THREE_MENTAL_STATES_PREDICTION_MODE or tuple(task.task_id for task in loaded_package.tasks) != TASKS: raise ValueError("verify_three_state_inference.py requires workload, attention, emotion tasks.")
+        packaged=loaded_package.predictor
     if "package" in modes:
         assert direct is not None and packaged is not None; summary["checks"]["package"]={"max_probability_error":_assert_equal(direct_result,packaged.predict(RawEEGWindow(data=eeg,channel_names=names,sample_rate=request.sample_rate_hz,unit="uV")))}
     if "decoder" in modes:

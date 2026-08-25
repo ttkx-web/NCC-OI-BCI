@@ -274,6 +274,15 @@ def save_training_artifacts(inputs: TrainingArtifactInputs) -> TrainingArtifactR
     }
     selected_val = inputs.selected_val_metrics.to_dict()
     target_final = inputs.target_metrics.to_dict()
+    saved_lora_state = (
+        lora_state_dict(inputs.classifier.backbone.model)
+        if inputs.lora_enabled
+        else None
+    )
+    if inputs.lora_enabled and not saved_lora_state:
+        raise RuntimeError(
+            "Refusing to save a LoRA checkpoint without injected adapter state."
+        )
 
     saved_path = save_classifier_checkpoint(
         classifier=inputs.classifier,
@@ -366,11 +375,7 @@ def save_training_artifacts(inputs: TrainingArtifactInputs) -> TrainingArtifactR
             if inputs.partial_finetuning_enabled
             else None
         ),
-        lora_state_dict=(
-            lora_state_dict(inputs.classifier.backbone.model)
-            if inputs.lora_enabled
-            else None
-        ),
+        lora_state_dict=saved_lora_state,
     )
 
     metrics_csv = inputs.run_dir / "epoch_metrics.csv"

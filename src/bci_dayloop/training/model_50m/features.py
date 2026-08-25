@@ -1,8 +1,7 @@
 """Frozen 50M feature extraction and feature-cache artifacts.
 
 This module deliberately handles only detached frozen-backbone features. Live
-partial-finetune and LoRA forwards remain in the training runner until their
-adaptation layer is extracted.
+partial-finetune and LoRA forwards are owned by ``adaptation.py``.
 """
 
 from __future__ import annotations

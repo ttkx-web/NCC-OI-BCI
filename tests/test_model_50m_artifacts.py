@@ -50,6 +50,15 @@ def test_population_artifact_writer_preserves_mode_specific_checkpoint_contract(
         return path
 
     monkeypatch.setattr(artifacts, "save_classifier_checkpoint", fake_save_classifier_checkpoint)
+    if lora_enabled:
+        monkeypatch.setattr(
+            artifacts,
+            "lora_state_dict",
+            lambda _model: {
+                "encoder.layers.7.self_attn.parametrizations.in_proj_weight.0.lora_A": torch.ones(1),
+                "encoder.layers.7.self_attn.parametrizations.in_proj_weight.0.lora_B": torch.zeros(1),
+            },
+        )
 
     class FakeClassifier:
         device = torch.device("cpu")

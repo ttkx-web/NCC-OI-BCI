@@ -121,18 +121,20 @@ def configure_adaptation(
 ) -> AdaptationSetup:
     """Apply the established partial/LoRA scope and validate its parameters."""
     lora_report = None
-    # Preserve the existing branch order exactly for compatibility.
-    if plan.requires_live_backbone_forward:
-        backbone.set_trainable_encoder_blocks(plan.trainable_block_indices)
-    elif plan.lora_enabled:
+    # The modes are mutually exclusive: both partial and LoRA need a live
+    # backbone forward, but only LoRA injects adapter parametrizations.
+    if plan.lora_enabled:
+        normalized_lora_targets = normalize_lora_target_modules(lora_target_modules)
         lora_report = inject_lora_adapters(
             backbone,
             block_indices=plan.trainable_block_indices,
-            target_modules=lora_target_modules,
+            target_modules=normalized_lora_targets,
             rank=lora_rank,
             alpha=lora_alpha,
             dropout=lora_dropout,
         )
+    elif plan.partial_finetuning_enabled:
+        backbone.set_trainable_encoder_blocks(plan.trainable_block_indices)
     else:
         backbone.set_trainable_encoder_blocks(())
     classifier.eval()
@@ -193,6 +195,34 @@ def configure_adaptation(
         != plan.trainable_block_indices
     ):
         raise RuntimeError("Backbone did not retain the requested trainable encoder blocks.")
+    if plan.lora_enabled:
+        if lora_report is None or not lora_report.adapter_modules:
+            raise RuntimeError("LoRA adaptation did not inject any adapter modules.")
+        if tuple(lora_report.block_indices) != plan.trainable_block_indices:
+            raise RuntimeError("Injected LoRA block indices differ from the adaptation plan.")
+        if lora_report.target_modules != normalized_lora_targets:
+            raise RuntimeError("Injected LoRA targets differ from the requested targets.")
+        if not lora_parameters or not lora_parameter_ids:
+            raise RuntimeError("LoRA adaptation did not expose trainable adapter parameters.")
+        if trainable_lora_parameter_count <= 0:
+            raise RuntimeError("LoRA adaptation has no trainable adapter parameters.")
+        if trainable_backbone_parameters or trainable_original_backbone_parameter_count:
+            raise RuntimeError("LoRA adaptation must freeze all original backbone parameters.")
+        if any(not parameter.requires_grad for parameter in lora_parameters):
+            raise RuntimeError("LoRA adapter parameters must require gradients.")
+        if any(
+            parameter.requires_grad
+            for parameter in backbone.parameters()
+            if id(parameter) not in lora_parameter_ids
+        ):
+            raise RuntimeError("LoRA adaptation left an original backbone parameter trainable.")
+        if any(not parameter.requires_grad for parameter in classifier.head.parameters()):
+            raise RuntimeError("Classification head parameters must require gradients in LoRA mode.")
+        saved_lora_state = lora_state_dict(backbone.model)
+        if not saved_lora_state or not any(
+            key.endswith(".lora_A") for key in saved_lora_state
+        ) or not any(key.endswith(".lora_B") for key in saved_lora_state):
+            raise RuntimeError("LoRA adaptation did not produce a complete adapter state.")
     return AdaptationSetup(
         lora_report=lora_report,
         lora_parameters=lora_parameters,

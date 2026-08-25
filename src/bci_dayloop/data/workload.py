@@ -651,7 +651,7 @@ def verify_workload_hdf5(path: str | Path, *, expected_sessions: Sequence[str]) 
                     for source_index in range(len(window_ids) // 2)
                     for condition in (EASY_CONDITION, DIFF_CONDITION)
                 ],
-                dtype=str,
+                dtype=object,
             )
             if not np.array_equal(window_ids, expected_window_ids):
                 raise ValueError(
@@ -764,5 +764,7 @@ class WorkloadHDF5:
                     np.int64, copy=False
                 ),
                 "trial_ordinals": group["trial_ordinals"][:].astype(np.int64, copy=False),
-                "window_ids": group["window_ids"].asstr()[:],
+                "window_ids": np.asarray(
+                    group["window_ids"].asstr()[:], dtype=object
+                ),
             }

@@ -10,6 +10,22 @@ _EXPORTS = {
     "register_builtin_readers": (".device_reader", "register_builtin_readers"),
     "align_events_with_csv": (".event_alignment", "align_events_with_csv"),
     "EEGHDF5": (".hdf5_dataset", "EEGHDF5"),
+    "DatasetAdapter": (
+        ".dataset_adapter_registry",
+        "DatasetAdapter",
+    ),
+    "DatasetAdapterRegistry": (
+        ".dataset_adapter_registry",
+        "DatasetAdapterRegistry",
+    ),
+    "HDF5DatasetDescriptor": (
+        ".dataset_adapter_registry",
+        "HDF5DatasetDescriptor",
+    ),
+    "inspect_hdf5_dataset": (
+        ".dataset_adapter_registry",
+        "inspect_hdf5_dataset",
+    ),
     "HDF5Metadata": (".hdf5_dataset", "HDF5Metadata"),
     "write_hdf5": (".hdf5_dataset", "write_hdf5"),
     "SequentialDataset": (".sequential_dataset", "SequentialDataset"),

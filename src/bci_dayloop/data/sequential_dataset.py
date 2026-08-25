@@ -13,11 +13,8 @@ import json
 import math
 from pathlib import Path
 
-import h5py
 import numpy as np
 
-from bci_dayloop.data.hdf5_dataset import EEGHDF5
-from bci_dayloop.data.workload import WorkloadHDF5
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,83 +213,7 @@ def _limit_prefix(dataset: SequentialDataset, max_trials: int | None) -> Sequent
     return limited
 
 
-def _load_eeg_hdf5(path: Path, *, session: str) -> SequentialDataset:
-    reader = EEGHDF5(path)
-    metadata = reader.metadata
-    payload = reader.load(session)
-    data = np.asarray(payload["data"], dtype=np.float32)
-    num_trials = int(data.shape[0]) if data.ndim >= 1 else 0
-    common_metadata = _metadata_from_eeg(
-        sample_rate=float(metadata.sample_rate),
-        channel_names=metadata.channel_names,
-        class_names=metadata.class_names,
-        unit=metadata.unit,
-        dataset_name=metadata.dataset_name,
-        num_samples=int(data.shape[2]) if data.ndim == 3 else 0,
-    )
-    trial_ids = _as_trial_vector(payload["trial_ids"], name="trial_ids", expected=num_trials)
-    session_ids = _as_trial_vector(payload["session_ids"], name="session_ids", expected=num_trials)
-    dataset = SequentialDataset(
-        metadata=common_metadata,
-        data=data,
-        labels=_as_trial_vector(payload["labels"], name="labels", expected=num_trials),
-        subject_ids=_as_trial_vector(
-            payload["subject_ids"], name="subject_ids", expected=num_trials
-        ),
-        session_ids=session_ids,
-        trial_ids=trial_ids,
-        trial_ordinals=np.arange(1, num_trials + 1, dtype=np.int64),
-        window_ids=np.asarray(
-            [
-                f"{trial_id}:trial{_window_suffix(common_metadata.window_sec)}"
-                for trial_id in trial_ids
-            ],
-            dtype=str,
-        ),
-    )
-    _validate_dataset(dataset)
-    return dataset
-
-
-def _load_workload_hdf5(path: Path, *, session: str) -> SequentialDataset:
-    payload = WorkloadHDF5(path).load(session=session)
-    with h5py.File(path, "r") as handle:
-        root = handle.attrs
-        group = handle["sessions"][session]
-        common_metadata = SequentialDatasetMetadata(
-            sample_rate=float(group.attrs["sample_rate"]),
-            channel_names=tuple(str(value) for value in json.loads(group.attrs["channel_names"])),
-            class_names=tuple(str(value) for value in json.loads(root["class_names"])),
-            unit=str(root["unit"]),
-            dataset_name=str(root["dataset_name"]),
-            window_sec=float(root["window_sec"]),
-        )
-        subject_id = str(root["subject_id"])
-
-    data = np.asarray(payload["data"], dtype=np.float32)
-    num_trials = int(data.shape[0]) if data.ndim >= 1 else 0
-    window_ids = _as_trial_vector(payload["window_ids"], name="window_ids", expected=num_trials)
-    dataset = SequentialDataset(
-        metadata=common_metadata,
-        data=data,
-        labels=_as_trial_vector(payload["labels"], name="labels", expected=num_trials),
-        subject_ids=np.full(num_trials, subject_id, dtype=str),
-        session_ids=np.full(num_trials, str(session), dtype=str),
-        # A Workload window ID is its persisted source identifier.
-        trial_ids=window_ids.copy(),
-        trial_ordinals=_as_trial_vector(
-            payload["trial_ordinals"], name="trial_ordinals", expected=num_trials
-        ),
-        window_ids=window_ids,
-    )
-    _validate_dataset(dataset)
-    return dataset
-
-
-def _decode_json_attribute(
-    attributes: h5py.AttributeManager,
-    key: str,
-) -> tuple[str, ...]:
+def _decode_json_attribute(attributes: object, key: str) -> tuple[str, ...]:
     if key not in attributes:
         raise ValueError(f"SEED HDF5 is missing required attribute: {key}.")
     raw_value = attributes[key]
@@ -311,7 +232,7 @@ def _decode_json_attribute(
     return tuple(str(value) for value in values)
 
 
-def _seed_subject_id(attributes: h5py.AttributeManager) -> str:
+def _seed_subject_id(attributes: object) -> str:
     for key in ("subject_id", "subject"):
         if key in attributes:
             value = attributes[key]
@@ -325,73 +246,6 @@ def _seed_subject_id(attributes: h5py.AttributeManager) -> str:
     )
 
 
-def _load_seed_hdf5(path: Path, *, session: str) -> SequentialDataset:
-    """Load persisted SEED trials without changing their chronological rows."""
-    with h5py.File(path, "r") as handle:
-        sessions = handle.get("sessions")
-        if not isinstance(sessions, h5py.Group) or session not in sessions:
-            raise ValueError(f"SEED HDF5 session is missing: {session!r}.")
-        group = sessions[session]
-        if not isinstance(group, h5py.Group):
-            raise ValueError(f"SEED HDF5 session is not a group: {session!r}.")
-        for key in ("data", "labels", "trial_ids", "trial_ordinals"):
-            if key not in group:
-                raise ValueError(
-                    f"SEED HDF5 session {session!r} is missing required dataset: {key}."
-                )
-        if "sample_rate" not in group.attrs:
-            raise ValueError(
-                f"SEED HDF5 session {session!r} is missing required attribute: sample_rate."
-            )
-        if "unit" not in handle.attrs:
-            raise ValueError("SEED HDF5 is missing required root attribute: unit.")
-        if "window_sec" not in handle.attrs:
-            raise ValueError("SEED HDF5 is missing required root attribute: window_sec.")
-
-        data = np.asarray(group["data"], dtype=np.float32)
-        num_trials = int(data.shape[0]) if data.ndim >= 1 else 0
-        subject_id = _seed_subject_id(handle.attrs)
-        common_metadata = SequentialDatasetMetadata(
-            sample_rate=float(group.attrs["sample_rate"]),
-            channel_names=_decode_json_attribute(group.attrs, "channel_names"),
-            class_names=_decode_json_attribute(handle.attrs, "class_names"),
-            unit=str(handle.attrs["unit"]),
-            dataset_name="seed",
-            window_sec=float(handle.attrs["window_sec"]),
-        )
-        trial_ids = _as_trial_vector(
-            group["trial_ids"], name="trial_ids", expected=num_trials
-        ).astype(str)
-        labels = _as_trial_vector(
-            group["labels"], name="labels", expected=num_trials
-        )
-        trial_ordinals = _as_trial_vector(
-            group["trial_ordinals"],
-            name="trial_ordinals",
-            expected=num_trials,
-        )
-
-    dataset = SequentialDataset(
-        metadata=common_metadata,
-        data=data,
-        labels=labels,
-        subject_ids=np.repeat(
-            np.asarray([subject_id], dtype=str), num_trials
-        ),
-        session_ids=np.repeat(
-            np.asarray([str(session)], dtype=str), num_trials
-        ),
-        trial_ids=trial_ids,
-        trial_ordinals=trial_ordinals,
-        window_ids=np.asarray(
-            [f"{subject_id}:{session}:{trial_id}" for trial_id in trial_ids],
-            dtype=str,
-        ),
-    )
-    _validate_dataset(dataset)
-    return dataset
-
-
 def load_sequential_dataset(
     path: str | Path,
     *,
@@ -399,31 +253,14 @@ def load_sequential_dataset(
     max_trials: int | None = None,
 ) -> SequentialDataset:
     """Load either supported HDF5 layout without changing trial order."""
-    target = Path(path)
-    if not target.is_file():
-        raise FileNotFoundError(f"Sequential HDF5 not found: {target}")
+    # The deferred import keeps this module as the canonical output contract;
+    # adapters can import that contract without an import-time cycle.
+    from bci_dayloop.data.dataset_adapter_registry import (
+        DEFAULT_DATASET_ADAPTER_REGISTRY,
+    )
 
-    with h5py.File(target, "r") as handle:
-        has_flat_eeg = "data" in handle
-        has_workload_sessions = "sessions" in handle
-        dataset_name = str(handle.attrs.get("dataset_name", "")).strip().lower()
-    if has_flat_eeg == has_workload_sessions:
-        raise ValueError(
-            "Unsupported sequential HDF5 layout: expected exactly one of "
-            "root /data or grouped /sessions."
-        )
-
-    if has_flat_eeg:
-        dataset = _load_eeg_hdf5(target, session=session)
-    elif dataset_name == "workload_pbci_hackathon":
-        dataset = _load_workload_hdf5(target, session=session)
-    elif dataset_name == "seed":
-        dataset = _load_seed_hdf5(target, session=session)
-    else:
-        raise ValueError(
-            "Unsupported grouped sequential dataset_name: "
-            f"{dataset_name!r}."
-        )
+    dataset = DEFAULT_DATASET_ADAPTER_REGISTRY.load(path, session=session)
+    _validate_dataset(dataset)
     return _limit_prefix(dataset, max_trials)
 
 

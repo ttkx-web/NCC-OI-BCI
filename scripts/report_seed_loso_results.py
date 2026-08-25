@@ -232,19 +232,60 @@ def _gain_counts(values: Sequence[float]) -> dict[str, int]:
     }
 
 
-def build_summary(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    expected_rows = len(SUBJECTS) * len(MODELS)
+def build_summary(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    dataset_name: str = "seed",
+    subjects: Sequence[int] = SUBJECTS,
+    models: Sequence[str] = MODELS,
+    primary_metric: str = "balanced_accuracy",
+) -> dict[str, Any]:
+    normalized_subjects = tuple(int(subject) for subject in subjects)
+    normalized_models = tuple(str(model) for model in models)
+    if not str(dataset_name).strip():
+        raise ValueError("dataset_name cannot be empty.")
+    if not normalized_subjects or len(set(normalized_subjects)) != len(
+        normalized_subjects
+    ):
+        raise ValueError("subjects must be non-empty and unique.")
+    if not normalized_models or len(set(normalized_models)) != len(
+        normalized_models
+    ):
+        raise ValueError("models must be non-empty and unique.")
+    if primary_metric not in METRICS:
+        raise ValueError(f"Unsupported primary metric: {primary_metric!r}.")
+
+    expected_identities = {
+        (subject, model)
+        for subject in normalized_subjects
+        for model in normalized_models
+    }
+    actual_identities = [
+        (int(row["subject"]), str(row["model"])) for row in results
+    ]
+    if len(actual_identities) != len(set(actual_identities)):
+        raise ValueError("Benchmark results contain duplicate subject/model rows.")
+    missing_identities = sorted(expected_identities - set(actual_identities))
+    unexpected_identities = sorted(set(actual_identities) - expected_identities)
+    if missing_identities or unexpected_identities:
+        raise ValueError(
+            "Benchmark subject/model matrix is incomplete; "
+            f"missing={missing_identities}, unexpected={unexpected_identities}."
+        )
+
+    expected_rows = len(normalized_subjects) * len(normalized_models)
     if len(results) != expected_rows:
         raise ValueError(
             f"Expected {expected_rows} subject/model rows, got {len(results)}."
         )
 
     model_summaries: dict[str, Any] = {}
-    for model in MODELS:
+    for model in normalized_models:
         model_rows = [row for row in results if row["model"] == model]
-        if len(model_rows) != len(SUBJECTS):
+        if len(model_rows) != len(normalized_subjects):
             raise ValueError(
-                f"Expected 15 rows for model {model}, got {len(model_rows)}."
+                f"Expected {len(normalized_subjects)} rows for model {model}, "
+                f"got {len(model_rows)}."
             )
         metric_summaries: dict[str, Any] = {}
         for metric in METRICS:
@@ -267,7 +308,7 @@ def build_summary(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
         model_summaries[model] = {
             "subject_count": len(model_rows),
-            "primary_metric": "balanced_accuracy",
+            "primary_metric": primary_metric,
             "metrics": metric_summaries,
             "update_count": _distribution(
                 [float(row["update_count"]) for row in model_rows]
@@ -294,10 +335,10 @@ def build_summary(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     return {
         "schema_version": 1,
-        "dataset": "seed",
-        "subjects": list(SUBJECTS),
-        "models": list(MODELS),
-        "primary_metric": "balanced_accuracy",
+        "dataset": str(dataset_name),
+        "subjects": list(normalized_subjects),
+        "models": list(normalized_models),
+        "primary_metric": primary_metric,
         "subject_results": [dict(row) for row in results],
         "model_summaries": model_summaries,
     }
@@ -312,10 +353,11 @@ def _fmt(value: object) -> str:
 def render_markdown(report: Mapping[str, Any]) -> str:
     rows = report["subject_results"]
     model_summaries = report["model_summaries"]
+    primary_metric_label = str(report["primary_metric"]).replace("_", " ")
     lines = [
-        "# SEED Full LOSO Results",
+        f"# {report['dataset']} NeuroOnline Benchmark Results",
         "",
-        "Primary comparison metric: **balanced accuracy**.",
+        f"Primary comparison metric: **{primary_metric_label}**.",
         "",
         "## Per-subject results",
         "",
@@ -355,7 +397,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         )
     )
-    for model in MODELS:
+    for model in report["models"]:
         metrics = model_summaries[model]["metrics"]
         for metric in METRICS:
             item = metrics[metric]
@@ -377,12 +419,37 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
 
 def write_reports(
-    *, results: Sequence[Mapping[str, Any]], report: Mapping[str, Any], output_dir: Path
+    *,
+    results: Sequence[Mapping[str, Any]],
+    report: Mapping[str, Any],
+    output_dir: Path,
+    filename_prefix: str = "seed_loso",
+    markdown_filename: str | None = None,
 ) -> tuple[Path, Path, Path]:
+    if not filename_prefix or any(
+        character in filename_prefix for character in ("/", "\\")
+    ):
+        raise ValueError("filename_prefix must be a non-empty filename stem.")
+    if markdown_filename is not None:
+        markdown_name = Path(markdown_filename)
+        if (
+            markdown_name.name != markdown_filename
+            or markdown_name.suffix != ".md"
+            or not markdown_name.stem
+        ):
+            raise ValueError(
+                "markdown_filename must be a non-empty .md filename without "
+                "directory components."
+            )
+    markdown = render_markdown(report)
+    if not markdown.strip():
+        raise ValueError("Rendered benchmark Markdown must not be empty.")
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "seed_loso_subject_results.csv"
-    json_path = output_dir / "seed_loso_summary.json"
-    markdown_path = output_dir / "seed_loso_report.md"
+    csv_path = output_dir / f"{filename_prefix}_subject_results.csv"
+    json_path = output_dir / f"{filename_prefix}_summary.json"
+    markdown_path = output_dir / (
+        markdown_filename or f"{filename_prefix}_report.md"
+    )
 
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
@@ -392,7 +459,7 @@ def write_reports(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    markdown_path.write_text(render_markdown(report), encoding="utf-8")
+    markdown_path.write_text(markdown, encoding="utf-8")
     return csv_path, json_path, markdown_path
 
 

@@ -18,6 +18,8 @@ import types
 from pathlib import Path
 
 import numpy as np
+root = Path.cwd()
+sys.path.insert(0, str(root / "src"))
 from bci_dayloop.data.hdf5_dataset import HDF5Metadata, write_hdf5
 
 scipy = types.ModuleType("scipy")
@@ -28,7 +30,6 @@ scipy.signal = signal
 sys.modules["scipy"] = scipy
 sys.modules["scipy.signal"] = signal
 
-root = Path.cwd()
 sys.path.insert(0, str(root / "scripts"))
 spec = importlib.util.spec_from_file_location(
     "population_head_cli_test",

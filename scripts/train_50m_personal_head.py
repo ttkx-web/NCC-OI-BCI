@@ -77,7 +77,7 @@ from bci_dayloop.personalization import (
 # - 50M preprocessing/tokenization
 # - frozen-feature extraction
 # - linear-head epoch training and checkpoint compatibility
-from train_50m_linear_head import (
+from bci_dayloop.training.model_50m.linear_head import (
     EpochMetrics,
     metric_is_better,
     run_head_epoch,
@@ -97,7 +97,7 @@ from train_50m_linear_head import (
 # - metadata/session checks
 # - extended Macro-F1 metrics
 # - collision-free source-trial IDs
-from train_50m_population_head import (
+from bci_dayloop.training.model_50m.runner import (
     atomic_write_json,
     class_name_counts,
     current_git_commit,

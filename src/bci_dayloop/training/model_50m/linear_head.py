@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from _bootstrap import ROOT
+from bci_dayloop.utils.config import project_root
+ROOT = project_root()
 
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
 from bci_dayloop.data.splits import stratified_source_trial_split
@@ -278,152 +279,6 @@ def limit_windows_per_class(
             window_set.source_trial_ids[int(i)] for i in selected_array
         ),
         construction=window_set.construction,
-    )
-
-
-def feature_cache_dtype_from_name(name: str) -> torch.dtype:
-    mapping = {
-        "float16": torch.float16,
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-    }
-    if name not in mapping:
-        raise ValueError(f"Unsupported feature cache dtype: {name!r}.")
-    return mapping[name]
-
-
-@torch.no_grad()
-def extract_frozen_features(
-    *,
-    window_set: WindowSet,
-    metadata: Any,
-    config: Model50MConfig,
-    classifier: Model50MClassifier,
-    preprocess_batch_size: int,
-    cache_dtype: torch.dtype,
-    split_name: str,
-    log_every: int,
-) -> TensorDataset:
-    """Preprocess, tokenize and cache frozen 50M features on CPU."""
-    if preprocess_batch_size <= 0:
-        raise ValueError("preprocess_batch_size must be positive.")
-
-    preprocessor = Model50MPreprocessor(config)
-    tokenizer = Model50MTokenizer(config)
-    feature_chunks: list[torch.Tensor] = []
-    label_chunks: list[torch.Tensor] = []
-    split_start = time.perf_counter()
-    mapped_counts: set[int] = set()
-    missing_counts: set[int] = set()
-    classifier.eval()
-
-    for batch_start in range(0, len(window_set.windows), preprocess_batch_size):
-        batch_end = min(
-            batch_start + preprocess_batch_size,
-            len(window_set.windows),
-        )
-
-        preprocess_start = time.perf_counter()
-        tokenized_samples = []
-        for raw_window in window_set.windows[batch_start:batch_end]:
-            result = preprocessor(
-                signal=raw_window,
-                channel_names=metadata.channel_names,
-                original_sample_rate=metadata.sample_rate,
-                input_unit=metadata.unit,
-            )
-            mapped_counts.add(int(result.mapped_channel_count))
-            missing_counts.add(int(result.missing_channel_count))
-            tokenized_samples.append(tokenizer(result))
-
-        model_batch = stack_model50m_tokens(
-            tokenized_samples,
-            device=classifier.device,
-        )
-        preprocess_seconds = time.perf_counter() - preprocess_start
-
-        compute_start = time.perf_counter()
-        features = classifier.extract_features(model_batch)
-        if classifier.device.type == "cuda":
-            torch.cuda.synchronize(classifier.device)
-        elif classifier.device.type == "mps" and hasattr(torch, "mps"):
-            torch.mps.synchronize()
-        compute_seconds = time.perf_counter() - compute_start
-
-        features_cpu = (
-            features.detach()
-            .to(device="cpu", dtype=cache_dtype)
-            .contiguous()
-        )
-        labels_cpu = torch.from_numpy(
-            window_set.labels[batch_start:batch_end].copy()
-        ).long()
-        feature_chunks.append(features_cpu)
-        label_chunks.append(labels_cpu)
-
-        batch_number = batch_start // preprocess_batch_size + 1
-        if (
-            batch_number == 1
-            or batch_end == len(window_set.windows)
-            or batch_number % log_every == 0
-        ):
-            print(
-                f"[FeatureCache] split={split_name} "
-                f"batch={batch_number} "
-                f"samples={batch_end}/{len(window_set.windows)} "
-                f"preprocess={preprocess_seconds:.2f}s "
-                f"backbone={compute_seconds:.2f}s",
-                flush=True,
-            )
-
-    features_all = torch.cat(feature_chunks, dim=0).contiguous()
-    labels_all = torch.cat(label_chunks, dim=0).contiguous()
-
-    expected_shape = (
-        len(window_set.windows),
-        config.classifier_input_dim,
-    )
-    if features_all.shape != expected_shape:
-        raise RuntimeError(
-            f"{split_name}: unexpected feature shape "
-            f"{tuple(features_all.shape)}, expected {expected_shape}."
-        )
-    if not torch.isfinite(features_all.float()).all():
-        raise RuntimeError(f"{split_name}: feature cache contains NaN or Inf.")
-
-    size_mib = (
-        features_all.numel()
-        * features_all.element_size()
-        / 1024**2
-    )
-    print(
-        f"[FeatureCache] completed split={split_name} "
-        f"shape={tuple(features_all.shape)} "
-        f"dtype={features_all.dtype} "
-        f"size={size_mib:.1f} MiB "
-        f"mapped_channels={sorted(mapped_counts)} "
-        f"missing_channels={sorted(missing_counts)} "
-        f"time={time.perf_counter() - split_start:.1f}s",
-        flush=True,
-    )
-    return TensorDataset(features_all, labels_all)
-
-
-def save_feature_cache(
-    dataset: TensorDataset,
-    path: Path,
-    *,
-    split_name: str,
-) -> None:
-    features, labels = dataset.tensors
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "features": features,
-            "labels": labels,
-            "split": split_name,
-        },
-        path,
     )
 
 
@@ -1255,6 +1110,14 @@ def main() -> None:
     print("classifier saved to:", saved_path)
     print("metrics CSV:", metrics_csv)
     print("report JSON:", report_path)
+
+
+# Compatibility re-exports. Frozen feature extraction now lives in features.py.
+from bci_dayloop.training.model_50m.features import (
+    extract_frozen_features,
+    feature_cache_dtype_from_name,
+    save_feature_cache,
+)
 
 
 if __name__ == "__main__":

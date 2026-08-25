@@ -37,6 +37,10 @@ sys.modules[spec.name] = module
 assert spec.loader is not None
 spec.loader.exec_module(module)
 
+from bci_dayloop.training.model_50m import data as data_module
+assert module.build_population_split is data_module.build_population_split
+assert module.build_within_subject_splits is data_module.build_within_subject_splits
+
 parser = module.build_argument_parser()
 assert parser.parse_args([]).data_reader == "eeg"
 

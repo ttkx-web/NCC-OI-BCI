@@ -529,6 +529,13 @@ python scripts/train_50m_population_head.py \
 
 `--save-feature-cache` 仅在需要将 frozen feature 写盘时开启；默认可只在内存中训练分类头。
 
+训练 CLI 保持在 `scripts/train_50m_population_head.py`，正式实现位于
+`src/bci_dayloop/training/model_50m/runner.py`；该入口默认冻结 Backbone，
+也支持既有的 `--backbone-adaptation partial/lora`，且三种模式共享同一
+split、评估与 artifact 契约。旧的 Stage-0.5 脚本已删除；其正式模块入口是
+`PYTHONPATH=src python -m bci_dayloop.training.model_50m.linear_head`，并继续
+作为 population 与 personal 路径复用的 frozen linear-head 实现。
+
 ---
 
 ## 13. 训练 LaBraM 群体头

@@ -6,6 +6,8 @@ import argparse
 from dataclasses import dataclass
 from typing import Sequence
 
+from bci_dayloop.models.model_50m.config import STANDARD_64_CHANNELS
+
 
 @dataclass
 class PopulationTrainingConfig:

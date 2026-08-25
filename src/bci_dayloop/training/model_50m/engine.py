@@ -11,8 +11,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from bci_dayloop.training.model_50m.adaptation import load_lora_state_dict, lora_state_dict
-from bci_dayloop.training.model_50m.linear_head import EpochMetrics, metric_is_better, run_head_epoch
+from bci_dayloop.training.model_50m.adaptation import (
+    forward_live_logits,
+    load_lora_state_dict,
+    lora_state_dict,
+)
+from bci_dayloop.training.model_50m.linear_head import (
+    EpochMetrics,
+    confusion_to_metrics,
+    metric_is_better,
+    run_head_epoch,
+)
 
 
 def run_finetune_epoch(

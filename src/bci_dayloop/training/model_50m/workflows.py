@@ -241,7 +241,9 @@ def _run_training_workflow(args: PopulationTrainingConfig) -> WorkflowResult:
         data_reader=args.data_reader,
         subject_identities=subject_identities,
         subject_paths=all_subject_paths,
-        arguments=vars(args),
+        # PopulationTrainingConfig wraps the argparse Namespace.  Persist the
+        # namespace fields themselves, matching the pre-refactor run config.
+        arguments=vars(args.as_namespace()),
     )
 
     # ------------------------------------------------------------------

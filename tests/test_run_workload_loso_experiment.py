@@ -108,6 +108,15 @@ def test_workload_default_sessions_separate_training_and_testing() -> None:
     ):
         assert _arg_after(commands[command_name], "--session") == "S2"
 
+    cbramod_train = commands["train_cbramod"]
+    labram_train = commands["train_labram"]
+    assert _arg_after(cbramod_train, "--missing-channel-policy") == (
+        "spherical_spline"
+    )
+    assert _arg_after(cbramod_train, "--min-observed-channels") == "21"
+    assert "--missing-channel-policy" not in labram_train
+    assert "--min-observed-channels" not in labram_train
+
 
 def test_workload_session_cli_options_override_defaults() -> None:
     module = _module()
@@ -171,6 +180,9 @@ def test_dry_run_prints_commands_without_executing(
     assert "subject_01 population=2" in output
     assert "subject_02 population=1" in output
     assert "train_session=S1 validation_session=S2 final_test_session=S2" in output
+    assert "[train_cbramod]" in output
+    assert "--missing-channel-policy spherical_spline" in output
+    assert "--min-observed-channels 21" in output
     assert "Dry-run complete: 2 subjects, no commands executed." in output
 
 

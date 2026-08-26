@@ -167,6 +167,10 @@ def build_subject_plan(
                 device,
                 "--window-sec",
                 f"{window_sec:g}",
+                "--missing-channel-policy",
+                "spherical_spline",
+                "--min-observed-channels",
+                "21",
             ),
         ),
         CommandSpec(

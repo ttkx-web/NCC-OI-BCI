@@ -36,7 +36,9 @@ def _plan(module: object, target: int = 1) -> object:
         output_root=Path("experiments/workload_loso_full"),
         labram_checkpoint=Path("models/labram-base.pth"),
         cbramod_checkpoint=Path("models/cbramod.pth"),
-        session="S1",
+        train_session="S1",
+        validation_session="S2",
+        final_test_session="S2",
         window_sec=2.0,
         device="cuda",
     )
@@ -76,16 +78,27 @@ def test_full_workload_loso_expansion_has_isolated_subject_outputs() -> None:
         assert len(plan.commands) == 6
 
 
-def test_workload_plan_uses_the_requested_session_for_every_stage() -> None:
+def test_workload_default_sessions_separate_training_and_testing() -> None:
     module = _module()
-    plan = _plan(module, target=1)
+    args = module.build_parser().parse_args(
+        [
+            "--subjects",
+            "1",
+            "2",
+            "--labram-checkpoint",
+            "labram.pth",
+            "--cbramod-checkpoint",
+            "cbramod.pth",
+        ]
+    )
+    plan = module.build_plans(args)[0]
     commands = {command.name: command.argv for command in plan.commands}
 
     for train_name in ("train_labram", "train_cbramod"):
         command = commands[train_name]
         assert _arg_after(command, "--train-session") == "S1"
-        assert _arg_after(command, "--validation-session") == "S1"
-        assert _arg_after(command, "--final-test-session") == "S1"
+        assert _arg_after(command, "--validation-session") == "S2"
+        assert _arg_after(command, "--final-test-session") == "S2"
         assert _arg_after(command, "--target-subject") == "1"
     for command_name in (
         "export_labram",
@@ -93,7 +106,43 @@ def test_workload_plan_uses_the_requested_session_for_every_stage() -> None:
         "export_cbramod",
         "evaluate_cbramod",
     ):
-        assert _arg_after(commands[command_name], "--session") == "S1"
+        assert _arg_after(commands[command_name], "--session") == "S2"
+
+
+def test_workload_session_cli_options_override_defaults() -> None:
+    module = _module()
+    args = module.build_parser().parse_args(
+        [
+            "--subjects",
+            "1",
+            "2",
+            "--train-session",
+            "TRAIN",
+            "--validation-session",
+            "VALIDATION",
+            "--final-test-session",
+            "TEST",
+            "--labram-checkpoint",
+            "labram.pth",
+            "--cbramod-checkpoint",
+            "cbramod.pth",
+        ]
+    )
+    plan = module.build_plans(args)[0]
+    commands = {command.name: command.argv for command in plan.commands}
+
+    for train_name in ("train_labram", "train_cbramod"):
+        command = commands[train_name]
+        assert _arg_after(command, "--train-session") == "TRAIN"
+        assert _arg_after(command, "--validation-session") == "VALIDATION"
+        assert _arg_after(command, "--final-test-session") == "TEST"
+    for command_name in (
+        "export_labram",
+        "evaluate_labram",
+        "export_cbramod",
+        "evaluate_cbramod",
+    ):
+        assert _arg_after(commands[command_name], "--session") == "TEST"
 
 
 def test_dry_run_prints_commands_without_executing(
@@ -121,6 +170,7 @@ def test_dry_run_prints_commands_without_executing(
     output = capsys.readouterr().out
     assert "subject_01 population=2" in output
     assert "subject_02 population=1" in output
+    assert "train_session=S1 validation_session=S2 final_test_session=S2" in output
     assert "Dry-run complete: 2 subjects, no commands executed." in output
 
 

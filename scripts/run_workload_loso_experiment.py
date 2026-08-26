@@ -50,11 +50,13 @@ def build_subject_plan(
     output_root: Path,
     labram_checkpoint: Path,
     cbramod_checkpoint: Path,
-    session: str,
+    train_session: str,
+    validation_session: str,
+    final_test_session: str,
     window_sec: float,
     device: str,
 ) -> SubjectPlan:
-    """Build one isolated Workload LOSO fold using a single session."""
+    """Build one isolated Workload LOSO fold with separated sessions."""
     normalized = normalize_subjects(subjects)
     target = int(target_subject)
     population = population_subjects_for(normalized, target)
@@ -77,11 +79,11 @@ def build_subject_plan(
         "--target-subject",
         str(target),
         "--train-session",
-        session,
+        train_session,
         "--validation-session",
-        session,
+        validation_session,
         "--final-test-session",
-        session,
+        final_test_session,
     )
 
     labram_dir = subject_dir / "labram"
@@ -127,7 +129,7 @@ def build_subject_plan(
                 "--device",
                 device,
                 "--session",
-                session,
+                final_test_session,
             ),
         ),
         CommandSpec(
@@ -140,7 +142,7 @@ def build_subject_plan(
                 "--model-package",
                 str(labram_package),
                 "--session",
-                session,
+                final_test_session,
                 "--device",
                 device,
                 "--online-strategy",
@@ -185,7 +187,7 @@ def build_subject_plan(
                 "--device",
                 device,
                 "--session",
-                session,
+                final_test_session,
             ),
         ),
         CommandSpec(
@@ -198,7 +200,7 @@ def build_subject_plan(
                 "--model-package",
                 str(cbramod_package),
                 "--session",
-                session,
+                final_test_session,
                 "--device",
                 device,
                 "--online-strategy",
@@ -222,7 +224,9 @@ def build_plans(args: argparse.Namespace) -> tuple[SubjectPlan, ...]:
             output_root=args.output_root,
             labram_checkpoint=args.labram_checkpoint,
             cbramod_checkpoint=args.cbramod_checkpoint,
-            session=args.session,
+            train_session=args.train_session,
+            validation_session=args.validation_session,
+            final_test_session=args.final_test_session,
             window_sec=args.window_sec,
             device=args.device,
         )
@@ -258,7 +262,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subjects", nargs="+", type=int, default=list(DEFAULT_SUBJECTS)
     )
-    parser.add_argument("--session", default="S1")
+    parser.add_argument("--train-session", default="S1")
+    parser.add_argument("--validation-session", default="S2")
+    parser.add_argument("--final-test-session", default="S2")
     parser.add_argument("--window-sec", type=float, default=2.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--labram-checkpoint", type=Path, required=True)
@@ -278,6 +284,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"# subject_{plan.target_subject:02d} population="
             + ",".join(str(subject) for subject in plan.population_subjects)
+        )
+        print(
+            "  "
+            f"train_session={args.train_session} "
+            f"validation_session={args.validation_session} "
+            f"final_test_session={args.final_test_session}"
         )
         for command in plan.commands:
             print(f"[{command.name}] {subprocess.list2cmdline(command.argv)}")

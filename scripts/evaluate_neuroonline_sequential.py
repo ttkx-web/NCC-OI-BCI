@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import time
@@ -44,6 +45,8 @@ else:
 
 
 VALID_STRATEGIES = ("none", "neuroonline", "both")
+VALID_EVALUATION_ORDERS = ("persisted", "random_permutation")
+DEFAULT_ORDER_SEED = 20260826
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,8 @@ class SequentialSettings:
     output_dir: Path
     subject_id: str | None
     neuroonline_config: NeuroOnlineConfig
+    evaluation_order: Literal["persisted", "random_permutation"] = "persisted"
+    order_seed: int = DEFAULT_ORDER_SEED
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rolling-window", type=int, default=None)
     parser.add_argument("--print-every", type=int, default=None)
     parser.add_argument("--output-dir")
+    parser.add_argument(
+        "--evaluation-order",
+        choices=VALID_EVALUATION_ORDERS,
+        default="persisted",
+        help="Trial visitation order; random_permutation is diagnostic only.",
+    )
+    parser.add_argument(
+        "--order-seed",
+        type=int,
+        default=DEFAULT_ORDER_SEED,
+        help="Seed used only by random_permutation evaluation order.",
+    )
     return parser
 
 
@@ -193,6 +210,8 @@ def resolve_settings(
         output_dir=resolve_path(output_dir_value),
         subject_id=subject_id,
         neuroonline_config=resolve_neuroonline_config(online.get("neuroonline")),
+        evaluation_order=args.evaluation_order,
+        order_seed=int(args.order_seed),
     )
 
 
@@ -220,6 +239,96 @@ def validate_package_contract(
             "Dataset class order does not match Runtime Package: "
             f"dataset={dataset_classes}, package={loaded.class_names}."
         )
+
+
+def resolve_evaluation_indices(
+    num_trials: int,
+    *,
+    evaluation_order: str,
+    order_seed: int,
+) -> np.ndarray:
+    """Return a label-independent, validated trial visitation permutation."""
+
+    count = int(num_trials)
+    if count < 0:
+        raise ValueError("num_trials cannot be negative.")
+    if evaluation_order == "persisted":
+        indices = np.arange(count, dtype=np.int64)
+    elif evaluation_order == "random_permutation":
+        indices = np.random.default_rng(int(order_seed)).permutation(count)
+        indices = np.asarray(indices, dtype=np.int64)
+    else:
+        raise ValueError(
+            "evaluation_order must be one of "
+            f"{VALID_EVALUATION_ORDERS}, got {evaluation_order!r}."
+        )
+
+    if not np.array_equal(np.sort(indices), np.arange(count, dtype=np.int64)):
+        raise RuntimeError("Evaluation indices must be a permutation of 0..N-1.")
+    return indices
+
+
+def _stable_sha256(values: Sequence[object]) -> str:
+    encoded = json.dumps(
+        [str(value) for value in values],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _alternation_rate(labels: Sequence[int]) -> float:
+    values = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if values.size < 2:
+        return 0.0
+    return float(np.mean(values[1:] != values[:-1]))
+
+
+def build_evaluation_order_diagnostics(
+    dataset: SequentialDataset,
+    *,
+    evaluation_indices: Sequence[int],
+    evaluation_order: str,
+    order_seed: int,
+) -> dict[str, Any]:
+    """Build metadata-only provenance for a diagnostic evaluation order."""
+
+    indices = np.asarray(evaluation_indices, dtype=np.int64).reshape(-1)
+    expected = np.arange(dataset.num_trials, dtype=np.int64)
+    if not np.array_equal(np.sort(indices), expected):
+        raise ValueError("evaluation_indices must be a permutation of 0..N-1.")
+
+    labels_before = np.asarray(dataset.labels, dtype=np.int64).reshape(-1)
+    labels_after = labels_before[indices]
+    source_ids = [
+        (
+            f"{dataset.subject_ids[index]}|{dataset.session_ids[index]}|"
+            f"{dataset.window_ids[index]}"
+        )
+        for index in range(dataset.num_trials)
+    ]
+    class_names = tuple(str(name) for name in dataset.metadata.class_names)
+
+    def counts(values: np.ndarray) -> dict[str, int]:
+        return {
+            class_names[class_id]: int(np.count_nonzero(values == class_id))
+            for class_id in range(len(class_names))
+        }
+
+    return {
+        "evaluation_order": str(evaluation_order),
+        "order_seed": int(order_seed),
+        "trial_count": int(dataset.num_trials),
+        "permutation_sha256": _stable_sha256(indices.tolist()),
+        "source_order_sha256": _stable_sha256(source_ids),
+        "reordered_source_ids_sha256": _stable_sha256(
+            [source_ids[index] for index in indices.tolist()]
+        ),
+        "class_counts_before": counts(labels_before),
+        "class_counts_after": counts(labels_after),
+        "alternation_rate_before": _alternation_rate(labels_before),
+        "alternation_rate_after": _alternation_rate(labels_after),
+    }
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -482,7 +591,20 @@ def _raw_window_for_trial(
     subject_id: int | str,
     session: str,
     trial_ordinal: int,
+    source_trial_ordinal: int | None = None,
 ) -> RawEEGWindow:
+    provenance = {
+        "session": str(session),
+        "subject_id": subject_id,
+        "trial_ordinal": int(trial_ordinal),
+        "protocol": (
+            "neuroonline_sequential_"
+            f"{_window_label(metadata.window_sec)}"
+        ),
+    }
+    if source_trial_ordinal is not None:
+        provenance["evaluation_ordinal"] = int(trial_ordinal)
+        provenance["source_trial_ordinal"] = int(source_trial_ordinal)
     return RawEEGWindow(
         data=np.ascontiguousarray(trial, dtype=np.float32),
         channel_names=list(metadata.channel_names),
@@ -493,15 +615,7 @@ def _raw_window_for_trial(
         trial_id=trial_id,
         window_id=window_id,
         label=None,
-        metadata={
-            "session": str(session),
-            "subject_id": subject_id,
-            "trial_ordinal": int(trial_ordinal),
-            "protocol": (
-                "neuroonline_sequential_"
-                f"{_window_label(metadata.window_sec)}"
-            ),
-        },
+        metadata=provenance,
     )
 
 
@@ -553,6 +667,7 @@ def evaluate_mode(
     dataset: SequentialDataset,
     settings: SequentialSettings,
     strategy_factory: Callable[[NeuroOnlineConfig], NeuroOnlineStrategy] = NeuroOnlineStrategy,
+    evaluation_indices: Sequence[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     runtime_model: RuntimeModel = loaded.runtime_model
     class_names = tuple(loaded.class_names)
@@ -581,8 +696,21 @@ def evaluate_mode(
     true_so_far: list[int] = []
     pred_so_far: list[int] = []
 
-    for index in range(dataset.num_trials):
-        trial_ordinal = int(dataset.trial_ordinals[index])
+    indices = (
+        np.arange(dataset.num_trials, dtype=np.int64)
+        if evaluation_indices is None
+        else np.asarray(evaluation_indices, dtype=np.int64).reshape(-1)
+    )
+    if not np.array_equal(
+        np.sort(indices), np.arange(dataset.num_trials, dtype=np.int64)
+    ):
+        raise ValueError("evaluation_indices must be a permutation of 0..N-1.")
+    diagnostic_order = settings.evaluation_order != "persisted"
+
+    for evaluation_ordinal, source_index in enumerate(indices.tolist(), start=1):
+        index = int(source_index)
+        source_trial_ordinal = int(dataset.trial_ordinals[index])
+        trial_ordinal = int(evaluation_ordinal)
         true_label = int(dataset.labels[index])
         if not 0 <= true_label < len(class_names):
             raise ValueError(
@@ -601,6 +729,9 @@ def evaluate_mode(
             subject_id=subject_id,
             session=str(dataset.session_ids[index]),
             trial_ordinal=trial_ordinal,
+            source_trial_ordinal=(
+                source_trial_ordinal if diagnostic_order else None
+            ),
         )
 
         if mode == "none":
@@ -657,6 +788,11 @@ def evaluate_mode(
                     "trial_id": trial_id,
                     "subject_id": subject_id,
                     "label_revealed": False,
+                    **(
+                        {"source_trial_ordinal": source_trial_ordinal}
+                        if diagnostic_order
+                        else {}
+                    ),
                 },
             )
 
@@ -672,6 +808,11 @@ def evaluate_mode(
                     metadata={
                         "source": "offline_ground_truth",
                         "trial_ordinal": trial_ordinal,
+                        **(
+                            {"source_trial_ordinal": source_trial_ordinal}
+                            if diagnostic_order
+                            else {}
+                        ),
                     },
                 )
             )
@@ -708,6 +849,15 @@ def evaluate_mode(
             "rolling_present_class_names": rolling_metrics["present_class_names"],
             "model_output_diagnostics": _to_jsonable(output.diagnostics),
         }
+        if diagnostic_order:
+            record.update(
+                {
+                    "evaluation_ordinal": trial_ordinal,
+                    "source_trial_ordinal": source_trial_ordinal,
+                    "source_dataset_index": index,
+                    "source_window_id": window_id,
+                }
+            )
         records.append(record)
 
         if (
@@ -956,6 +1106,17 @@ def run_evaluation(
 
     warnings_list = _build_warnings(settings)
     dataset = load_sequential_dataset(settings)
+    evaluation_indices = resolve_evaluation_indices(
+        dataset.num_trials,
+        evaluation_order=settings.evaluation_order,
+        order_seed=settings.order_seed,
+    )
+    order_diagnostics = build_evaluation_order_diagnostics(
+        dataset,
+        evaluation_indices=evaluation_indices,
+        evaluation_order=settings.evaluation_order,
+        order_seed=settings.order_seed,
+    )
 
     mode_records: dict[str, list[dict[str, Any]]] = {}
     mode_summaries: dict[str, dict[str, Any]] = {}
@@ -987,6 +1148,7 @@ def run_evaluation(
             dataset=dataset,
             settings=settings,
             strategy_factory=strategy_factory,
+            evaluation_indices=evaluation_indices,
         )
         mode_records[mode] = records
         mode_summaries[mode] = summary
@@ -1019,25 +1181,34 @@ def run_evaluation(
     csv_path = output_dir / "trial_predictions.csv"
     jsonl_path = output_dir / "trial_predictions.jsonl"
 
+    protocol_payload = {
+        "name": (
+            "neuroonline_sequential_trial_"
+            f"{_window_label(dataset.metadata.window_sec)}"
+        ),
+        "window_sec": dataset.metadata.window_sec,
+        # Source trials are discrete; their causal evaluation cadence is
+        # the persisted trial duration, not Runtime Package step_sec.
+        "step_sec": dataset.metadata.window_sec,
+        "one_prediction_per_source_trial": True,
+        "uses_replay_acquirer": False,
+        "uses_sliding_window_decoder": False,
+        "continuous_stream_concatenation": False,
+        "shuffle": settings.evaluation_order != "persisted",
+        "label_available_during_prediction": False,
+        "package_step_sec_ignored_for_trial_sequence": True,
+    }
+    if settings.evaluation_order != "persisted":
+        protocol_payload.update(
+            {
+                "evaluation_order": settings.evaluation_order,
+                "order_seed": settings.order_seed,
+            }
+        )
+
     summary_payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "protocol": {
-            "name": (
-                "neuroonline_sequential_trial_"
-                f"{_window_label(dataset.metadata.window_sec)}"
-            ),
-            "window_sec": dataset.metadata.window_sec,
-            # Source trials are discrete; their causal evaluation cadence is
-            # the persisted trial duration, not Runtime Package step_sec.
-            "step_sec": dataset.metadata.window_sec,
-            "one_prediction_per_source_trial": True,
-            "uses_replay_acquirer": False,
-            "uses_sliding_window_decoder": False,
-            "continuous_stream_concatenation": False,
-            "shuffle": False,
-            "label_available_during_prediction": False,
-            "package_step_sec_ignored_for_trial_sequence": True,
-        },
+        "protocol": protocol_payload,
         "data": {
             "path": str(settings.data_path),
             "session": settings.session,
@@ -1066,6 +1237,8 @@ def run_evaluation(
             "trial_predictions_jsonl": str(jsonl_path),
         },
     }
+    if settings.evaluation_order != "persisted":
+        summary_payload["order_control"] = order_diagnostics
 
     _atomic_write_csv(csv_path, all_records)
     _atomic_write_jsonl(jsonl_path, all_records)

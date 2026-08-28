@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
+import json
 from pathlib import Path
 import sys
 
@@ -517,3 +518,135 @@ def test_prepare_receives_label_none(tmp_path):
         package_loader=loader,
     )
     assert runtime.prepare_labels == [None, None, None, None]
+
+
+def test_evaluation_order_defaults_to_persisted(tmp_path):
+    args = seq.build_parser().parse_args(
+        [
+            "--data",
+            str(tmp_path / "data.h5"),
+            "--model-package",
+            str(tmp_path / "pkg"),
+        ]
+    )
+    assert args.evaluation_order == "persisted"
+    assert args.order_seed == 20260826
+
+
+def test_random_evaluation_indices_are_seeded_label_independent_bijection():
+    first = seq.resolve_evaluation_indices(
+        20, evaluation_order="random_permutation", order_seed=7
+    )
+    repeated = seq.resolve_evaluation_indices(
+        20, evaluation_order="random_permutation", order_seed=7
+    )
+    different = seq.resolve_evaluation_indices(
+        20, evaluation_order="random_permutation", order_seed=8
+    )
+
+    assert np.array_equal(first, repeated)
+    assert not np.array_equal(first, different)
+    assert sorted(first.tolist()) == list(range(20))
+    # The resolver accepts only N/order/seed, so labels cannot affect it.
+    assert "labels" not in seq.resolve_evaluation_indices.__annotations__
+
+
+def test_random_order_moves_trial_level_fields_together_and_remains_causal(tmp_path):
+    FakeNeuroOnlineStrategy.events = []
+    FakeNeuroOnlineStrategy.used_revisions = []
+    FakeNeuroOnlineStrategy.instances = []
+    data_path = write_dataset(
+        tmp_path / "data.h5",
+        labels=[0, 1, 2, 3],
+        trial_ids=[30, 10, 20, 40],
+    )
+    cfg = dataclass_replace(
+        settings(tmp_path, data_path=data_path),
+        evaluation_order="random_permutation",
+        order_seed=11,
+    )
+
+    class PairRecordingRuntimeModel(RecordingRuntimeModel):
+        def __init__(self):
+            super().__init__([0, 1, 2, 3])
+            self.first_values: list[float] = []
+
+        def prepare(self, raw_window):
+            self.first_values.append(float(raw_window.data[0, 0]))
+            return super().prepare(raw_window)
+
+    runtimes: list[PairRecordingRuntimeModel] = []
+
+    def loader(*_args, **_kwargs):
+        runtime = PairRecordingRuntimeModel()
+        runtimes.append(runtime)
+        return FakeLoadedPackage(runtime, cfg.model_package)
+
+    summary = seq.run_evaluation(
+        cfg,
+        package_loader=loader,
+        strategy_factory=FakeNeuroOnlineStrategy,  # type: ignore[arg-type]
+    )
+    rows = [
+        json.loads(line)
+        for line in (cfg.output_dir / "trial_predictions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["mode"] == "neuroonline"
+    ]
+    source_labels = [0, 1, 2, 3]
+    source_ids = [30, 10, 20, 40]
+    for evaluation_ordinal, row in enumerate(rows, start=1):
+        source_index = row["source_dataset_index"]
+        assert row["evaluation_ordinal"] == evaluation_ordinal
+        assert row["trial_ordinal"] == evaluation_ordinal
+        assert row["source_trial_ordinal"] == source_index + 1
+        assert row["true_class_id"] == source_labels[source_index]
+        assert int(row["source_trial_id"]) == source_ids[source_index]
+        assert runtimes[1].first_values[evaluation_ordinal - 1] == pytest.approx(
+            source_index * 2 * 8
+        )
+
+    assert FakeNeuroOnlineStrategy.events[:5] == [
+        "initialize",
+        "predict:0",
+        "observe",
+        f"feedback:{rows[0]['true_class_id']}",
+        "update",
+    ]
+    assert summary["protocol"]["evaluation_order"] == "random_permutation"
+    assert summary["protocol"]["shuffle"] is True
+    assert summary["order_control"]["class_counts_before"] == summary[
+        "order_control"
+    ]["class_counts_after"]
+
+
+def test_static_and_neuroonline_use_identical_random_permutation(tmp_path):
+    data_path = write_dataset(tmp_path / "data.h5")
+    cfg = dataclass_replace(
+        settings(tmp_path, data_path=data_path),
+        evaluation_order="random_permutation",
+        order_seed=91,
+    )
+
+    def loader(*_args, **_kwargs):
+        return FakeLoadedPackage(
+            RecordingRuntimeModel([0, 1, 2, 3]), cfg.model_package
+        )
+
+    seq.run_evaluation(
+        cfg,
+        package_loader=loader,
+        strategy_factory=FakeNeuroOnlineStrategy,  # type: ignore[arg-type]
+    )
+    rows = [
+        json.loads(line)
+        for line in (cfg.output_dir / "trial_predictions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    by_mode = {
+        mode: [row["source_dataset_index"] for row in rows if row["mode"] == mode]
+        for mode in ("none", "neuroonline")
+    }
+    assert by_mode["none"] == by_mode["neuroonline"]

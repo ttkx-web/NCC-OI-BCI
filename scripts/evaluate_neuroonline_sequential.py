@@ -8,7 +8,7 @@ import sys
 import time
 import warnings
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, fields as dataclass_fields
+from dataclasses import asdict, dataclass, fields as dataclass_fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TYPE_CHECKING
@@ -27,6 +27,7 @@ from bci_dayloop.data.sequential_dataset import (
 from bci_dayloop.inference.neuroonline_strategy import (
     NeuroOnlineConfig,
     NeuroOnlineStrategy,
+    VALID_UPDATE_SCOPES,
 )
 from bci_dayloop.runtime.adaptation_types import (
     AdaptationContext,
@@ -100,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_ORDER_SEED,
         help="Seed used only by random_permutation evaluation order.",
+    )
+    parser.add_argument(
+        "--update-scope",
+        choices=VALID_UPDATE_SCOPES,
+        default=None,
+        help="Auditable NeuroOnline parameter update scope.",
     )
     return parser
 
@@ -197,6 +204,14 @@ def resolve_settings(
     subject_value = data_config.get("subject")
     subject_id = None if subject_value is None else str(subject_value)
 
+    neuroonline_config = resolve_neuroonline_config(online.get("neuroonline"))
+    update_scope = getattr(args, "update_scope", None)
+    if update_scope is not None:
+        neuroonline_config = replace(
+            neuroonline_config,
+            update_scope=str(update_scope),
+        )
+
     return SequentialSettings(
         data_path=resolve_path(data_value),
         model_package=resolve_path(package_value),
@@ -209,7 +224,7 @@ def resolve_settings(
         print_every=print_every,
         output_dir=resolve_path(output_dir_value),
         subject_id=subject_id,
-        neuroonline_config=resolve_neuroonline_config(online.get("neuroonline")),
+        neuroonline_config=neuroonline_config,
         evaluation_order=args.evaluation_order,
         order_seed=int(args.order_seed),
     )
@@ -876,6 +891,11 @@ def evaluate_mode(
             block_size=settings.block_size,
         ),
         "updates": summarize_updates(records),
+        "parameter_audit": (
+            getattr(strategy, "parameter_audit", None)
+            if strategy is not None
+            else None
+        ),
     }
     return records, mode_summary
 
@@ -1166,8 +1186,10 @@ def run_evaluation(
             neuroonline_records=mode_records["neuroonline"],
         )
         if identity_check["warning"] is not None:
-            warnings_list.append(str(identity_check["warning"]))
-            print(f"WARNING: {identity_check['warning']}", file=sys.stderr)
+            raise RuntimeError(
+                "NeuroOnline identity initialization gate failed: "
+                f"{identity_check['warning']}"
+            )
         gains = paired_gains(
             static_summary=mode_summaries["none"],
             neuroonline_summary=mode_summaries["neuroonline"],

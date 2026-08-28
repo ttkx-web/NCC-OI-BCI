@@ -28,11 +28,14 @@ from model_50m_neuroonline_support import (
 )
 
 
-def build_strategy() -> tuple[NeuroOnlineStrategy, object, object]:
+def build_strategy(
+    update_scope: str = "generator_and_head",
+) -> tuple[NeuroOnlineStrategy, object, object]:
     backend = build_backend()
     runtime_model = build_runtime_model(backend)
     strategy = NeuroOnlineStrategy(
         NeuroOnlineConfig(
+            update_scope=update_scope,
             num_subject_codes=2,
             num_attention_heads=2,
             dropout=0.0,
@@ -52,6 +55,33 @@ def build_strategy() -> tuple[NeuroOnlineStrategy, object, object]:
         context=AdaptationContext(run_id="50m-stage-b"),
     )
     return strategy, runtime_model, backend
+
+
+def apply_one_update(
+    strategy: NeuroOnlineStrategy,
+    runtime_model: object,
+) -> object:
+    for observation_id, values, mask, label in (
+        ("scope-a", (1.0, 10.0), (1.0, 0.0), 0),
+        ("scope-b", (3.0, 30.0), (0.0, 1.0), 1),
+    ):
+        prepared = make_prepared_input(
+            make_model_input(values=values, mask=mask),
+            trial_id=observation_id,
+        )
+        output = strategy.predict_prepared(prepared)
+        strategy.observe(
+            OnlineObservation(
+                observation_id=observation_id,
+                prepared_input=prepared,
+                output=output,
+                timestamp_sec=0.0,
+            )
+        )
+        strategy.submit_feedback(
+            FeedbackEvent(observation_id=observation_id, label=label)
+        )
+    return strategy.maybe_update(runtime_model=runtime_model)  # type: ignore[arg-type]
 
 
 def assert_state_dict_unchanged(
@@ -209,3 +239,84 @@ def test_strategy_update_changes_generator_and_head_only_with_batched_masks(
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_default_update_scope_preserves_current_generator_and_head_behavior() -> None:
+    assert NeuroOnlineConfig().update_scope == "generator_and_head"
+    strategy, _, _ = build_strategy()
+    assert strategy.parameter_audit["update_scope"] == "generator_and_head"
+    assert strategy.parameter_audit["generator_trainable_param_count"] > 0
+    assert strategy.parameter_audit["head_trainable_param_count"] > 0
+
+
+@pytest.mark.parametrize(
+    ("scope", "generator_changes", "head_changes"),
+    (
+        ("generator_and_head", True, True),
+        ("generator_only", True, False),
+        ("head_only", False, True),
+    ),
+)
+def test_update_scope_optimizer_freezing_and_identity_gate(
+    scope: str,
+    generator_changes: bool,
+    head_changes: bool,
+) -> None:
+    strategy, runtime_model, backend = build_strategy(scope)
+    generator_parameters = list(strategy.generator.parameters())
+    head_parameters = list(backend.adapter.classifier.head.parameters())
+    backbone_parameters = list(backend.adapter.backbone.parameters())
+    optimizer = strategy._optimizer
+    assert optimizer is not None
+    optimizer_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    expected_ids = {
+        id(parameter)
+        for parameter in (
+            ([*generator_parameters] if generator_changes else [])
+            + ([*head_parameters] if head_changes else [])
+        )
+    }
+    assert optimizer_ids == expected_ids
+    assert not any(parameter.requires_grad for parameter in backbone_parameters)
+    audit = strategy.parameter_audit
+    assert audit["backbone_trainable_param_count"] == 0
+    assert (audit["generator_trainable_param_count"] > 0) is generator_changes
+    assert (audit["head_trainable_param_count"] > 0) is head_changes
+
+    prepared = make_prepared_input(
+        make_model_input(values=(1.0, 10.0), mask=(1.0, 0.0)),
+        trial_id="identity",
+    )
+    static_output = runtime_model.predict_prepared(prepared)
+    online_output = strategy.predict_prepared(prepared)
+    assert online_output.predicted_class == static_output.predicted_class
+    torch.testing.assert_close(
+        online_output.probabilities,
+        static_output.probabilities,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    generator_before = clone_state_dict(strategy.generator)
+    head_before = clone_state_dict(backend.adapter.classifier.head)
+    backbone_before = clone_state_dict(backend.adapter.backbone)
+    update = apply_one_update(strategy, runtime_model)
+    assert update.applied is True
+    assert bool(changed_parameter_names(strategy.generator, generator_before)) is generator_changes
+    assert bool(
+        changed_parameter_names(backend.adapter.classifier.head, head_before)
+    ) is head_changes
+    assert_state_dict_unchanged(
+        backbone_before,
+        clone_state_dict(backend.adapter.backbone),
+    )
+    assert update.metrics["update_scope"] == scope
+
+
+def test_invalid_update_scope_fails_closed() -> None:
+    with pytest.raises(ValueError, match="update_scope"):
+        NeuroOnlineConfig(update_scope="everything")

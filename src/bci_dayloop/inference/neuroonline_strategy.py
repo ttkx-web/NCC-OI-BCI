@@ -42,12 +42,19 @@ from bci_dayloop.runtime.types import (
 )
 
 
+VALID_UPDATE_SCOPES = (
+    "generator_and_head",
+    "generator_only",
+    "head_only",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class NeuroOnlineConfig:
     """
     NeuroOnline V1 配置。
 
-    V1 固定：
+    V1 默认：
         - 冻结 backbone；
         - 更新 Generator；
         - 更新 classification head；
@@ -62,6 +69,7 @@ class NeuroOnlineConfig:
     dropout: float = 0.1
 
     # 在线更新参数
+    update_scope: str = "generator_and_head"
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
@@ -91,6 +99,12 @@ class NeuroOnlineConfig:
     seed: int = 42
 
     def __post_init__(self) -> None:
+        if self.update_scope not in VALID_UPDATE_SCOPES:
+            raise ValueError(
+                "update_scope must be one of "
+                f"{VALID_UPDATE_SCOPES}, got {self.update_scope!r}."
+            )
+
         if self.num_subject_codes <= 0:
             raise ValueError(
                 "num_subject_codes must be positive."
@@ -401,10 +415,13 @@ class NeuroOnlineStrategy(
 
     每个在线 session 创建一个实例。
 
-    V1 更新范围：
+    V1 默认更新范围：
         backbone: frozen
         Generator: trainable
         classifier head: trainable
+
+    诊断消融可通过 update_scope 仅更新 Generator 或 head；
+    backbone 始终冻结。
     """
 
     def __init__(
@@ -441,6 +458,16 @@ class NeuroOnlineStrategy(
         self._trainable_parameters: list[
             torch.nn.Parameter
         ] = []
+
+        self._generator_parameters: list[
+            torch.nn.Parameter
+        ] = []
+
+        self._backbone_parameters: list[
+            torch.nn.Parameter
+        ] = []
+
+        self._parameter_audit: dict[str, int | str] = {}
 
         # 已预测但尚未收到真实标签的样本。
         self._pending_observations: (
@@ -514,6 +541,95 @@ class NeuroOnlineStrategy(
         return len(
             self._pending_observations
         )
+
+    @property
+    def parameter_audit(self) -> dict[str, int | str]:
+        """Return the audited optimizer/freeze boundary for this run."""
+
+        self._require_initialized()
+        return dict(self._parameter_audit)
+
+    def _apply_parameter_scope(self) -> None:
+        train_generator = self.config.update_scope in (
+            "generator_and_head",
+            "generator_only",
+        )
+        train_head = self.config.update_scope in (
+            "generator_and_head",
+            "head_only",
+        )
+        for parameter in self._generator_parameters:
+            parameter.requires_grad_(train_generator)
+        for parameter in self._head_parameters:
+            parameter.requires_grad_(train_head)
+
+    @staticmethod
+    def _parameter_count(parameters: list[torch.nn.Parameter]) -> int:
+        return sum(int(parameter.numel()) for parameter in parameters)
+
+    @staticmethod
+    def _discover_backend_parameters(backend: object) -> list[torch.nn.Parameter]:
+        """Discover backend-owned module parameters without changing modes."""
+
+        discovered: dict[int, torch.nn.Parameter] = {}
+        visited: set[int] = set()
+
+        def visit(value: object, depth: int) -> None:
+            if depth > 4 or id(value) in visited:
+                return
+            visited.add(id(value))
+            if isinstance(value, torch.nn.Module):
+                for parameter in value.parameters():
+                    discovered[id(parameter)] = parameter
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    visit(item, depth + 1)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item, depth + 1)
+                return
+            attributes = getattr(value, "__dict__", None)
+            if isinstance(attributes, dict):
+                for item in attributes.values():
+                    visit(item, depth + 1)
+
+        visit(backend, 0)
+        return list(discovered.values())
+
+    def _validate_parameter_scope(self) -> None:
+        generator_count = self._parameter_count(
+            [item for item in self._generator_parameters if item.requires_grad]
+        )
+        head_count = self._parameter_count(
+            [item for item in self._head_parameters if item.requires_grad]
+        )
+        optimizer_count = self._parameter_count(self._trainable_parameters)
+        backbone_count = self._parameter_count(
+            [item for item in self._backbone_parameters if item.requires_grad]
+        )
+        expected_generator = self.config.update_scope != "head_only"
+        expected_head = self.config.update_scope != "generator_only"
+        if (generator_count > 0) != expected_generator:
+            raise RuntimeError("NeuroOnline Generator freeze audit failed.")
+        if (head_count > 0) != expected_head:
+            raise RuntimeError("NeuroOnline classification-head freeze audit failed.")
+        if optimizer_count != generator_count + head_count:
+            raise RuntimeError("NeuroOnline optimizer parameter audit failed.")
+        if backbone_count != 0:
+            raise RuntimeError("NeuroOnline backbone freeze audit failed.")
+
+        # All supported backends guarantee this boundary through
+        # set_online_mode(..., train_backbone=False). The online optimizer is
+        # assembled exclusively from the audited Generator/head lists.
+        self._parameter_audit = {
+            "update_scope": self.config.update_scope,
+            "backbone_trainable_param_count": backbone_count,
+            "generator_trainable_param_count": generator_count,
+            "head_trainable_param_count": head_count,
+            "optimizer_param_count": optimizer_count,
+        }
 
     def _require_initialized(
         self,
@@ -602,12 +718,30 @@ class NeuroOnlineStrategy(
                 "trainable head parameters."
             )
 
-        trainable_parameters = [
-            *forward_model
-            .generator
-            .parameters(),
-            *head_parameters,
+        generator_parameters = list(forward_model.generator.parameters())
+
+        # Restore inference mode before applying the explicit scope. Some
+        # backends toggle head requires_grad while changing online mode.
+        backend.set_online_mode(training=False, train_backbone=False)
+        forward_model.generator.eval()
+
+        self._generator_parameters = generator_parameters
+        self._head_parameters = list(head_parameters)
+        head_parameter_ids = {id(item) for item in self._head_parameters}
+        self._backbone_parameters = [
+            item
+            for item in self._discover_backend_parameters(backend)
+            if id(item) not in head_parameter_ids
         ]
+        self._apply_parameter_scope()
+
+        trainable_parameters = [
+            parameter
+            for parameter in [*generator_parameters, *head_parameters]
+            if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise RuntimeError("NeuroOnline update scope selected no parameters.")
 
         optimizer = torch.optim.AdamW(
             trainable_parameters,
@@ -631,27 +765,13 @@ class NeuroOnlineStrategy(
             forward_model
         )
 
-        self._head_parameters = list(
-            head_parameters
-        )
-
         self._trainable_parameters = list(
             trainable_parameters
         )
 
         self._optimizer = optimizer
 
-        # 创建 optimizer 时 backend 的
-        # get_trainable_parameters("head")
-        # 可能把 head 切到了 train 模式。
-        #
-        # 初始化结束后恢复推理模式。
-        backend.set_online_mode(
-            training=False,
-            train_backbone=False,
-        )
-
-        self.forward_model.generator.eval()
+        self._validate_parameter_scope()
 
     def predict_prepared(
         self,
@@ -667,15 +787,15 @@ class NeuroOnlineStrategy(
 
         self._require_initialized()
 
-        return (
-            self.forward_model
-            .predict_prepared(
-                prepared,
-                return_features=(
-                    return_features
-                ),
-            )
+        output = self.forward_model.predict_prepared(
+            prepared,
+            return_features=return_features,
         )
+        # Model-specific inference mode helpers may toggle the classification
+        # head's requires_grad flag. Reassert the configured freeze boundary.
+        self._apply_parameter_scope()
+        self._validate_parameter_scope()
+        return output
 
     def observe(
         self,
@@ -871,8 +991,7 @@ class NeuroOnlineStrategy(
         """
         满足更新条件时，在最近的有标签样本上训练。
 
-        更新：
-            Generator + head
+        更新范围由 config.update_scope 显式决定；backbone 始终冻结。
 
         冻结：
             backbone
@@ -934,12 +1053,16 @@ class NeuroOnlineStrategy(
         batch_count = 0
         last_gradient_norm = 0.0
 
+        train_generator = self.config.update_scope != "head_only"
+        train_head = self.config.update_scope != "generator_only"
         backend.set_online_mode(
-            training=True,
+            training=train_head,
             train_backbone=False,
         )
+        self._apply_parameter_scope()
+        self._validate_parameter_scope()
 
-        generator.train()
+        generator.train(mode=train_generator)
 
         # 每次 update 使用不同但可复现的 shuffle。
         shuffle_generator = (
@@ -1079,7 +1202,7 @@ class NeuroOnlineStrategy(
                 training=False,
                 train_backbone=False,
             )
-
+            self._apply_parameter_scope()
             generator.eval()
 
         if total_examples <= 0:
@@ -1129,6 +1252,7 @@ class NeuroOnlineStrategy(
                 "last_gradient_norm": (
                     last_gradient_norm
                 ),
+                **self.parameter_audit,
                 "gate_alpha": float(
                     generator
                     .gate_alpha
@@ -1478,4 +1602,6 @@ class NeuroOnlineStrategy(
             train_backbone=False,
         )
 
+        self._apply_parameter_scope()
+        self._validate_parameter_scope()
         self.forward_model.generator.eval()

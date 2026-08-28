@@ -327,6 +327,36 @@ def test_cli_online_strategy_overrides_yaml(tmp_path):
     assert resolved.online_strategy == "both"
 
 
+def test_cli_update_scope_overrides_yaml_without_changing_other_settings(tmp_path):
+    args = seq.build_parser().parse_args(
+        [
+            "--config",
+            "configs/stage0/day1_bnci_s01.yaml",
+            "--data",
+            str(tmp_path / "data.h5"),
+            "--model-package",
+            str(tmp_path / "pkg"),
+            "--update-scope",
+            "generator_only",
+        ]
+    )
+    resolved = seq.resolve_settings(
+        args,
+        {
+            "project": {"run_dir": str(tmp_path / "runs")},
+            "online": {
+                "neuroonline": {
+                    "learning_rate": 1e-4,
+                    "warmup_feedback": 32,
+                }
+            },
+        },
+    )
+    assert resolved.neuroonline_config.update_scope == "generator_only"
+    assert resolved.neuroonline_config.learning_rate == 1e-4
+    assert resolved.neuroonline_config.warmup_feedback == 32
+
+
 def test_post_warmup_starts_after_warmup_feedback():
     records = [
         {

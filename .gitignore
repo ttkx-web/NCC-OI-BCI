@@ -94,3 +94,7 @@ registries/**
 
 *.log
 repo_gitignore_audit.txt
+
+# experiment outputs
+experiments/seed_loso_full/
+experiments/*/report/

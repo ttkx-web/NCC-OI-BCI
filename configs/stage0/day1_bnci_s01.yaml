@@ -47,6 +47,7 @@ training:
   patience: 12
 
 replay:
+  model_package: model_packages/stage0/bnci2014_001/subject_01/labram/population/4s/v1
   acquirer: replay
   session: 1test
   speed: 1.0
@@ -64,3 +65,23 @@ labels:
     feet: FORWARD
     tongue: STOP
 
+online:
+  strategy: neuroonline
+
+  neuroonline:
+    num_subject_codes: 32
+    num_attention_heads: 4
+    dropout: 0.1
+
+    learning_rate: 0.0001
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+
+    warmup_feedback: 32
+    update_interval: 16
+    recent_buffer_size: 64
+    batch_size: 16
+    epochs_per_update: 1
+
+    max_pending_observations: 256
+    seed: 42

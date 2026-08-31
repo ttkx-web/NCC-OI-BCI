@@ -31,9 +31,10 @@ import torch
 
 from _bootstrap import ROOT
 
-from bci_dayloop.data.hdf5_dataset import (
-    EEGHDF5,
-    HDF5Metadata,
+from bci_dayloop.data.sequential_dataset import (
+    SequentialDatasetMetadata,
+    load_sequential_dataset,
+    resolve_population_split_plan,
 )
 from bci_dayloop.data.preprocessing import (
     EEGPreprocessor,
@@ -66,6 +67,34 @@ def resolve_repo_path(
         path = ROOT / path
 
     return path.resolve()
+
+
+def resolve_default_artifact_paths(
+    *,
+    metadata: SequentialDatasetMetadata,
+    target_subject: int,
+    window_seconds: float,
+) -> tuple[Path, Path]:
+    dataset_name = str(metadata.dataset_name).strip()
+    if not dataset_name:
+        raise ValueError("Loaded dataset_name must be non-empty.")
+
+    return (
+        population_head_path(
+            stage="stage0",
+            dataset=dataset_name,
+            subject_id=target_subject,
+            window_seconds=window_seconds,
+            aggregation="labram",
+        ),
+        population_run_dir(
+            stage="stage0",
+            dataset=dataset_name,
+            subject_id=target_subject,
+            window_seconds=window_seconds,
+            aggregation="labram",
+        ),
+    )
 
 
 def current_git_commit() -> str | None:
@@ -173,8 +202,8 @@ def resolve_subject_file(
 
 
 def validate_metadata_compatibility(
-    reference: HDF5Metadata,
-    candidate: HDF5Metadata,
+    reference: SequentialDatasetMetadata,
+    candidate: SequentialDatasetMetadata,
     *,
     subject_id: int,
     path: Path,
@@ -400,19 +429,18 @@ def load_preprocessed_subject_session(
     path: Path,
     session_name: str,
     preprocessor: EEGPreprocessor,
-    reference_metadata: (
-        HDF5Metadata | None
-    ),
+    reference_metadata: SequentialDatasetMetadata | None,
     expected_window_sec: float,
+    trial_window_anchor: str,
     maximum_per_class: int | None,
     seed: int,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
-    HDF5Metadata,
+    SequentialDatasetMetadata,
     dict[str, Any],
 ]:
-    dataset = EEGHDF5(path)
+    dataset = load_sequential_dataset(path, session=session_name)
     metadata = dataset.metadata
 
     if reference_metadata is not None:
@@ -423,43 +451,86 @@ def load_preprocessed_subject_session(
             path=path,
         )
 
-    payload = dataset.load(session_name)
+    source_data = np.asarray(dataset.data, dtype=np.float32)
+    labels = np.asarray(dataset.labels, dtype=np.int64)
 
-    validate_loaded_session(
-        payload,
-        subject_id=subject_id,
-        session_name=session_name,
-        path=path,
+    source_num_samples = int(source_data.shape[-1])
+    source_window_sec = (
+        source_num_samples
+        / float(metadata.sample_rate)
     )
 
-    raw_data = np.asarray(
-        payload["data"],
-        dtype=np.float32,
+    if (
+        metadata.dataset_name == "workload_pbci_hackathon"
+        and not np.isclose(source_window_sec, expected_window_sec, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(
+            "Workload trials must be consumed at their persisted window duration; "
+            f"dataset={source_window_sec}, requested={expected_window_sec}."
+        )
+
+    target_num_samples = int(
+        round(
+            float(expected_window_sec)
+            * float(metadata.sample_rate)
+        )
     )
 
-    labels = np.asarray(
-        payload["labels"],
-        dtype=np.int64,
-    )
+    if target_num_samples <= 0:
+        raise ValueError(
+            "expected_window_sec must resolve to at least "
+            "one sample."
+        )
 
-    raw_window_sec = (
-        raw_data.shape[-1]
+    resolved_window_sec = (
+        target_num_samples
         / float(metadata.sample_rate)
     )
 
     if not np.isclose(
-        raw_window_sec,
+        resolved_window_sec,
         expected_window_sec,
         rtol=0.0,
         atol=1e-6,
     ):
         raise ValueError(
+            "expected_window_sec is not representable at "
+            f"the source sampling rate: "
+            f"requested={expected_window_sec}, "
+            f"resolved={resolved_window_sec}."
+        )
+
+    if target_num_samples > source_num_samples:
+        raise ValueError(
             f"{path}: source trials are "
-            f"{raw_window_sec:.6f}s, but this "
-            f"experiment requires "
-            f"{expected_window_sec:.6f}s direct "
-            "trials. Do not silently crop or "
-            "concatenate trials."
+            f"{source_window_sec:.6f}s, but the requested "
+            f"window is {expected_window_sec:.6f}s. "
+            "This script may crop an existing trial, but "
+            "never concatenate trials or pad missing data."
+        )
+
+    if trial_window_anchor == "end":
+        start_sample = source_num_samples - target_num_samples
+        end_sample = source_num_samples
+    elif trial_window_anchor == "start":
+        start_sample = 0
+        end_sample = target_num_samples
+    else:
+        raise ValueError(
+            "trial_window_anchor must be 'start' or 'end', "
+            f"got {trial_window_anchor!r}."
+        )
+
+    raw_data = np.ascontiguousarray(
+        source_data[:, :, start_sample:end_sample],
+        dtype=np.float32,
+    )
+
+    if raw_data.shape[-1] != target_num_samples:
+        raise RuntimeError(
+            "Selected trial window has an unexpected sample "
+            f"count: expected={target_num_samples}, "
+            f"actual={raw_data.shape[-1]}."
         )
 
     X = preprocessor.transform(
@@ -481,18 +552,13 @@ def load_preprocessed_subject_session(
             "match labels."
         )
 
-    if X.shape[1] != len(
-        metadata.channel_names
-    ):
+    if X.shape[1] != len(metadata.channel_names):
         raise ValueError(
             "Preprocessed channel count does not "
             "match metadata."
         )
 
-    if (
-        X.shape[-1]
-        != preprocessor.config.patch_samples
-    ):
+    if X.shape[-1] != preprocessor.config.patch_samples:
         raise ValueError(
             "Unexpected LaBraM patch length: "
             f"{X.shape[-1]}."
@@ -501,8 +567,7 @@ def load_preprocessed_subject_session(
     expected_patches = int(
         round(
             expected_window_sec
-            * preprocessor.config
-            .target_sample_rate
+            * preprocessor.config.target_sample_rate
             / preprocessor.config.patch_samples
         )
     )
@@ -517,9 +582,7 @@ def load_preprocessed_subject_session(
     X, labels = limit_trials_per_class(
         X,
         labels,
-        maximum_per_class=(
-            maximum_per_class
-        ),
+        maximum_per_class=maximum_per_class,
         seed=seed,
     )
 
@@ -536,21 +599,20 @@ def load_preprocessed_subject_session(
         "subject_id": int(subject_id),
         "path": str(path),
         "session": session_name,
-        "raw_shape": list(
-            raw_data.shape
-        ),
-        "preprocessed_shape": list(
-            X.shape
-        ),
+        "source_raw_shape": list(source_data.shape),
+        "selected_raw_shape": list(raw_data.shape),
+        "preprocessed_shape": list(X.shape),
+        "source_window_seconds": float(source_window_sec),
+        "selected_window_seconds": float(resolved_window_sec),
+        "trial_window_anchor": trial_window_anchor,
+        "start_sample": int(start_sample),
+        "end_sample": int(end_sample),
         "num_trials": int(len(X)),
         "class_counts": class_counts,
     }
 
     return (
-        np.asarray(
-            X,
-            dtype=np.float32,
-        ),
+        np.asarray(X, dtype=np.float32),
         labels,
         metadata,
         summary,
@@ -756,6 +818,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--trial-window-anchor",
+        choices=["start", "end"],
+        default="end",
+        help=(
+            "How to select a shorter direct window from "
+            "the stored trial. 'end' keeps the trial end "
+            "fixed; for BNCI [2,6], 3s becomes [3,6]."
+        ),
+    )
+
+    parser.add_argument(
         "--target-sample-rate",
         type=float,
         default=200.0,
@@ -883,11 +956,8 @@ def main() -> None:
             "in --subjects."
         )
 
-    population_subjects = [
-        subject
-        for subject in subjects
-        if subject != target_subject
-    ]
+    split_plan = resolve_population_split_plan(subjects, target_subject, args.train_session, args.validation_session, args.final_test_session)
+    population_subjects = list(split_plan.train_subjects)
 
     if not population_subjects:
         raise ValueError(
@@ -920,31 +990,25 @@ def main() -> None:
         for subject in subjects
     }
 
+    identity_metadata = load_sequential_dataset(
+        subject_paths[population_subjects[0]],
+        session=split_plan.train_session,
+    ).metadata
+    default_output_path, default_run_dir = resolve_default_artifact_paths(
+        metadata=identity_metadata,
+        target_subject=target_subject,
+        window_seconds=args.window_sec,
+    )
+
     if args.output is None:
-        output_path = population_head_path(
-            stage="stage0",
-            dataset=args.dataset_name,
-            subject_id=target_subject,
-            window_seconds=(
-                args.window_sec
-            ),
-            aggregation="labram",
-        )
+        output_path = default_output_path
     else:
         output_path = resolve_repo_path(
             args.output
         )
 
     if args.run_dir is None:
-        run_dir = population_run_dir(
-            stage="stage0",
-            dataset=args.dataset_name,
-            subject_id=target_subject,
-            window_seconds=(
-                args.window_sec
-            ),
-            aggregation="labram",
-        )
+        run_dir = default_run_dir
     else:
         run_dir = resolve_repo_path(
             args.run_dir
@@ -1002,6 +1066,7 @@ def main() -> None:
 
     run_config   = {
         "status": "started",
+        "dataset": str(identity_metadata.dataset_name),
         "created_at": (
             datetime.now().isoformat()
         ),
@@ -1062,7 +1127,7 @@ def main() -> None:
     }
 
     reference_metadata: (
-        HDF5Metadata | None
+        SequentialDatasetMetadata | None
     ) = None
 
     print(
@@ -1091,6 +1156,7 @@ def main() -> None:
                 expected_window_sec=(
                     args.window_sec
                 ),
+                trial_window_anchor=args.trial_window_anchor,
                 maximum_per_class=(
                     args
                     .max_trials_per_class_per_subject
@@ -1119,6 +1185,7 @@ def main() -> None:
                 expected_window_sec=(
                     args.window_sec
                 ),
+                trial_window_anchor=args.trial_window_anchor,
                 maximum_per_class=(
                     args
                     .max_trials_per_class_per_subject
@@ -1272,6 +1339,7 @@ def main() -> None:
         expected_window_sec=(
             args.window_sec
         ),
+        trial_window_anchor=args.trial_window_anchor,
         maximum_per_class=(
             args
             .max_trials_per_class_per_subject

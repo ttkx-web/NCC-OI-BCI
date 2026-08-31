@@ -4,10 +4,26 @@ import argparse
 import json
 import sys
 import numpy as np
-from dataclasses import dataclass, replace as dataclass_replace
+from collections.abc import Callable
+from dataclasses import (
+    dataclass,
+    fields as dataclass_fields,
+    replace as dataclass_replace,
+)
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from bci_dayloop.inference.neuroonline_strategy import (
+    NeuroOnlineConfig,
+    NeuroOnlineStrategy,
+)
+from bci_dayloop.runtime.adaptation_types import (
+    AdaptationContext,
+    FeedbackEvent,
+    OnlineObservation,
+    OnlineUpdateResult,
+)
 
 from _bootstrap import ROOT  # noqa: F401
 
@@ -57,6 +73,13 @@ class ReplaySettings:
     maximum_windows: int | None
     jsonl_log_path: Path | None
     summary_json_path: Path
+    online_strategy: str = "none"
+
+    neuroonline_config: (
+        NeuroOnlineConfig | None
+    ) = None
+
+    subject_id: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,14 +96,78 @@ def build_parser() -> argparse.ArgumentParser:
     jsonl_group.add_argument("--jsonl-log")
     jsonl_group.add_argument("--no-jsonl-log", action="store_true")
     parser.add_argument("--summary-json")
+    parser.add_argument(
+        "--online-strategy",
+        choices=(
+            "none",
+            "neuroonline",
+        ),
+        default=None,
+        help=(
+            "Online adaptation strategy. "
+            "'none' keeps the original static path."
+        ),
+    )
     return parser
 
 
 def _first_defined(command_line: Any, yaml_value: Any, default: Any) -> Any:
     return command_line if command_line is not None else yaml_value if yaml_value is not None else default
 
+def _resolve_neuroonline_config(
+    value: object,
+) -> NeuroOnlineConfig:
+    if value is None:
+        payload: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        payload = dict(value)
+    else:
+        raise TypeError(
+            "online.neuroonline must be a mapping."
+        )
+
+    allowed_fields = {
+        item.name
+        for item in dataclass_fields(
+            NeuroOnlineConfig
+        )
+    }
+
+    unknown_fields = (
+        set(payload)
+        - allowed_fields
+    )
+
+    if unknown_fields:
+        raise ValueError(
+            "Unknown NeuroOnline settings: "
+            f"{sorted(unknown_fields)}."
+        )
+
+    return NeuroOnlineConfig(
+        **payload
+    )
 
 def resolve_replay_settings(args: argparse.Namespace, config: dict[str, Any]) -> ReplaySettings:
+    online_value = config.get(
+        "online",
+        {},
+    )
+
+    if online_value is None:
+        online: dict[str, Any] = {}
+    elif isinstance(
+            online_value,
+            dict,
+    ):
+        online = dict(
+            online_value
+        )
+    else:
+        raise TypeError(
+            "online must be a mapping."
+        )
+
     replay = dict(config.get("replay", {}))
     model_config = dict(config.get("model", {}))
     project = dict(config.get("project", {}))
@@ -114,6 +201,43 @@ def resolve_replay_settings(args: argparse.Namespace, config: dict[str, Any]) ->
         jsonl_log_path = resolve_path(jsonl_value) if jsonl_value is not None else None
     summary_value = _first_defined(args.summary_json, replay.get("summary_json"), run_dir / "replay_summary.json")
 
+    online_strategy = str(
+        _first_defined(
+            args.online_strategy,
+            online.get("strategy"),
+            "none",
+        )
+    ).strip().lower()
+
+    if online_strategy not in {
+        "none",
+        "neuroonline",
+    }:
+        raise ValueError(
+            "online strategy must be "
+            "'none' or 'neuroonline', got "
+            f"{online_strategy!r}."
+        )
+
+    neuroonline_config = (
+        _resolve_neuroonline_config(
+            online.get("neuroonline")
+        )
+        if online_strategy
+           == "neuroonline"
+        else None
+    )
+
+    subject_value = (
+        data_config.get("subject")
+    )
+
+    subject_id = (
+        None
+        if subject_value is None
+        else str(subject_value)
+    )
+
     return ReplaySettings(
         data_path=resolve_path(data_value),
         model_package=resolve_path(package_value),
@@ -128,8 +252,146 @@ def resolve_replay_settings(args: argparse.Namespace, config: dict[str, Any]) ->
         maximum_windows=maximum_windows,
         jsonl_log_path=jsonl_log_path,
         summary_json_path=resolve_path(summary_value),
+        online_strategy=(
+            online_strategy
+        ),
+        neuroonline_config=(
+            neuroonline_config
+        ),
+        subject_id=subject_id,
     )
 
+OnlineReplayHandler = Callable[
+    [OnlineObservation, int | None],
+    OnlineUpdateResult | None,
+]
+
+
+def build_online_replay_components(
+    settings: ReplaySettings,
+    *,
+    runtime_package: LoadedRuntimePackage,
+) -> tuple[
+    NeuroOnlineStrategy | None,
+    OnlineReplayHandler | None,
+]:
+    """
+    普通模式：
+        predictor=None
+        handler=None
+
+    NeuroOnline 模式：
+        predictor=NeuroOnlineStrategy
+        handler=真实标签反馈和更新函数
+    """
+
+    if settings.online_strategy == "none":
+        return None, None
+
+    if settings.online_strategy != "neuroonline":
+        raise ValueError(
+            "Unsupported online strategy: "
+            f"{settings.online_strategy!r}."
+        )
+
+    if settings.neuroonline_config is None:
+        raise RuntimeError(
+            "NeuroOnline mode is enabled, but "
+            "neuroonline_config is missing."
+        )
+
+    runtime_model = (
+        runtime_package.runtime_model
+    )
+
+    # 每个 replay session 只创建一个 strategy。
+    # Generator 也只会在 initialize() 中创建一次。
+    strategy = NeuroOnlineStrategy(
+        settings.neuroonline_config
+    )
+
+    run_timestamp = (
+        datetime.now(timezone.utc)
+        .strftime(
+            "%Y%m%dT%H%M%S%fZ"
+        )
+    )
+
+    strategy.initialize(
+        runtime_model=runtime_model,
+        context=AdaptationContext(
+            run_id=(
+                f"replay-{run_timestamp}"
+            ),
+            subject_id=(
+                settings.subject_id
+            ),
+            session=settings.session,
+            metadata={
+                "source": (
+                    "replay_offline"
+                ),
+                "data_path": str(
+                    settings.data_path
+                ),
+                "model_package": str(
+                    settings.model_package
+                ),
+            },
+        ),
+    )
+
+    def handle_observation(
+        observation: OnlineObservation,
+        true_label: int | None,
+    ) -> OnlineUpdateResult:
+        # 离线实验必须有真实标签。
+        # 这里不能退化为预测类别/伪标签。
+        if true_label is None:
+            raise RuntimeError(
+                "NeuroOnline replay requires "
+                "a true label for every window."
+            )
+
+        # 1. 保存刚刚完成预测的输入。
+        strategy.observe(
+            observation
+        )
+
+        # 2. 用 observation_id 将真实标签
+        #    和刚才的输入对应起来。
+        strategy.submit_feedback(
+            FeedbackEvent(
+                observation_id=(
+                    observation
+                    .observation_id
+                ),
+                label=int(
+                    true_label
+                ),
+                reward=None,
+                timestamp_sec=(
+                    observation
+                    .timestamp_sec
+                ),
+                metadata={
+                    "source": (
+                        "offline_ground_truth"
+                    ),
+                },
+            )
+        )
+
+        # 3. 检查 warmup 和 update_interval；
+        #    满足条件时更新 Generator + head。
+        return strategy.maybe_update(
+            runtime_model=runtime_model
+        )
+
+    return (
+        strategy,
+        handle_observation,
+    )
 
 def expected_and_target_windows(
     *,
@@ -227,10 +489,28 @@ def build_pipeline_controller(
         else None
     )
 
+    online_predictor, online_handler = (
+        build_online_replay_components(
+            settings,
+            runtime_package=runtime_package,
+        )
+    )
+
     decoder = SlidingWindowDecoder(
         runtime_model=(
             runtime_package.runtime_model
         ),
+
+        # none 模式下这里是 None，
+        # Decoder 自动使用 runtime_model。
+        #
+        # neuroonline 模式下这里是 strategy。
+        predictor=online_predictor,
+
+        online_observation_handler=(
+            online_handler
+        ),
+
         class_names=(
             runtime_package.class_names
         ),
@@ -337,49 +617,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"dataset={dataset_classes}, "
                 f"package={runtime_package.class_names}."
             )
-        package_window = runtime_package.window_sec
-        package_step = runtime_package.step_sec
 
-        explicit_window = (
-                args.window_sec is not None
-                or "window_sec" in config.get("replay", {})
-        )
-
-        explicit_step = (
-                args.step_sec is not None
-                or "step_sec" in config.get("replay", {})
-        )
-        if (
-                explicit_window
-                and not np.isclose(
-            settings.window_sec,
-            package_window,
-            atol=1e-6,
-            rtol=0.0,
-        )
-        ):
-            raise ValueError(
-                "Requested window_sec does not match "
-                "the Runtime Model Package: "
-                f"requested={settings.window_sec}, "
-                f"package={package_window}."
-            )
-
-        if (
-                explicit_step
-                and not np.isclose(
-            settings.step_sec,
-            package_step,
-            atol=1e-6,
-            rtol=0.0,
-        )
-        ):
-            raise ValueError(
-                "Requested step_sec does not match "
-                "the Runtime Model Package: "
-                f"requested={settings.step_sec}, "
-                f"package={package_step}."
-            )
         package_window = (
             runtime_package.window_sec
         )
@@ -388,16 +626,18 @@ def main(argv: list[str] | None = None) -> int:
             runtime_package.step_sec
         )
 
+        replay_config = dict(
+            config.get("replay", {})
+        )
+
         explicit_window = (
                 args.window_sec is not None
-                or "window_sec"
-                in config.get("replay", {})
+                or "window_sec" in replay_config
         )
 
         explicit_step = (
                 args.step_sec is not None
-                or "step_sec"
-                in config.get("replay", {})
+                or "step_sec" in replay_config
         )
 
         if (

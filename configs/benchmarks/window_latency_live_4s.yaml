@@ -1,0 +1,22 @@
+benchmark:
+  mode: device
+  device: cuda
+  source:
+    host_env: NEURACLE_JELLYFISH_HOST
+    port: 8712
+    expected_sampling_rate: 1000
+    duration_sec: 150
+  schedule:
+    window_sec: 4.0
+    step_sec: 0.5
+    warmup_windows: 20
+    measured_windows: 200
+  output:
+    root_dir: runs/benchmarks/window_latency_live_4s
+  candidates:
+    - id: model_50m_4s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/4s_flatten/experimentB/1e-3/v1
+    - id: labram_live19_4s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/4s_labram_live19/v1
+    - id: cbramod_live19_spline22_4s
+      package: model_packages/stage1/bnci2014_001/subject_01/population/4s_cbramod_live19_spline22/v1

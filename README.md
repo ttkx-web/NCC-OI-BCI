@@ -436,7 +436,7 @@ conda create -n bci-dayloop python=3.11 -y
 conda activate bci-dayloop
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 ### 10.2 NVIDIA CUDA 环境
@@ -444,8 +444,13 @@ python -m pip install -e .
 ```bash
 conda env create -f environment.yml
 conda activate bci-dayloop
-python -m pip install -e .
+# Install the platform-approved CUDA PyTorch wheel separately, then:
+python -m pip install -e . --no-deps
 ```
+
+For the supported deployment procedure and GPU validation gate, see
+[`docs/server_deployment.md`](docs/server_deployment.md). The base environment
+does not select a CUDA wheel or CUDA toolkit.
 
 ### 10.3 BNCI 数据准备环境
 

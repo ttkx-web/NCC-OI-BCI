@@ -93,6 +93,9 @@ class RuntimeBenchmarkCore:
         synchronize_device(self.device)
         preprocessing_finished = time.perf_counter()
 
+        if item.prepare_validator is not None:
+            item.prepare_validator(prepared)
+
         inference_started = time.perf_counter()
         output = self.runtime_model.predict_prepared(prepared)
         synchronize_device(self.device)
@@ -226,17 +229,23 @@ class RuntimeBenchmarkCore:
             warmup_windows + measured_windows
         )
 
-        for provider_index, item in enumerate(provider):
-            record = self._run_one(item)
+        iterator = iter(provider)
+        try:
+            for provider_index, item in enumerate(iterator):
+                record = self._run_one(item)
 
             # Warmup 已实际执行，但不写入 latency 统计。
-            if provider_index < warmup_windows:
-                continue
+                if provider_index < warmup_windows:
+                    continue
 
-            records.append(record)
+                records.append(record)
 
-            if len(records) >= measured_windows:
-                break
+                if len(records) >= measured_windows:
+                    break
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
 
         if len(records) != measured_windows:
             raise RuntimeError(

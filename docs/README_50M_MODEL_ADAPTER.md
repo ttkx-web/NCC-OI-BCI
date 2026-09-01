@@ -138,7 +138,7 @@ probabilities:    [B, num_classes]
 
 ```bash
 conda activate bci-dayloop
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 确认导入的是当前仓库：

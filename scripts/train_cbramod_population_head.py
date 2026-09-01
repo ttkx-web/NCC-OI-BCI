@@ -57,6 +57,7 @@ from bci_dayloop.data.sequential_dataset import (
     load_sequential_dataset,
     resolve_population_split_plan,
 )
+from bci_dayloop.data.channel_selection import select_named_channels
 from bci_dayloop.models.cbramod.backbone import (
     CBraModBackbone,
 )
@@ -65,7 +66,10 @@ from bci_dayloop.models.cbramod.classifier import (
     build_cbramod_classifier,
 )
 from bci_dayloop.models.cbramod.config import (
+    CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE,
+    CBRAMOD_STRICT22_PROFILE,
     CBraModConfig,
+    resolve_cbramod_deployment_profile,
 )
 from bci_dayloop.models.cbramod.preprocessing import (
     CBraModPipelinePreprocessor,
@@ -235,6 +239,7 @@ def resolve_default_artifact_paths(
     metadata: SequentialDatasetMetadata,
     target_subject: int,
     window_tag: str,
+    model_path_component: str = "cbramod",
 ) -> tuple[Path, Path]:
     dataset_name = str(metadata.dataset_name).strip()
     if not dataset_name:
@@ -246,7 +251,7 @@ def resolve_default_artifact_paths(
         / "stage1"
         / dataset_name
         / f"subject_{target_subject:02d}"
-        / "cbramod"
+        / model_path_component
         / window_tag
     )
     head_path = (
@@ -256,7 +261,7 @@ def resolve_default_artifact_paths(
         / "stage1"
         / dataset_name
         / f"subject_{target_subject:02d}"
-        / "cbramod"
+        / model_path_component
         / window_tag
         / "head.pt"
     )
@@ -325,9 +330,11 @@ def build_preprocessing_manifest(
     config: CBraModConfig,
     source_unit: str,
     direct_trial_anchor: str,
+    deployment_profile: Any | None = None,
+    completion_matrix_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Build the persisted preprocessing contract without loading a model."""
-    return {
+    manifest = {
         "source_unit": str(source_unit),
         "standard_channels": list(config.standard_channels),
         "target_sample_rate": config.target_sample_rate,
@@ -354,6 +361,32 @@ def build_preprocessing_manifest(
         "min_observed_channels": config.min_observed_channels,
         "spline_alpha": config.spline_alpha,
     }
+    if deployment_profile is not None:
+        manifest.update(
+            {
+                "deployment_profile": deployment_profile.name,
+                "training_channel_source_count": deployment_profile.training_channel_source_count,
+                "observed_channel_count": len(deployment_profile.observed_channel_names),
+                "observed_channel_names": list(deployment_profile.observed_channel_names),
+                "simulated_missing_channels": list(deployment_profile.simulated_missing_channels),
+                "channel_completion_source": deployment_profile.channel_completion_source,
+                "completion_matrix_sha256": completion_matrix_sha256,
+            }
+        )
+    return manifest
+
+
+def state_dict_sha256(
+    state_dict: Mapping[str, torch.Tensor],
+) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def current_git_commit() -> str | None:
@@ -602,6 +635,9 @@ def prepare_cbramod_trials(
     session_name: str,
     canonicalizer: SignalCanonicalizer,
     preprocessor: CBraModPipelinePreprocessor,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
 ) -> np.ndarray:
     """
     将 HDF5 的 [N, C, T] trial 转成 CBRaMod 的 [N, 22, 4, 200]。
@@ -620,13 +656,20 @@ def prepare_cbramod_trials(
             "trial_ids length does not match number of trials."
         )
 
+    values, selected_channel_names = select_named_channels(
+        values,
+        source_channel_names=metadata.channel_names,
+        requested_channel_names=observed_channel_names,
+        channel_axis=1,
+    )
+
     prepared_trials: list[np.ndarray] = []
 
     for index, trial in enumerate(values):
         raw_window = RawEEGWindow(
             data=trial,
             channel_names=list(
-                metadata.channel_names
+                selected_channel_names
             ),
             sample_rate=float(metadata.sample_rate),
             unit=str(metadata.unit),
@@ -646,6 +689,44 @@ def prepare_cbramod_trials(
         prepared = preprocessor.transform(
             canonical_window
         )
+
+        diagnostics = prepared.diagnostics
+        expected_observed = tuple(
+            str(name).upper() for name in selected_channel_names
+        )
+        actual_observed = tuple(
+            str(name).upper()
+            for name in diagnostics.get("observed_channel_names", ())
+        )
+        if actual_observed != expected_observed:
+            raise RuntimeError(
+                "CBRaMod training preprocessor observed unexpected channels: "
+                f"expected={expected_observed}, actual={actual_observed}."
+            )
+        expected_missing = tuple(
+            str(name).upper() for name in simulated_missing_channels
+        )
+        actual_missing = tuple(
+            str(name).upper()
+            for name in diagnostics.get("missing_channel_names", ())
+        )
+        if actual_missing != expected_missing:
+            raise RuntimeError(
+                "CBRaMod training missing-channel simulation changed: "
+                f"expected={expected_missing}, actual={actual_missing}."
+            )
+        if int(diagnostics.get("duplicate_channel_count", -1)) != 0:
+            raise RuntimeError(
+                "CBRaMod training input must not contain duplicate channels."
+            )
+        actual_completion_sha256 = diagnostics.get(
+            "completion_matrix_sha256"
+        )
+        if actual_completion_sha256 != expected_completion_matrix_sha256:
+            raise RuntimeError(
+                "CBRaMod training completion matrix SHA-256 does not match "
+                "the deployment profile."
+            )
 
         signal = prepared.model_input["signal"]
 
@@ -774,6 +855,9 @@ def build_subject_feature_split(
     backbone: CBraModBackbone,
     feature_batch_size: int,
     direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
 ) -> tuple[FeatureSplit, SequentialDatasetMetadata]:
     dataset = load_sequential_dataset(subject_path, session=session_name)
     metadata = dataset.metadata
@@ -843,6 +927,11 @@ def build_subject_feature_split(
         session_name=session_name,
         canonicalizer=canonicalizer,
         preprocessor=preprocessor,
+        observed_channel_names=observed_channel_names,
+        simulated_missing_channels=simulated_missing_channels,
+        expected_completion_matrix_sha256=(
+            expected_completion_matrix_sha256
+        ),
     )
 
     features = extract_frozen_features(
@@ -1372,6 +1461,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--deployment-profile",
+        choices=(
+            CBRAMOD_STRICT22_PROFILE,
+            CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE,
+        ),
+        default=CBRAMOD_STRICT22_PROFILE,
+        help=(
+            "strict22 preserves the native 22-channel baseline; "
+            "neuracle_live19_spline22 explicitly removes CPz/P1/P2 "
+            "before the shared runtime preprocessor completes them."
+        ),
+    )
+
+    parser.add_argument(
         "--direct-trial-anchor",
         choices=["start", "center", "end"],
         default="end",
@@ -1421,10 +1524,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=["none", "per_window_zscore", "fixed_100uv"],
         default="none",
     )
-    parser.add_argument("--missing-channel-policy", choices=["error", "spherical_spline"], default="error")
+    # Retain the historical knobs for CLI compatibility. Deployment artifacts
+    # are produced from the named profile unless callers explicitly override it.
+    parser.add_argument("--missing-channel-policy", choices=["error", "spherical_spline"], default=None)
     parser.add_argument("--min-observed-channels", type=int, default=None)
-    parser.add_argument("--spline-alpha", type=float, default=1e-5)
-
+    parser.add_argument("--spline-alpha", type=float, default=None)
     parser.add_argument(
         "--head-type",
         choices=["official_mlp", "linear"],
@@ -1475,6 +1579,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argument_parser().parse_args()
 
+    deployment_profile = resolve_cbramod_deployment_profile(
+        args.deployment_profile
+    )
+
     time_segments = resolve_cbramod_time_segments(
         window_seconds=args.window_seconds,
         target_sample_rate=args.target_sample_rate,
@@ -1513,6 +1621,12 @@ def main() -> None:
             "CBraMod backbone checkpoint was not found: "
             f"{checkpoint_path}"
         )
+
+    profile_output_name = (
+        "cbramod"
+        if deployment_profile.name == CBRAMOD_STRICT22_PROFILE
+        else "cbramod_live19_spline22"
+    )
 
     class_names: tuple[str, ...] | None = None
     reference_metadata: SequentialDatasetMetadata | None = None
@@ -1556,6 +1670,7 @@ def main() -> None:
         metadata=reference_metadata,
         target_subject=target_subject,
         window_tag=window_tag,
+        model_path_component=profile_output_name,
     )
     run_dir = (
         resolve_repo_path(args.run_dir)
@@ -1592,9 +1707,13 @@ def main() -> None:
         filter_order=args.filter_order,
         reference_mode=args.reference_mode,
         normalization=args.normalization,
-        missing_channel_policy=args.missing_channel_policy,
-        min_observed_channels=args.min_observed_channels,
-        spline_alpha=args.spline_alpha,
+        missing_channel_policy=(
+            deployment_profile.missing_channel_policy
+        ),
+        min_observed_channels=(
+            deployment_profile.min_observed_channels
+        ),
+        spline_alpha=deployment_profile.spline_alpha,
 
         num_classes=len(class_names),
         head_type=args.head_type,
@@ -1603,12 +1722,24 @@ def main() -> None:
         head_dropout=args.head_dropout,
     )
 
+    canonicalizer = SignalCanonicalizer(
+        target_unit=config.input_unit
+    )
+    preprocessor = CBraModPipelinePreprocessor(config)
+    completion_matrix_sha256 = (
+        preprocessor.completion_matrix_sha256_for(
+            deployment_profile.observed_channel_names
+        )
+    )
+
     backbone_sha256 = sha256_file(checkpoint_path)
 
     preprocessing_manifest = build_preprocessing_manifest(
         config=config,
         source_unit=str(reference_metadata.unit),
         direct_trial_anchor=args.direct_trial_anchor,
+        deployment_profile=deployment_profile,
+        completion_matrix_sha256=completion_matrix_sha256,
     )
 
     preprocessing_hash = stable_json_hash(
@@ -1676,14 +1807,6 @@ def main() -> None:
             "parameters are trainable: "
             f"{frozen_parameters[:10]}."
         )
-
-    canonicalizer = SignalCanonicalizer(
-        target_unit=config.input_unit
-    )
-
-    preprocessor = CBraModPipelinePreprocessor(
-        config
-    )
 
     feature_cache_dir = (
         resolve_repo_path(args.feature_cache_dir)
@@ -1759,6 +1882,15 @@ def main() -> None:
                     ),
                     direct_trial_anchor=(
                         args.direct_trial_anchor
+                    ),
+                    observed_channel_names=(
+                        deployment_profile.observed_channel_names
+                    ),
+                    simulated_missing_channels=(
+                        deployment_profile.simulated_missing_channels
+                    ),
+                    expected_completion_matrix_sha256=(
+                        completion_matrix_sha256
                     ),
                 )
             )
@@ -1948,6 +2080,10 @@ def main() -> None:
         num_classes=config.num_classes,
     )
 
+    classifier_state_dict_sha256 = state_dict_sha256(
+        classifier.state_dict()
+    )
+
     saved_head_path = save_cbramod_classifier_checkpoint(
         classifier,
         output_head_path,
@@ -1955,6 +2091,11 @@ def main() -> None:
         class_names=class_names,
         extra_metadata={
             "dataset": str(reference_metadata.dataset_name),
+            "artifact_metadata": {
+                "trained_head": True,
+                "head_type": "population",
+                "is_test_head": False,
+            },
             "target_subject": target_subject,
             "population_training_subjects": (
                 population_subjects
@@ -1987,9 +2128,39 @@ def main() -> None:
             ),
             "backbone_sha256": backbone_sha256,
             "preprocessing_hash": preprocessing_hash,
+            "deployment_profile": deployment_profile.name,
+            "training_channel_source_count": (
+                deployment_profile.training_channel_source_count
+            ),
+            "observed_channel_count": len(
+                deployment_profile.observed_channel_names
+            ),
+            "observed_channel_names": list(
+                deployment_profile.observed_channel_names
+            ),
+            "simulated_missing_channels": list(
+                deployment_profile.simulated_missing_channels
+            ),
+            "missing_channel_policy": (
+                deployment_profile.missing_channel_policy
+            ),
+            "min_observed_channels": (
+                deployment_profile.min_observed_channels
+            ),
+            "spline_alpha": deployment_profile.spline_alpha,
+            "channel_completion_source": (
+                deployment_profile.channel_completion_source
+            ),
+            "completion_matrix_sha256": (
+                completion_matrix_sha256
+            ),
+            "classifier_state_dict_sha256": (
+                classifier_state_dict_sha256
+            ),
             "seed": args.seed,
         },
     )
+    classifier_sha256 = sha256_file(saved_head_path)
 
     write_confusion_matrix_csv(
         path=run_dir / "final_confusion_matrix.csv",
@@ -2019,6 +2190,39 @@ def main() -> None:
         "backbone_checkpoint": str(checkpoint_path),
         "backbone_sha256": backbone_sha256,
         "classifier_checkpoint": str(saved_head_path),
+        "classifier_sha256": classifier_sha256,
+        "classifier_state_dict_sha256": (
+            classifier_state_dict_sha256
+        ),
+        "artifact_metadata": {
+            "trained_head": True,
+            "head_type": "population",
+            "is_test_head": False,
+        },
+        "deployment_profile": deployment_profile.name,
+        "training_channel_source_count": (
+            deployment_profile.training_channel_source_count
+        ),
+        "observed_channel_count": len(
+            deployment_profile.observed_channel_names
+        ),
+        "observed_channel_names": list(
+            deployment_profile.observed_channel_names
+        ),
+        "simulated_missing_channels": list(
+            deployment_profile.simulated_missing_channels
+        ),
+        "missing_channel_policy": (
+            deployment_profile.missing_channel_policy
+        ),
+        "min_observed_channels": (
+            deployment_profile.min_observed_channels
+        ),
+        "spline_alpha": deployment_profile.spline_alpha,
+        "channel_completion_source": (
+            deployment_profile.channel_completion_source
+        ),
+        "completion_matrix_sha256": completion_matrix_sha256,
         "preprocessing": preprocessing_manifest,
         "preprocessing_hash": preprocessing_hash,
         "best_epoch": best_epoch,

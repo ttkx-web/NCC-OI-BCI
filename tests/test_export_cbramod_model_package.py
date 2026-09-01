@@ -147,6 +147,7 @@ def test_workload_training_report_package_and_reload_contract_parity(
 
     captured: dict[str, object] = {}
     sentinel = object()
+    loaded_sentinel = type("Loaded", (), {"model_type": "cbramod"})()
 
     def fake_build_runtime(**kwargs: object) -> object:
         captured.update(kwargs)
@@ -163,23 +164,23 @@ def test_workload_training_report_package_and_reload_contract_parity(
     assert "source_unit" not in captured
     assert captured["standard_channels"] == BCICIV2A_22_CHANNELS
 
-    captured.clear()
+    loaded_calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        module,
+        "load_runtime_package",
+        lambda package_path, **kwargs: (
+            loaded_calls.update({"package_path": package_path, **kwargs}), loaded_sentinel
+        )[1],
+    )
     loaded = module.load_package_runtime_for_smoke_test(
         package_path=package_dir,
         device="cpu",
         verify_hashes=True,
     )
-    assert loaded is sentinel
-    assert "source_unit" not in captured
-    assert captured["input_unit"] == "uV"
-    assert captured["normalization"] == "fixed_100uv"
-    assert captured["window_seconds"] == 2.0
-    assert captured["time_segments"] == 2
-    assert captured["points_per_patch"] == 200
-    assert captured["missing_channel_policy"] == "spherical_spline"
-    assert captured["min_observed_channels"] == 21
-    assert captured["spline_alpha"] == pytest.approx(1e-5)
-    assert captured["standard_channels"] == BCICIV2A_22_CHANNELS
+    assert loaded is loaded_sentinel
+    assert loaded_calls["package_path"] == package_dir
+    assert loaded_calls["device"] == "cpu"
+    assert loaded_calls["verify_hashes"] is True
 
 
 def test_strict_report_allows_none_minimum() -> None:

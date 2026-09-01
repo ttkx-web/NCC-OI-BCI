@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -9,6 +9,11 @@ import numpy as np
 
 from bci_dayloop.data.hdf5_dataset import EEGHDF5
 from bci_dayloop.runtime.types import RawEEGWindow
+from bci_dayloop.realtime.channel_units import select_verified_eeg_channels
+from bci_dayloop.realtime.contracts import EventMarker, RealtimeWindow
+from bci_dayloop.realtime.neuracle_jellyfish import NeuracleJellyFishSource
+from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline
+from bci_dayloop.realtime.runtime_bridge import RealtimeRuntimeBridge
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +34,7 @@ class BenchmarkWindow:
     # Replay compute benchmark 保持 None。
     window_ready_at_monotonic: float | None = None
     last_sample_received_at_monotonic: float | None = None
+    prepare_validator: Callable[[object], None] | None = None
 
 
 class WindowProvider(Protocol):
@@ -36,6 +42,186 @@ class WindowProvider(Protocol):
 
     def __iter__(self) -> Iterator[BenchmarkWindow]:
         ...
+
+
+class DeviceWindowProvider:
+    """Adapt the approved live source/pipeline/bridge path to benchmark windows.
+
+    No packet decoding, channel mapping, preprocessing, or window construction
+    is duplicated here.  Host-side timestamps are captured with
+    :func:`time.perf_counter` only and are intentionally not persisted by this
+    provider.
+    """
+
+    def __init__(
+        self,
+        *,
+        source: NeuracleJellyFishSource,
+        pipeline: RealtimeEEGWindowPipeline,
+        bridge: RealtimeRuntimeBridge,
+        duration_sec: float,
+        maximum_windows: int | None = None,
+        perf_counter: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        if duration_sec <= 0:
+            raise ValueError("duration_sec must be positive")
+        if maximum_windows is not None and maximum_windows <= 0:
+            raise ValueError("maximum_windows must be positive or None")
+        import time
+
+        self.source = source
+        self.pipeline = pipeline
+        self.bridge = bridge
+        self.duration_sec = float(duration_sec)
+        self.maximum_windows = maximum_windows
+        self._perf_counter = perf_counter or time.perf_counter
+        self._sleep = sleep or time.sleep
+        self._closed = False
+        self._started = False
+        self._sequence_received_at: dict[int, float] = {}
+        self._yielded_windows = 0
+        self._pre_disconnect_health: dict[str, object] = {}
+        self._final_health: dict[str, object] = {}
+        self._pipeline_integrity: dict[str, int] = {}
+
+    def __iter__(self) -> Iterator[BenchmarkWindow]:
+        if self._started:
+            raise RuntimeError("DeviceWindowProvider may be iterated only once")
+        self._started = True
+        self.source.connect()
+        deadline = self._perf_counter() + self.duration_sec
+        try:
+            while self._perf_counter() < deadline:
+                raw_chunk = self.source.read_chunk()
+                if raw_chunk is None:
+                    self._sleep(0.001)
+                    continue
+                received_at = self._perf_counter()
+                self._sequence_received_at[raw_chunk.sequence_id] = received_at
+                markers = self._drain_events()
+                eeg_chunk = select_verified_eeg_channels(raw_chunk)
+                results = self.pipeline.process(eeg_chunk, markers)
+                for result in results:
+                    if result.status != "emitted" or result.window is None:
+                        raise RuntimeError(
+                            "Realtime window pipeline failed: "
+                            f"{result.reason or 'unknown failure'}"
+                        )
+                    benchmark_window = self._to_benchmark_window(
+                        result.window,
+                        window_ready_at=self._perf_counter(),
+                    )
+                    self._yielded_windows += 1
+                    yield benchmark_window
+                    if (
+                        self.maximum_windows is not None
+                        and self._yielded_windows >= self.maximum_windows
+                    ):
+                        return
+            raise RuntimeError(
+                "Device source ended before enough benchmark windows were "
+                f"collected: yielded_windows={self._yielded_windows}, "
+                f"maximum_windows={self.maximum_windows}."
+            )
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Release source and buffer; safe to call after partial iteration."""
+        if self._closed:
+            return
+        try:
+            self._pre_disconnect_health = dict(self.source.health())
+        finally:
+            try:
+                self.source.disconnect()
+            finally:
+                self._final_health = dict(self.source.health())
+                self._pipeline_integrity = {
+                    "received_samples": int(self.pipeline.accepted_eeg_sample_count),
+                    "pipeline_expected_windows": int(self.pipeline.expected_windows),
+                    "pipeline_emitted_windows": int(self.pipeline.emitted_windows),
+                    "pipeline_failed_windows": int(self.pipeline.failed_windows),
+                    "gap_count": int(self.pipeline.timestamp_gap_count),
+                    "buffer_overflow_count": int(self.pipeline.buffer_overflow_count),
+                }
+                self.pipeline.close()
+                self._closed = True
+
+    @property
+    def source_integrity(self) -> dict[str, int]:
+        health = self._pre_disconnect_health
+        return {
+            "received_packets": int(health.get("received_packets", 0)),
+            "received_samples": self._pipeline_integrity.get("received_samples", 0),
+            "pipeline_expected_windows": self._pipeline_integrity.get("pipeline_expected_windows", 0),
+            "pipeline_emitted_windows": self._pipeline_integrity.get("pipeline_emitted_windows", 0),
+            "pipeline_failed_windows": self._pipeline_integrity.get("pipeline_failed_windows", 0),
+            "missing_packets": int(health.get("missing_packets", 0)),
+            "duplicate_packets": int(health.get("duplicate_packets", 0)),
+            "out_of_order_packets": int(health.get("out_of_order_packets", 0)),
+            "malformed_packets": int(health.get("malformed_packets", 0)),
+            "reconnect_count": int(health.get("reconnect_count", 0)),
+            "gap_count": self._pipeline_integrity.get("gap_count", 0),
+            "buffer_overflow_count": self._pipeline_integrity.get("buffer_overflow_count", 0),
+            "dropped_window_count": self._pipeline_integrity.get("pipeline_failed_windows", 0),
+        }
+
+    @property
+    def pre_disconnect_health(self) -> Mapping[str, object]:
+        return dict(self._pre_disconnect_health)
+
+    @property
+    def final_health(self) -> Mapping[str, object]:
+        return dict(self._final_health)
+
+    def _drain_events(self) -> tuple[EventMarker, ...]:
+        markers: list[EventMarker] = []
+        marker = self.source.read_event()
+        while marker is not None:
+            markers.append(marker)
+            marker = self.source.read_event()
+        return tuple(markers)
+
+    def _to_benchmark_window(
+        self,
+        window: RealtimeWindow,
+        *,
+        window_ready_at: float,
+    ) -> BenchmarkWindow:
+        last_received = self._sequence_received_at.get(
+            window.source_sequence_end
+        )
+        if last_received is None:
+            raise RuntimeError(
+                "No host perf_counter timestamp for the window's last "
+                "source sequence"
+            )
+        raw_window = self.bridge.to_raw_window(window)
+
+        def validate_prepared(prepared: object) -> None:
+            result = self.bridge.validate_prepared_window(
+                window,
+                prepared,  # type: ignore[arg-type]
+            )
+            if not result.model_input_safe:
+                raise RuntimeError(
+                    "Realtime prepared-input gate failed: "
+                    f"{result.failure_reason or 'unknown failure'}"
+                )
+
+        return BenchmarkWindow(
+            raw_window=raw_window,
+            source_mode="device",
+            sequence_index=self._yielded_windows + 1,
+            window_id=f"device:{window.window_id}",
+            source_start_sample=window.start_sample_index,
+            source_end_sample_exclusive=window.end_sample_index,
+            window_ready_at_monotonic=window_ready_at,
+            last_sample_received_at_monotonic=last_received,
+            prepare_validator=validate_prepared,
+        )
 
 
 class ReplayWindowProvider:

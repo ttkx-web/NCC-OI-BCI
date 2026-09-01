@@ -74,12 +74,15 @@ From PowerShell or Anaconda Prompt:
 Set-Location E:\code\BCI_DayLoop
 conda env create -f environment.yml
 conda activate bci-dayloop
-python -m pip install -e .
+# Install the platform-approved PyTorch wheel first; then:
+python -m pip install -e . --no-deps
 ```
 
-The pinned main runtime is Python 3.11, NumPy 1.26.4, PyTorch 2.0.1,
-TorchVision 0.15.2, and TorchAudio 2.0.2. Alternatively, run `setup_env.bat`
-and then activate the environment.
+The portable runtime base pins NumPy 1.26.4 and requires Python 3.11. PyTorch
+GPU wheel selection is platform-specific and is intentionally separate from
+the project dependency declaration; follow
+[`server_deployment.md`](server_deployment.md) for the deployment gate.
+Alternatively, run `setup_env.bat` and then activate the environment.
 
 ### Optional data-preparation environment
 

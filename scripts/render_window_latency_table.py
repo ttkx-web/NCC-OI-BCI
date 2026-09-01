@@ -59,6 +59,14 @@ class SummaryRow:
     measured_windows: int
     num_records: int
     metrics: dict[str, LatencyStats]
+    deadline_ms: float | None
+    deadline_miss_count: int | None
+    deadline_miss_rate: float | None
+    expected_windows: int | None
+    completed_windows: int | None
+    failed_windows: int | None
+    source_integrity: dict[str, int] | None
+    status: str | None
 
 
 def require_mapping(
@@ -267,6 +275,52 @@ def read_summary_rows(summary_path: Path) -> list[SummaryRow]:
                 ),
                 num_records=int(item["num_records"]),
                 metrics=metrics,
+                deadline_ms=(
+                    float(item["deadline_ms"])
+                    if item.get("deadline_ms") is not None
+                    else None
+                ),
+                deadline_miss_count=(
+                    int(item["deadline_miss_count"])
+                    if item.get("deadline_miss_count") is not None
+                    else None
+                ),
+                deadline_miss_rate=(
+                    float(item["deadline_miss_rate"])
+                    if item.get("deadline_miss_rate") is not None
+                    else None
+                ),
+                expected_windows=(
+                    int(item["expected_windows"])
+                    if item.get("expected_windows") is not None
+                    else None
+                ),
+                completed_windows=(
+                    int(item["completed_windows"])
+                    if item.get("completed_windows") is not None
+                    else None
+                ),
+                failed_windows=(
+                    int(item["failed_windows"])
+                    if item.get("failed_windows") is not None
+                    else None
+                ),
+                source_integrity=(
+                    {
+                        str(key): int(value)
+                        for key, value in require_mapping(
+                            item["source_integrity"],
+                            name=f"{source}.source_integrity",
+                        ).items()
+                    }
+                    if item.get("source_integrity") is not None
+                    else None
+                ),
+                status=(
+                    str(item["status"])
+                    if item.get("status") is not None
+                    else None
+                ),
             )
         )
 
@@ -300,7 +354,7 @@ def format_ms(stat: LatencyStats | None) -> str:
     if stat is None:
         return "—"
 
-    return f"{stat.p50:.3f} / {stat.p95:.3f}"
+    return f"{stat.p50:.3f} / {stat.p95:.3f} / {stat.maximum:.3f}"
 
 
 def markdown_table(
@@ -352,6 +406,10 @@ def build_long_markdown(
         "总计算 P50 / P95 (ms)",
         "窗口就绪至预测 P50 / P95 (ms)",
         "最后样本至预测 P50 / P95 (ms)",
+        "Deadline misses",
+        "Completed / expected",
+        "Packet / gap errors",
+        "PASS / FAIL",
         "Candidate ID",
     ]
 
@@ -390,6 +448,32 @@ def build_long_markdown(
                         "last_sample_received_to_prediction_ms"
                     )
                 ),
+                (
+                    "—"
+                    if row.deadline_miss_count is None
+                    else f"{row.deadline_miss_count} ({row.deadline_miss_rate:.3%})"
+                ),
+                (
+                    "—"
+                    if row.completed_windows is None
+                    or row.expected_windows is None
+                    else f"{row.completed_windows}/{row.expected_windows}"
+                ),
+                (
+                    "—"
+                    if row.source_integrity is None
+                    else "/".join(
+                        str(row.source_integrity.get(name, 0))
+                        for name in (
+                            "missing_packets",
+                            "duplicate_packets",
+                            "out_of_order_packets",
+                            "gap_count",
+                            "malformed_packets",
+                        )
+                    )
+                ),
+                row.status or "—",
                 row.candidate_id,
             ]
         )
@@ -456,6 +540,7 @@ def build_wide_markdown(
             [
                 f"{display_name} P50 (ms)",
                 f"{display_name} P95 (ms)",
+                f"{display_name} Max (ms)",
             ]
         )
 
@@ -470,7 +555,7 @@ def build_wide_markdown(
             )
 
             if row is None:
-                table_row.extend(["—", "—"])
+                table_row.extend(["—", "—", "—"])
                 continue
 
             stat = row.metrics[metric_name]
@@ -478,6 +563,7 @@ def build_wide_markdown(
                 [
                     f"{stat.p50:.3f}",
                     f"{stat.p95:.3f}",
+                    f"{stat.maximum:.3f}",
                 ]
             )
 
@@ -512,6 +598,14 @@ def write_long_csv(
         "warmup_windows",
         "measured_windows",
         "num_records",
+        "deadline_ms",
+        "deadline_miss_count",
+        "deadline_miss_rate",
+        "expected_windows",
+        "completed_windows",
+        "failed_windows",
+        "status",
+        "source_integrity",
     ]
 
     for metric_name in (
@@ -564,6 +658,18 @@ def write_long_csv(
                 "warmup_windows": row.warmup_windows,
                 "measured_windows": row.measured_windows,
                 "num_records": row.num_records,
+                "deadline_ms": row.deadline_ms,
+                "deadline_miss_count": row.deadline_miss_count,
+                "deadline_miss_rate": row.deadline_miss_rate,
+                "expected_windows": row.expected_windows,
+                "completed_windows": row.completed_windows,
+                "failed_windows": row.failed_windows,
+                "status": row.status,
+                "source_integrity": (
+                    json.dumps(row.source_integrity, sort_keys=True)
+                    if row.source_integrity is not None
+                    else None
+                ),
             }
 
             for metric_name in (
@@ -587,6 +693,70 @@ def write_long_csv(
                 )
 
             writer.writerow(flat_row)
+
+
+def write_wide_csv(
+    rows: list[SummaryRow],
+    *,
+    metric_name: str,
+    path: Path,
+) -> None:
+    """Write the same model-by-window comparison as the wide Markdown table."""
+    usable_rows = [row for row in rows if metric_name in row.metrics]
+    if not usable_rows:
+        raise ValueError(f"No candidate contains metric {metric_name!r}.")
+    by_pair: dict[tuple[str, float], SummaryRow] = {}
+    for row in usable_rows:
+        key = (row.model_type, row.window_sec)
+        if key in by_pair:
+            raise ValueError(
+                "Cannot build wide CSV because multiple candidates share "
+                f"(model_type, window_sec): {key!r}."
+            )
+        by_pair[key] = row
+    model_types = sorted({row.model_type for row in usable_rows}, key=model_sort_key)
+    fieldnames = ["window_sec"]
+    for model_type in model_types:
+        fieldnames.extend(
+            [
+                f"{model_type}_p50_ms",
+                f"{model_type}_p95_ms",
+                f"{model_type}_max_ms",
+                f"{model_type}_deadline_miss_count",
+                f"{model_type}_deadline_miss_rate",
+                f"{model_type}_completed_windows",
+                f"{model_type}_expected_windows",
+                f"{model_type}_failed_windows",
+                f"{model_type}_integrity",
+                f"{model_type}_status",
+            ]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for window_sec in sorted({row.window_sec for row in usable_rows}):
+            result: dict[str, object] = {"window_sec": window_sec}
+            for model_type in model_types:
+                row = by_pair.get((model_type, window_sec))
+                if row is None:
+                    continue
+                stat = row.metrics[metric_name]
+                result.update(
+                    {
+                        f"{model_type}_p50_ms": stat.p50,
+                        f"{model_type}_p95_ms": stat.p95,
+                        f"{model_type}_max_ms": stat.maximum,
+                        f"{model_type}_deadline_miss_count": row.deadline_miss_count,
+                        f"{model_type}_deadline_miss_rate": row.deadline_miss_rate,
+                        f"{model_type}_completed_windows": row.completed_windows,
+                        f"{model_type}_expected_windows": row.expected_windows,
+                        f"{model_type}_failed_windows": row.failed_windows,
+                        f"{model_type}_integrity": json.dumps(row.source_integrity, sort_keys=True),
+                        f"{model_type}_status": row.status,
+                    }
+                )
+            writer.writerow(result)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -659,6 +829,7 @@ def main() -> int:
     long_csv_path = (
         output_dir / "window_latency_summary_long.csv"
     )
+    wide_csv_path = output_dir / "window_latency_summary_wide.csv"
 
     long_markdown_path.write_text(
         build_long_markdown(
@@ -681,11 +852,17 @@ def main() -> int:
         rows,
         path=long_csv_path,
     )
+    write_wide_csv(
+        rows,
+        metric_name=args.wide_metric,
+        path=wide_csv_path,
+    )
 
     print("Rendered latency tables:")
     print("  long markdown:", long_markdown_path)
     print("  wide markdown:", wide_markdown_path)
     print("  long csv:", long_csv_path)
+    print("  wide csv:", wide_csv_path)
 
     return 0
 

@@ -22,6 +22,7 @@ Only the linear classification head is trained.
 
 import argparse
 import subprocess
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -35,6 +36,9 @@ from bci_dayloop.data.sequential_dataset import (
     SequentialDatasetMetadata,
     load_sequential_dataset,
     resolve_population_split_plan,
+)
+from bci_dayloop.data.channel_selection import (
+    select_named_channels,
 )
 from bci_dayloop.data.preprocessing import (
     EEGPreprocessor,
@@ -431,9 +435,12 @@ def load_preprocessed_subject_session(
     preprocessor: EEGPreprocessor,
     reference_metadata: SequentialDatasetMetadata | None,
     expected_window_sec: float,
-    trial_window_anchor: str,
+    trial_window_anchor: str = "end",
     maximum_per_class: int | None,
     seed: int,
+    requested_channel_names: (
+        Sequence[str] | None
+    ) = None,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -441,7 +448,25 @@ def load_preprocessed_subject_session(
     dict[str, Any],
 ]:
     dataset = load_sequential_dataset(path, session=session_name)
-    metadata = dataset.metadata
+    source_metadata = dataset.metadata
+    source_data = np.asarray(dataset.data, dtype=np.float32)
+    raw_data, selected_channel_names = (
+        select_named_channels(
+            source_data,
+            source_channel_names=(
+                source_metadata.channel_names
+            ),
+            requested_channel_names=(
+                requested_channel_names
+            ),
+            channel_axis=1,
+        )
+    )
+
+    metadata = replace(
+        source_metadata,
+        channel_names=tuple(selected_channel_names),
+    )
 
     if reference_metadata is not None:
         validate_metadata_compatibility(
@@ -451,7 +476,6 @@ def load_preprocessed_subject_session(
             path=path,
         )
 
-    source_data = np.asarray(dataset.data, dtype=np.float32)
     labels = np.asarray(dataset.labels, dtype=np.int64)
 
     source_num_samples = int(source_data.shape[-1])
@@ -522,7 +546,7 @@ def load_preprocessed_subject_session(
         )
 
     raw_data = np.ascontiguousarray(
-        source_data[:, :, start_sample:end_sample],
+        raw_data[:, :, start_sample:end_sample],
         dtype=np.float32,
     )
 
@@ -599,9 +623,27 @@ def load_preprocessed_subject_session(
         "subject_id": int(subject_id),
         "path": str(path),
         "session": session_name,
-        "source_raw_shape": list(source_data.shape),
-        "selected_raw_shape": list(raw_data.shape),
-        "preprocessed_shape": list(X.shape),
+        "raw_shape": list(
+            raw_data.shape
+        ),
+        "source_raw_shape": list(
+            source_data.shape
+        ),
+        "selected_raw_shape": list(
+            raw_data.shape
+        ),
+        "preprocessed_shape": list(
+            X.shape
+        ),
+        "source_channel_count": len(
+            source_metadata.channel_names
+        ),
+        "selected_channel_count": len(
+            metadata.channel_names
+        ),
+        "selected_channel_names": list(
+            metadata.channel_names
+        ),
         "source_window_seconds": float(source_window_sec),
         "selected_window_seconds": float(resolved_window_sec),
         "trial_window_anchor": trial_window_anchor,
@@ -838,6 +880,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--patch-samples",
         type=int,
         default=200,
+    )
+
+    parser.add_argument(
+        "--channel-names",
+        nargs="+",
+        default=None,
+        help=(
+            "Explicit channel names and order. "
+            "Missing, unknown, or duplicate names "
+            "fail closed. Omit to preserve the full "
+            "HDF5 channel order."
+        ),
     )
 
     parser.add_argument(
@@ -1165,6 +1219,9 @@ def main() -> None:
                     args.seed
                     + offset * 100
                 ),
+                requested_channel_names=(
+                    args.channel_names
+                ),
             )
         )
 
@@ -1195,6 +1252,9 @@ def main() -> None:
                     + 10_000
                     + offset * 100
                 ),
+                requested_channel_names=(
+                    args.channel_names
+                ),
             )
         )
 
@@ -1217,6 +1277,27 @@ def main() -> None:
         ] = val_summary
 
     assert reference_metadata is not None
+
+    first_train_summary = next(
+        iter(
+            split_summaries[
+                "population_train"
+            ].values()
+        )
+    )
+    source_channel_count = int(
+        first_train_summary[
+            "source_channel_count"
+        ]
+    )
+    selected_channel_count = len(
+        reference_metadata.channel_names
+    )
+    channel_selection_policy = (
+        "explicit_live_intersection"
+        if args.channel_names is not None
+        else "all_source_channels"
+    )
 
     X_train, y_train = (
         combine_subject_splits(
@@ -1345,6 +1426,9 @@ def main() -> None:
             .max_trials_per_class_per_subject
         ),
         seed=args.seed + 40_000,
+        requested_channel_names=(
+            args.channel_names
+        ),
     )
 
     target_predictions, _ = (
@@ -1397,6 +1481,15 @@ def main() -> None:
             for name
             in reference_metadata.channel_names
         ],
+        "source_channel_count": (
+            source_channel_count
+        ),
+        "selected_channel_count": (
+            selected_channel_count
+        ),
+        "channel_selection_policy": (
+            channel_selection_policy
+        ),
         "n_patches": n_patches,
         "patch_samples": int(
             preprocessing_config.patch_samples

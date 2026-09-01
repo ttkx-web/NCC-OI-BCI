@@ -136,9 +136,8 @@ def test_workload_adapter_preserves_two_second_windows_and_identifiers(
         "P03:S1:MATBeasy:000001",
         "P03:S1:MATBdiff:000001",
     ]
-    # The sequential evaluator reports persisted causal window identities.
-    # WorkloadHDF5.load() separately exposes compact numeric trainer IDs.
-    assert dataset.subject_ids.tolist() == [3, 3, 3, 3]
+    # The sequential evaluator reports persisted source identities verbatim.
+    assert dataset.subject_ids.tolist() == ["P03"] * 4
     assert dataset.session_ids.tolist() == ["S1"] * 4
     assert dataset.trial_ids.tolist() == dataset.window_ids.tolist()
 

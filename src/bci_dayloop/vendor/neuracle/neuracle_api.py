@@ -14,7 +14,12 @@ from threading import Thread, Lock, current_thread
 from struct import unpack
 import numpy as np
 import tempfile
-from pyedflib import highlevel
+try:
+    # EDF/BDF export is optional.  Streaming, packet handling and the vendor
+    # backend must remain importable in the lightweight runtime environment.
+    from pyedflib import highlevel
+except ModuleNotFoundError:  # pragma: no cover - exercised at the save boundary
+    highlevel = None
 import pickle
 
 
@@ -1047,6 +1052,11 @@ class DataServerThread:
         return rst
 
     def save(self, fpath: str):
+        if highlevel is None:
+            raise RuntimeError(
+                "Saving Neuracle EDF/BDF files requires optional dependency "
+                "pyedflib. Install it in the data-export environment."
+            )
         signal_headers = []
         for ich in range(self.n_chan - 1):
             signal_headers.append(

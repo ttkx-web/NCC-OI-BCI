@@ -244,34 +244,19 @@ def resolve_default_artifact_paths(
     target_subject: int,
     window_tag: str,
     model_path_component: str = "cbramod",
-    split_mode: str = "loso",
+    split_mode: str | None = None,
 ) -> tuple[Path, Path]:
     dataset_name = str(metadata.dataset_name).strip()
     if not dataset_name:
         raise ValueError("Loaded dataset_name must be non-empty.")
 
-    run_dir = (
-        ROOT
-        / "runs"
-        / "stage1"
-        / dataset_name
-        / split_mode
-        / f"subject_{target_subject:02d}"
-        / model_path_component
-        / window_tag
-    )
-    head_path = (
-        ROOT
-        / "checkpoints"
-        / "heads"
-        / "stage1"
-        / dataset_name
-        / split_mode
-        / f"subject_{target_subject:02d}"
-        / model_path_component
-        / window_tag
-        / "head.pt"
-    )
+    run_base = ROOT / "runs" / "stage1" / dataset_name
+    head_base = ROOT / "checkpoints" / "heads" / "stage1" / dataset_name
+    if split_mode is not None:
+        run_base /= split_mode
+        head_base /= split_mode
+    run_dir = run_base / f"subject_{target_subject:02d}" / model_path_component / window_tag
+    head_path = head_base / f"subject_{target_subject:02d}" / model_path_component / window_tag / "head.pt"
     return head_path, run_dir
 
 
@@ -910,6 +895,28 @@ def sequential_dataset_trial_data(dataset: Any) -> dict[str, np.ndarray]:
     }
 
 
+def trainer_subject_ids(values: object, *, subject_id: int, expected: int) -> np.ndarray:
+    """Map adapter-native identities to the requested trainer subject safely."""
+    source_ids = np.asarray(values).reshape(-1)
+    if source_ids.shape != (expected,):
+        raise ValueError("adapter subject_ids length does not match trial count.")
+    if not all(str(value).strip() for value in source_ids):
+        raise ValueError("adapter subject_ids must be non-empty.")
+    # Numeric adapters can be checked exactly.  Dataset-native textual IDs
+    # (e.g. P01 and SEED-01) are provenance identities, while the CLI target
+    # subject is the stable population-training identity.
+    try:
+        numeric_ids = source_ids.astype(np.int64)
+    except (TypeError, ValueError):
+        return np.full(expected, int(subject_id), dtype=np.int64)
+    if not np.all(numeric_ids == int(subject_id)):
+        raise ValueError(
+            f"adapter subject_ids do not match subject {subject_id}: "
+            f"{sorted(set(numeric_ids.tolist()))}."
+        )
+    return numeric_ids
+
+
 def build_feature_split_from_session_data(
     *,
     subject_id: int,
@@ -930,7 +937,9 @@ def build_feature_split_from_session_data(
     data = np.asarray(loaded["data"], dtype=np.float32)
     labels = np.asarray(loaded["labels"], dtype=np.int64)
     trial_ids = np.asarray(loaded["trial_ids"], dtype=str)
-    subject_ids = np.asarray(loaded["subject_ids"], dtype=np.int64)
+    subject_ids = trainer_subject_ids(
+        loaded["subject_ids"], subject_id=subject_id, expected=len(data)
+    )
 
     if data.ndim != 3:
         raise ValueError(
@@ -948,10 +957,6 @@ def build_feature_split_from_session_data(
             f"{subject_path}: labels length mismatch."
         )
 
-    if len(subject_ids) != len(data) or not np.all(subject_ids == subject_id):
-        raise ValueError(
-            f"{subject_path}: adapter subject_ids do not match subject {subject_id}."
-        )
     loaded_sessions = set(np.asarray(loaded["session_ids"], dtype=str).tolist())
     if loaded_sessions != {session_name}:
         raise ValueError(
@@ -1080,6 +1085,9 @@ def build_within_subject_train_validation_splits(
         key: np.concatenate((train_data[key], test_data[key]), axis=0)
         for key in train_data
     }
+    all_trial_metadata["subject_ids"] = np.full(
+        len(all_trial_metadata["labels"]), subject_id, dtype=np.int64
+    )
     split = resolve_within_subject_trial_split(
         subject_ids=all_trial_metadata["subject_ids"],
         session_ids=all_trial_metadata["session_ids"],
@@ -1097,6 +1105,10 @@ def build_within_subject_train_validation_splits(
     selected_validation = select_trial_ids(
         train_data, all_trial_metadata["trial_ids"][split.validation_indices],
     )
+    for selected in (selected_train, selected_validation):
+        selected["subject_ids"] = np.full(
+            len(selected["labels"]), subject_id, dtype=np.int64
+        )
     common = {
         "subject_id": subject_id, "session_name": train_session,
         "subject_path": subject_path, "metadata": train_dataset.metadata,
@@ -1739,6 +1751,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=["none", "per_window_zscore", "fixed_100uv"],
         default="none",
     )
+    # Accepted only for backward-compatible invocation parsing. Named
+    # deployment profiles remain the sole authority used to build CBraModConfig.
+    parser.add_argument("--missing-channel-policy", choices=["error", "spherical_spline"], default=None)
+    parser.add_argument("--min-observed-channels", type=int, default=None)
+    parser.add_argument("--spline-alpha", type=float, default=None)
     parser.add_argument(
         "--head-type",
         choices=["official_mlp", "linear"],

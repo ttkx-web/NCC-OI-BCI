@@ -274,7 +274,10 @@ class LaBraMLinearAdapter(BaseModelAdapter):
             optimizer.step()
             loss_value = float(loss.detach().cpu())
         predictions = self.head(features_t).argmax(dim=1).detach().cpu().numpy()
-        return {"updated": float(len(targets)), "loss": loss_value, "accuracy": float(accuracy_score(targets, predictions))}
+        # Avoid routing this simple ndarray metric through sklearn's optional
+        # dataframe detection (which can see an unavailable pandas namespace).
+        accuracy = float(np.mean(targets == predictions)) if len(targets) else 0.0
+        return {"updated": float(len(targets)), "loss": loss_value, "accuracy": accuracy}
 
     def save(
         self,

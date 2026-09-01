@@ -187,6 +187,7 @@ class WorkloadHDF5Adapter:
                 dataset_name=str(root["dataset_name"]),
                 window_sec=float(root["window_sec"]),
             )
+            source_subject_id = str(root["subject_id"])
 
         data = np.asarray(payload["data"], dtype=np.float32)
         num_trials = int(data.shape[0]) if data.ndim >= 1 else 0
@@ -199,16 +200,13 @@ class WorkloadHDF5Adapter:
             labels=_as_trial_vector(
                 payload["labels"], name="labels", expected=num_trials
             ),
-            # Keep the canonical numeric subject identity for trainers. The
-            # sequential public trial identity remains the persisted window ID
-            # (the evaluator reports it verbatim); WorkloadHDF5.load() still
-            # exposes its compact numeric trial_ids to direct consumers.
-            subject_ids=_as_trial_vector(
-                payload["subject_ids"], name="subject_ids", expected=num_trials
+            # The sequential contract reports the persisted source identity
+            # verbatim. WorkloadHDF5.load() separately exposes numeric IDs for
+            # direct trainer integrations.
+            subject_ids=np.repeat(
+                np.asarray([source_subject_id], dtype=object), num_trials
             ),
-            session_ids=_as_trial_vector(
-                payload["session_ids"], name="session_ids", expected=num_trials
-            ),
+            session_ids=np.repeat(np.asarray([str(session)], dtype=object), num_trials),
             trial_ids=window_ids.copy(),
             trial_ordinals=_as_trial_vector(
                 payload["trial_ordinals"],

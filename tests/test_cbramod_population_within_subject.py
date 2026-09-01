@@ -92,9 +92,9 @@ def test_cbramod_deployment_profile_is_the_channel_adaptation_authority() -> Non
     default_args = parser.parse_args(["--target-subject", "1"])
 
     assert default_args.deployment_profile == CBRAMOD_STRICT22_PROFILE
-    assert not hasattr(default_args, "missing_channel_policy")
-    assert not hasattr(default_args, "min_observed_channels")
-    assert not hasattr(default_args, "spline_alpha")
+    assert default_args.missing_channel_policy is None
+    assert default_args.min_observed_channels is None
+    assert default_args.spline_alpha is None
 
     args = parser.parse_args(
         [

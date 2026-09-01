@@ -1,0 +1,24 @@
+schema_version: 1
+application: three_mental_states
+
+sources:
+  backbone_checkpoint: checkpoints/backbones/50m/model_deploy.pt
+  heads:
+    workload: checkpoints/heads/stage1/bnci2014_001/subject_01/Workload/subject_01/population/2s_flatten/head.pt
+    attention: checkpoints/heads/stage1/bnci2014_001/subject_01/MEMA/subject_01/population/2s_flatten/head.pt
+    emotion: checkpoints/heads/stage1/bnci2014_001/subject_01/SEED/subject_01/population/2s_flatten/head.pt
+
+runtime:
+  target_sample_rate_hz: 100.0
+  window_sec: 2.0
+  step_sec: 2.0
+  patch_sec: 1.0
+  patch_stride_sec: 1.0
+  model_n_time_patches: 10
+  output_layer_idx: 8
+  aggregation: flatten
+
+package:
+  output_dir: model_packages/50m_three_mental_states
+  id: 50m-three-mental-states
+  version: "1"

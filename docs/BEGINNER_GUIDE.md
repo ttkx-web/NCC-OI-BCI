@@ -235,14 +235,14 @@ web\app.py
 Set-Location E:\code\BCI_DayLoop
 conda env create -f environment.yml
 conda activate bci-dayloop
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 如果环境已经存在，可以跳过 `conda env create`，直接执行：
 
 ```powershell
 conda activate bci-dayloop
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 ### 第二步：放入 LaBraM checkpoint

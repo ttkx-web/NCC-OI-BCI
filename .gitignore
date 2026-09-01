@@ -3,6 +3,7 @@
 # ============================================================
 
 .DS_Store
+._*
 Thumbs.db
 
 
@@ -50,6 +51,10 @@ data/processed/**
 !data/raw/.gitkeep
 !data/cache/.gitkeep
 !data/processed/.gitkeep
+# Dataset truth is versioned; derived canonical H5 and inspection reports stay local.
+!data/processed/yaxin/
+!data/processed/yaxin/dataset_manifest.json
+!data/processed/yaxin/trial_hashes.json
 
 
 # ============================================================
@@ -94,3 +99,7 @@ registries/**
 
 *.log
 repo_gitignore_audit.txt
+
+# experiment outputs
+experiments/seed_loso_full/
+experiments/*/report/

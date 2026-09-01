@@ -43,6 +43,8 @@ CHANNEL_ALIASES: dict[str, str] = {
 
 ReferenceMode = Literal["none", "average"]
 AggregationMode = Literal["flatten", "mean"]
+HeadType = Literal["linear", "mlp"]
+HeadNorm = Literal["none", "layernorm", "batchnorm"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +126,15 @@ class Model50MConfig:
     aggregation: AggregationMode = "flatten"
     num_classes: int = 4
 
+    # ------------------------------------------------------------------
+    # 下游分类头结构
+    # ------------------------------------------------------------------
+    # 默认 linear，保持既有 Linear Probe checkpoint 与训练命令不变。
+    head_type: HeadType = "linear"
+    head_hidden_dim: int = 512
+    head_dropout: float = 0.0
+    head_norm: HeadNorm = "none"
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint_path", Path(self.checkpoint_path))
 
@@ -189,6 +200,39 @@ class Model50MConfig:
         if self.aggregation not in {"flatten", "mean"}:
             raise ValueError(
                 f"Unsupported aggregation mode: {self.aggregation}"
+            )
+
+        if self.head_type not in {"linear", "mlp"}:
+            raise ValueError(
+                f"Unsupported head_type: {self.head_type!r}. "
+                "Expected 'linear' or 'mlp'."
+            )
+
+        if self.head_hidden_dim <= 0:
+            raise ValueError("head_hidden_dim must be positive.")
+
+        if not 0.0 <= self.head_dropout < 1.0:
+            raise ValueError(
+                "head_dropout must be in [0, 1), "
+                f"got {self.head_dropout}."
+            )
+
+        if self.head_norm not in {"none", "layernorm", "batchnorm"}:
+            raise ValueError(
+                f"Unsupported head_norm: {self.head_norm!r}. "
+                "Expected 'none', 'layernorm', or 'batchnorm'."
+            )
+
+        if self.head_type == "linear" and self.head_norm != "none":
+            raise ValueError(
+                "head_norm is only supported with head_type='mlp'; "
+                f"got head_type='linear', head_norm={self.head_norm!r}."
+            )
+
+        if self.head_type == "linear" and self.head_dropout != 0.0:
+            raise ValueError(
+                "head_dropout is only supported with head_type='mlp'; "
+                f"got head_type='linear', head_dropout={self.head_dropout}."
             )
 
         if not 0 <= self.output_layer_idx < self.depth:

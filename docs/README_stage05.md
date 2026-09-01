@@ -230,7 +230,7 @@ NCC-OI-BCI/
 ├── scripts/
 │   ├── prepare_bnci2014_001.py
 │   ├── inspect_dataset.py
-│   ├── train_50m_linear_head.py
+│   ├── train_50m_population_head.py
 │   ├── export_50m_model_package.py
 │   ├── test_50m_offline_window.py
 │   ├── replay_offline.py
@@ -279,17 +279,20 @@ cd NCC-OI-BCI
 
 ### 7.2 NVIDIA CUDA 环境
 
-`environment.yml` 当前包含 PyTorch 2.0.1 和 CUDA 11.8：
+`environment.yml` 只声明可移植的 Python 数值环境；PyTorch GPU wheel 与
+CUDA 选择必须按目标平台单独安装，见
+[`server_deployment.md`](server_deployment.md)：
 
 ```bash
 conda env create -f environment.yml
 conda activate bci-dayloop
-python -m pip install -e .
+# Install the platform-approved PyTorch wheel first; then:
+python -m pip install -e . --no-deps
 ```
 
 ### 7.3 macOS 或 CPU 环境
 
-macOS 不应直接安装 `environment.yml` 中的 `pytorch-cuda`。可单独创建环境后安装当前项目：
+macOS 或 CPU 环境不需要 GPU PyTorch wheel。可单独创建环境后安装当前项目：
 
 ```bash
 conda create -n bci-dayloop python=3.11 -y
@@ -412,7 +415,7 @@ conda activate bci-dayloop
 仓库已经定义了正式分类头路径。仅在需要重新训练分类头时执行：
 
 ```bash
-python scripts/train_50m_linear_head.py \
+PYTHONPATH=src python -m bci_dayloop.training.model_50m.linear_head \
   --data data/processed/bnci2014_001_s01.h5 \
   --train-session 0train \
   --test-session 1test \

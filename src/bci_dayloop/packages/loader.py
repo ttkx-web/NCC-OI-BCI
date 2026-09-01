@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -24,6 +23,12 @@ from bci_dayloop.preprocessing.model_50m import (
 )
 from bci_dayloop.runtime.model import RuntimeModel
 from bci_dayloop.utils.config import load_yaml
+from bci_dayloop.packages.common import (
+    required_mapping as _required_mapping,
+    resolve_package_file as _resolve_package_file,
+    sha256_file as _sha256_file,
+    verify_sha256 as _verify_sha256,
+)
 
 import torch
 from torch import nn
@@ -76,89 +81,6 @@ class LoadedRuntimePackage:
             self.runtime_model
             .input_contract
             .sample_rate
-        )
-
-
-def _required_mapping(
-    payload: dict[str, Any],
-    key: str,
-    *,
-    source: Path,
-) -> dict[str, Any]:
-    value = payload.get(key)
-
-    if not isinstance(value, dict):
-        raise ValueError(
-            f"{source} field {key!r} "
-            "must be a mapping."
-        )
-
-    return dict(value)
-
-
-def _resolve_package_file(
-    package_path: Path,
-    value: str,
-    *,
-    logical_name: str,
-) -> Path:
-    relative_path = Path(value)
-
-    if relative_path.is_absolute():
-        raise ValueError(
-            f"{logical_name} must use a package-relative "
-            f"path, got {value!r}."
-        )
-
-    resolved = (
-        package_path / relative_path
-    ).resolve()
-
-    # 防止 "../../outside.pt" 逃出 Package。
-    try:
-        resolved.relative_to(package_path)
-    except ValueError as error:
-        raise ValueError(
-            f"{logical_name} escapes package directory: "
-            f"{value!r}."
-        ) from error
-
-    if not resolved.is_file():
-        raise FileNotFoundError(
-            f"{logical_name} was not found: {resolved}"
-        )
-
-    return resolved
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-
-    with path.open("rb") as handle:
-        for block in iter(
-            lambda: handle.read(1024 * 1024),
-            b"",
-        ):
-            digest.update(block)
-
-    return digest.hexdigest()
-
-
-def _verify_sha256(
-    *,
-    path: Path,
-    expected: str | None,
-    logical_name: str,
-) -> None:
-    if not expected:
-        return
-
-    actual = _sha256_file(path)
-
-    if actual.lower() != str(expected).lower():
-        raise ValueError(
-            f"{logical_name} SHA256 mismatch: "
-            f"expected={expected}, actual={actual}."
         )
 
 
@@ -888,6 +810,455 @@ def _load_50m_package(
     )
 
 
+def _load_cbramod_package(
+    *,
+    package_path: Path,
+    package_payload: dict[str, Any],
+    device: str,
+    verify_hashes: bool,
+) -> LoadedRuntimePackage:
+    """Load a schema-v2 CBRaMod frozen-head Runtime Package."""
+
+    # Keep these imports local so existing LaBraM/50M users are not forced
+    # to vendor CBRaMod until they actually load a CBRaMod package.
+    from bci_dayloop.models.cbramod.backend import CBraModBackend
+    from bci_dayloop.models.cbramod.backbone import CBraModBackbone
+    from bci_dayloop.models.cbramod.classifier import (
+        build_cbramod_classifier,
+    )
+    from bci_dayloop.models.cbramod.config import CBraModConfig
+    from bci_dayloop.models.cbramod.preprocessing import (
+        CBraModPipelinePreprocessor,
+    )
+    from bci_dayloop.models.cbramod.runtime import (
+        load_cbramod_classifier_checkpoint,
+    )
+
+    package_yaml = package_path / "package.yaml"
+
+    model = _required_mapping(
+        package_payload,
+        "model",
+        source=package_yaml,
+    )
+    files = _required_mapping(
+        package_payload,
+        "files",
+        source=package_yaml,
+    )
+    contract = _required_mapping(
+        package_payload,
+        "input_contract",
+        source=package_yaml,
+    )
+    runtime_config = _required_mapping(
+        package_payload,
+        "runtime",
+        source=package_yaml,
+    )
+    package_metadata = _required_mapping(
+        package_payload,
+        "package",
+        source=package_yaml,
+    )
+
+    if model.get("name") != "cbramod-frozen-head":
+        raise ValueError(
+            "Expected CBRaMod package model.name "
+            "'cbramod-frozen-head', got "
+            f"{model.get('name')!r}."
+        )
+
+    backbone_path = _resolve_package_file(
+        package_path,
+        str(files["backbone"]),
+        logical_name="backbone",
+    )
+    classifier_path = _resolve_package_file(
+        package_path,
+        str(files["classifier"]),
+        logical_name="classifier",
+    )
+    preprocessing_path = _resolve_package_file(
+        package_path,
+        str(files["preprocessing"]),
+        logical_name="preprocessing config",
+    )
+    metrics_path = _resolve_package_file(
+        package_path,
+        str(files["metrics"]),
+        logical_name="metrics",
+    )
+
+    hashes = files.get("sha256", {})
+    if hashes is None:
+        hashes = {}
+    if not isinstance(hashes, dict):
+        raise ValueError("files.sha256 must be a mapping.")
+
+    if verify_hashes:
+        _verify_sha256(
+            path=backbone_path,
+            expected=hashes.get("backbone"),
+            logical_name="backbone",
+        )
+        _verify_sha256(
+            path=classifier_path,
+            expected=hashes.get("classifier"),
+            logical_name="classifier",
+        )
+
+    preprocessing = load_yaml(preprocessing_path)
+    canonicalizer_config = _required_mapping(
+        preprocessing,
+        "canonicalizer",
+        source=preprocessing_path,
+    )
+    transform = _required_mapping(
+        preprocessing,
+        "transform",
+        source=preprocessing_path,
+    )
+
+    if transform.get("type") != "cbramod":
+        raise ValueError(
+            "Expected preprocessing transform 'cbramod', got "
+            f"{transform.get('type')!r}."
+        )
+
+    class_names = tuple(
+        str(name)
+        for name in model["class_names"]
+    )
+    num_classes = int(model["num_classes"])
+    if len(class_names) != num_classes:
+        raise ValueError(
+            "model.class_names length does not match "
+            "model.num_classes."
+        )
+
+    channel_names = tuple(
+        str(name)
+        for name in contract["channel_names"]
+    )
+    transform_channels = tuple(
+        str(name)
+        for name in transform["standard_channels"]
+    )
+    if channel_names != transform_channels:
+        raise ValueError(
+            "CBRaMod input_contract.channel_names does not "
+            "match preprocessing transform standard_channels."
+        )
+
+    # 旧模型包使用 allow_missing_channels；它无法表达新的
+    # spherical_spline 完整协议，不能静默迁移。
+    if (
+        "missing_channel_policy" not in transform
+        and bool(
+            transform.get(
+                "allow_missing_channels",
+                False,
+            )
+        )
+    ):
+        raise ValueError(
+            "Legacy CBraMod package uses "
+            "allow_missing_channels=true. Re-export it with "
+            "missing_channel_policy, min_observed_channels, "
+            "and spline_alpha."
+        )
+
+    n_channels = int(transform["n_channels"])
+    policy_value = transform.get("missing_channel_policy")
+    missing_channel_policy = (
+        "error" if policy_value is None else str(policy_value)
+    )
+    min_observed_value = transform.get("min_observed_channels")
+    if min_observed_value is None:
+        if missing_channel_policy == "spherical_spline":
+            raise ValueError(
+                "CBRaMod spherical_spline package must explicitly declare "
+                "transform.min_observed_channels."
+            )
+        min_observed_channels = n_channels
+    else:
+        min_observed_channels = int(min_observed_value)
+    spline_alpha_value = transform.get("spline_alpha")
+    if spline_alpha_value is None:
+        if missing_channel_policy == "spherical_spline":
+            raise ValueError(
+                "CBRaMod spherical_spline package must explicitly declare "
+                "transform.spline_alpha."
+            )
+        spline_alpha = 1e-5
+    else:
+        spline_alpha = float(spline_alpha_value)
+
+    completion_metadata = runtime_config.get("channel_completion")
+    if (
+        missing_channel_policy == "spherical_spline"
+        and completion_metadata is None
+    ):
+        raise ValueError(
+            "CBRaMod spherical_spline package must declare "
+            "runtime.channel_completion."
+        )
+    if completion_metadata is not None:
+        if not isinstance(completion_metadata, dict):
+            raise ValueError(
+                "runtime.channel_completion must be a mapping."
+            )
+        expected_completion_values = {
+            "missing_channel_policy": missing_channel_policy,
+            "min_observed_channels": min_observed_channels,
+            "spline_alpha": spline_alpha,
+        }
+        for key, expected_value in expected_completion_values.items():
+            if completion_metadata.get(key) != expected_value:
+                raise ValueError(
+                    "CBRaMod runtime.channel_completion does not match "
+                    f"preprocessing transform for {key}."
+                )
+        observed_names = tuple(
+            str(name)
+            for name in completion_metadata.get(
+                "observed_channel_names", ()
+            )
+        )
+        missing_names = tuple(
+            str(name)
+            for name in completion_metadata.get("missing_expected", ())
+        )
+        if len(observed_names) != len(set(observed_names)):
+            raise ValueError(
+                "CBRaMod runtime observed channels contain duplicates."
+            )
+        if len(missing_names) != len(set(missing_names)):
+            raise ValueError(
+                "CBRaMod runtime missing channels contain duplicates."
+            )
+        if set(observed_names).intersection(missing_names):
+            raise ValueError(
+                "CBRaMod runtime observed and missing channels overlap."
+            )
+        if tuple(
+            name for name in channel_names if name in observed_names
+        ) != observed_names or tuple(
+            name for name in channel_names if name in missing_names
+        ) != missing_names:
+            raise ValueError(
+                "CBRaMod runtime channel completion order does not match "
+                "the package target montage."
+            )
+        if set(observed_names).union(missing_names) != set(channel_names):
+            raise ValueError(
+                "CBRaMod runtime observed/missing channels do not partition "
+                "the package target montage."
+            )
+        if int(completion_metadata.get("observed_required", -1)) != len(
+            observed_names
+        ):
+            raise ValueError(
+                "CBRaMod runtime observed_required does not match its "
+                "observed channel list."
+            )
+        if (
+            missing_channel_policy == "spherical_spline"
+            and completion_metadata.get("channel_completion_source")
+            != "shared_runtime_preprocessor"
+        ):
+            raise ValueError(
+                "CBRaMod spherical-spline package must use the shared "
+                "runtime preprocessor."
+            )
+        if completion_metadata.get(
+            "completion_matrix_sha256"
+        ) != transform.get("completion_matrix_sha256"):
+            raise ValueError(
+                "CBRaMod completion matrix SHA-256 differs between runtime "
+                "and preprocessing metadata."
+            )
+        provenance = package_payload.get("provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError("CBRaMod package provenance must be a mapping.")
+        provenance_sha256 = provenance.get("completion_matrix_sha256")
+        if (
+            provenance_sha256 is not None
+            and provenance_sha256
+            != transform.get("completion_matrix_sha256")
+        ):
+            raise ValueError(
+                "CBRaMod completion matrix SHA-256 differs between package "
+                "provenance and preprocessing metadata."
+            )
+
+    config = CBraModConfig(
+        checkpoint_path=backbone_path,
+        classifier_path=classifier_path,
+        device=device,
+
+        target_sample_rate=float(contract["sample_rate"]),
+        window_seconds=float(contract["window_sec"]),
+        n_channels=n_channels,
+        standard_channels=channel_names,
+        time_segments=int(transform["time_segments"]),
+        points_per_patch=int(transform["points_per_patch"]),
+        input_unit=str(contract["input_unit"]),
+
+        strict_window_duration=bool(
+            contract.get("strict_window_duration", True)
+        ),
+        window_tolerance_seconds=float(
+            transform.get("window_tolerance_seconds", 0.02)
+        ),
+        filter_enabled=bool(
+            transform.get("filter_enabled", False)
+        ),
+        filter_low_hz=float(
+            transform.get("filter_low_hz", 0.1)
+        ),
+        filter_high_hz=float(
+            transform.get("filter_high_hz", 75.0)
+        ),
+        filter_order=int(transform.get("filter_order", 4)),
+        reference_mode=str(
+            transform.get("reference_mode", "none")
+        ),
+        normalization=str(
+            transform.get("normalization", "none")
+        ),
+        zscore_eps=float(transform.get("zscore_eps", 1e-8)),
+        missing_channel_policy=missing_channel_policy,
+        min_observed_channels=min_observed_channels,
+        spline_alpha=spline_alpha,
+
+        num_classes=num_classes,
+        backbone_output_dim=int(
+            model.get("backbone_output_dim", 200)
+        ),
+        head_type=str(model["head_type"]),
+        head_hidden_dim_1=int(
+            model.get("head_hidden_dim_1", 800)
+        ),
+        head_hidden_dim_2=int(
+            model.get("head_hidden_dim_2", 200)
+        ),
+        head_dropout=float(model.get("head_dropout", 0.1)),
+    )
+
+    backbone = CBraModBackbone(config)
+    classifier = build_cbramod_classifier(config).to(
+        backbone.device
+    )
+    classifier_report = load_cbramod_classifier_checkpoint(
+        classifier,
+        classifier_path,
+        config=config,
+        class_names=class_names,
+        strict_metadata=True,
+    )
+
+    if missing_channel_policy == "spherical_spline":
+        classifier_metadata = classifier_report.metadata
+        assert isinstance(completion_metadata, dict)
+        provenance = package_payload.get("provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError("CBRaMod package provenance must be a mapping.")
+        required_classifier_metadata = {
+            "deployment_profile": completion_metadata.get(
+                "deployment_profile"
+            ),
+            "training_channel_source_count": provenance.get(
+                "training_channel_source_count"
+            ),
+            "observed_channel_count": len(
+                completion_metadata["observed_channel_names"]
+            ),
+            "observed_channel_names": completion_metadata[
+                "observed_channel_names"
+            ],
+            "simulated_missing_channels": completion_metadata[
+                "missing_expected"
+            ],
+            "missing_channel_policy": missing_channel_policy,
+            "min_observed_channels": min_observed_channels,
+            "spline_alpha": spline_alpha,
+            "completion_matrix_sha256": transform.get(
+                "completion_matrix_sha256"
+            ),
+            "channel_completion_source": "shared_runtime_preprocessor",
+        }
+        for key, expected_value in required_classifier_metadata.items():
+            if classifier_metadata.get(key) != expected_value:
+                raise ValueError(
+                    "CBRaMod classifier metadata does not match the "
+                    f"spherical-spline package for {key}."
+                )
+
+    runtime_model = RuntimeModel(
+        canonicalizer=SignalCanonicalizer(
+            target_unit=str(
+                canonicalizer_config.get(
+                    "target_unit",
+                    contract["input_unit"],
+                )
+            )
+        ),
+        input_transform=CBraModPipelinePreprocessor(config),
+        backend=CBraModBackend(
+            backbone=backbone,
+            classifier=classifier,
+            config=config,
+        ),
+    )
+
+    _validate_runtime_contract(
+        runtime_model=runtime_model,
+        contract=contract,
+    )
+
+    command_map_raw = runtime_config.get("command_map", {})
+    if not isinstance(command_map_raw, dict):
+        raise ValueError(
+            "runtime.command_map must be a mapping."
+        )
+
+    step_sec = float(runtime_config.get("step_sec", 0.5))
+    if step_sec <= 0:
+        raise ValueError("runtime.step_sec must be positive.")
+
+    confidence_threshold = float(
+        runtime_config.get("confidence_threshold", 0.55)
+    )
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError(
+            "runtime.confidence_threshold must be in [0, 1]."
+        )
+
+    return LoadedRuntimePackage(
+        runtime_model=runtime_model,
+        package_path=package_path,
+        model_type="cbramod",
+        model_name="cbramod-frozen-head",
+        class_names=class_names,
+        command_map={
+            str(key): str(value)
+            for key, value in command_map_raw.items()
+        },
+        step_sec=step_sec,
+        confidence_threshold=confidence_threshold,
+        is_test_head=bool(
+            package_metadata.get("is_test_head", False)
+        ),
+        warning_message=package_metadata.get(
+            "warning_message"
+        ),
+        metrics=_load_json(metrics_path),
+        package_metadata=package_payload,
+    )
+
+
 def load_runtime_package(
     package_path: str | Path,
     *,
@@ -953,7 +1324,15 @@ def load_runtime_package(
             verify_hashes=verify_hashes,
         )
 
+    if model_type == "cbramod":
+        return _load_cbramod_package(
+            package_path=package,
+            package_payload=payload,
+            device=device,
+            verify_hashes=verify_hashes,
+        )
+
     raise ValueError(
         f"Unsupported model type {model_type!r}. "
-        "Currently available: model_50m, labram."
+        "Currently available: model_50m, labram, cbramod."
     )

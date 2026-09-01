@@ -2,7 +2,7 @@
 
 模型代码版本：v1.0
 
-backbone权重火山云地址：s3://jianyu/AAAI2026/LargeScalePretrainResults/LargeScalePretrainResults_FullData_50M/checkpoints/pretrain_checkpoint_4.pt
+backbone权重火山云地址：s3://jianyu/AAAI2026/LargeScalePretrainResults/LargeScalePretrainResults_FullData_50M/checkpoints/model_deploy.pt
 
 权重版本：v1.0
 

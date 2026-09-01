@@ -71,7 +71,7 @@ src/bci_dayloop/models/model_50m/
 └── runtime.py
 
 scripts/
-├── train_50m_linear_head.py
+├── train_50m_population_head.py       # Stage-1 population/LOSO trainer
 ├── export_50m_model_package.py
 ├── smoke_test_50m_tokenization.py
 ├── smoke_test_50m_backbone.py
@@ -138,7 +138,7 @@ probabilities:    [B, num_classes]
 
 ```bash
 conda activate bci-dayloop
-python -m pip install -e .
+python -m pip install -e . --no-deps
 ```
 
 确认导入的是当前仓库：
@@ -180,7 +180,7 @@ Model Package 导出时会保留分类头中的训练 metadata，并写入源文
 ## 6. 训练正式线性分类头
 
 ```bash
-python scripts/train_50m_linear_head.py \
+PYTHONPATH=src python -m bci_dayloop.training.model_50m.linear_head \
   --data data/processed/bnci2014_001/subject_01.h5 \
   --train-session 0train \
   --test-session 1test \

@@ -188,6 +188,90 @@ class LinearClassificationHead(nn.Module):
         return self.linear(features)
 
 
+class MLPClassificationHead(nn.Module):
+    """One-hidden-layer MLP classification head for frozen 50M features."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float,
+        norm: str,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+        if num_classes <= 1:
+            raise ValueError(
+                "num_classes must be greater than 1, "
+                f"got {num_classes}."
+            )
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_classes = int(num_classes)
+        self.dropout_probability = float(dropout)
+        self.norm_type = str(norm)
+
+        if norm == "none":
+            self.normalization: nn.Module = nn.Identity()
+        elif norm == "layernorm":
+            self.normalization = nn.LayerNorm(self.input_dim)
+        elif norm == "batchnorm":
+            self.normalization = nn.BatchNorm1d(self.input_dim)
+        else:
+            raise ValueError(
+                f"Unsupported MLP head norm: {norm!r}. "
+                "Expected 'none', 'layernorm', or 'batchnorm'."
+            )
+
+        self.hidden = nn.Linear(self.input_dim, self.hidden_dim)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(self.dropout_probability)
+        self.output = nn.Linear(self.hidden_dim, self.num_classes)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 2:
+            raise ValueError(
+                "Classification features must have shape [B, F], "
+                f"got {tuple(features.shape)}."
+            )
+        if features.shape[1] != self.input_dim:
+            raise ValueError(
+                "Classification feature dimension mismatch: "
+                f"expected {self.input_dim}, got {features.shape[1]}."
+            )
+        if not torch.isfinite(features).all():
+            raise ValueError("Classification features contain NaN or Inf.")
+        normalized = self.normalization(features)
+        hidden = self.hidden(normalized)
+        activated = self.activation(hidden)
+        return self.output(self.dropout(activated))
+
+
+def build_classification_head(config: Model50MConfig) -> nn.Module:
+    """Construct the configured task head in one shared location."""
+    if config.head_type == "linear":
+        return LinearClassificationHead(
+            input_dim=config.classifier_input_dim,
+            num_classes=config.num_classes,
+        )
+    if config.head_type == "mlp":
+        return MLPClassificationHead(
+            input_dim=config.classifier_input_dim,
+            hidden_dim=config.head_hidden_dim,
+            num_classes=config.num_classes,
+            dropout=config.head_dropout,
+            norm=config.head_norm,
+        )
+    raise ValueError(f"Unsupported head_type: {config.head_type!r}.")
+
+
 # ======================================================================
 # 预测结果
 # ======================================================================
@@ -292,7 +376,7 @@ class Model50MClassifier(nn.Module):
                 ↓
         Classification Features
                 ↓
-        LinearClassificationHead
+        Configured classification head
                 ↓
         logits [B, num_classes]
 
@@ -313,10 +397,7 @@ class Model50MClassifier(nn.Module):
             mode=config.aggregation,
         )
 
-        self.head = LinearClassificationHead(
-            input_dim=config.classifier_input_dim,
-            num_classes=config.num_classes,
-        )
+        self.head = build_classification_head(config)
 
         self.head.to(self.backbone.device)
         self.aggregator.to(self.backbone.device)
@@ -350,9 +431,11 @@ class Model50MClassifier(nn.Module):
     ) -> "Model50MClassifier":
         super().train(mode)
 
-        # Linear probe 时，Backbone 必须始终为 eval，
-        # 避免 Dropout 造成同一 EEG 输入特征不一致。
-        self.backbone.eval()
+        # The Backbone owns its own freeze/partial-finetune mode policy.
+        # In the frozen baseline this still keeps every backbone module in
+        # eval; partial fine-tuning enables train mode only for selected
+        # encoder blocks.
+        self.backbone.train(mode)
 
         # 只有分类头跟随训练状态。
         self.head.train(mode)
@@ -602,6 +685,22 @@ def build_classifier_metadata(
         "model_n_time_patches": int(
             config.model_n_time_patches
         ),
+        "head_type": config.head_type,
+        "head_hidden_dim": int(config.head_hidden_dim),
+        "head_dropout": float(config.head_dropout),
+        "head_norm": config.head_norm,
+    }
+
+
+def classifier_head_config_from_metadata(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return architecture metadata, defaulting absent legacy fields to Linear."""
+    return {
+        "head_type": str(metadata.get("head_type", "linear")),
+        "head_hidden_dim": int(metadata.get("head_hidden_dim", 512)),
+        "head_dropout": float(metadata.get("head_dropout", 0.0)),
+        "head_norm": str(metadata.get("head_norm", "none")),
     }
 
 
@@ -610,9 +709,13 @@ def save_classifier_checkpoint(
     checkpoint_path: Path | str,
     *,
     extra_metadata: Mapping[str, Any] | None = None,
+    backbone_state_dict: Mapping[str, torch.Tensor] | None = None,
+    lora_state_dict: Mapping[str, torch.Tensor] | None = None,
 ) -> Path:
     """
-    只保存任务分类头，不重复保存 50M Backbone。
+    默认只保存任务分类头，不重复保存 50M Backbone。partial fine-tuning
+    调用方可显式提供 ``backbone_state_dict``；LoRA 调用方则保存独立的
+    ``lora_state_dict``，避免重复保存冻结 backbone。
 
     文件内容：
         format_version
@@ -639,8 +742,18 @@ def save_classifier_checkpoint(
     if extra_metadata is not None:
         metadata.update(dict(extra_metadata))
 
+    if backbone_state_dict is not None and lora_state_dict is not None:
+        raise ValueError(
+            "A classifier checkpoint cannot contain both a full fine-tuned "
+            "backbone_state_dict and lora_state_dict."
+        )
+
     payload = {
-        "format_version": 1,
+        "format_version": (
+            4
+            if lora_state_dict is not None
+            else (3 if backbone_state_dict is not None else 2)
+        ),
         "head_state_dict": {
             key: value.detach().cpu()
             for key, value in (
@@ -649,6 +762,16 @@ def save_classifier_checkpoint(
         },
         "metadata": metadata,
     }
+    if backbone_state_dict is not None:
+        payload["backbone_state_dict"] = {
+            key: value.detach().cpu()
+            for key, value in backbone_state_dict.items()
+        }
+    if lora_state_dict is not None:
+        payload["lora_state_dict"] = {
+            key: value.detach().cpu()
+            for key, value in lora_state_dict.items()
+        }
 
     temporary_path = Path(
         f"{checkpoint_path}.tmp"
@@ -681,6 +804,25 @@ def _safe_load_classifier_file(
         )
 
 
+def read_classifier_head_config(
+    checkpoint_path: Path | str,
+) -> dict[str, Any]:
+    """Read self-described head architecture, including legacy Linear defaults."""
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"50M classifier checkpoint was not found: {path}")
+    checkpoint = _safe_load_classifier_file(path, torch.device("cpu"))
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(
+            "Classifier checkpoint must be a mapping, "
+            f"got {type(checkpoint)!r}."
+        )
+    metadata = checkpoint.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise TypeError("Classifier checkpoint metadata must be a mapping.")
+    return classifier_head_config_from_metadata(metadata)
+
+
 def _validate_checkpoint_metadata(
     metadata: Mapping[str, Any],
     config: Model50MConfig,
@@ -705,18 +847,25 @@ def _validate_checkpoint_metadata(
         "target_sample_rate": float(
             config.target_sample_rate
         ),
+        "head_type": config.head_type,
+        "head_hidden_dim": int(config.head_hidden_dim),
+        "head_dropout": float(config.head_dropout),
+        "head_norm": config.head_norm,
     }
+
+    normalized_metadata = dict(metadata)
+    normalized_metadata.update(classifier_head_config_from_metadata(metadata))
 
     mismatches: list[str] = []
 
     for key, expected_value in expected.items():
-        if key not in metadata:
+        if key not in normalized_metadata:
             mismatches.append(
                 f"{key}: missing in checkpoint"
             )
             continue
 
-        actual_value = metadata[key]
+        actual_value = normalized_metadata[key]
 
         if actual_value != expected_value:
             mismatches.append(
@@ -808,6 +957,63 @@ def load_classifier_checkpoint(
             config=classifier.config,
         )
 
+    saved_backbone_state = checkpoint.get("backbone_state_dict")
+    saved_lora_state = checkpoint.get("lora_state_dict")
+    if saved_backbone_state is not None and saved_lora_state is not None:
+        raise ValueError(
+            "Classifier checkpoint cannot contain both backbone_state_dict "
+            "and lora_state_dict."
+        )
+    if saved_backbone_state is not None:
+        if not isinstance(saved_backbone_state, Mapping):
+            raise TypeError(
+                "Classifier checkpoint backbone_state_dict must be a mapping."
+            )
+        try:
+            classifier.backbone.model.load_state_dict(
+                saved_backbone_state,
+                strict=True,
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Failed to load the fine-tuned 50M backbone state from "
+                "the classifier checkpoint."
+            ) from error
+
+    if saved_lora_state is not None:
+        if not isinstance(saved_lora_state, Mapping):
+            raise TypeError(
+                "Classifier checkpoint lora_state_dict must be a mapping."
+            )
+        required_lora_metadata = (
+            "lora_block_indices",
+            "lora_target_modules",
+            "lora_rank",
+            "lora_alpha",
+            "lora_dropout",
+        )
+        missing_lora_metadata = [
+            key for key in required_lora_metadata if key not in metadata
+        ]
+        if missing_lora_metadata:
+            raise KeyError(
+                "LoRA classifier checkpoint metadata is missing "
+                f"{missing_lora_metadata}."
+            )
+        from .lora import inject_lora_adapters, load_lora_state_dict
+
+        report = inject_lora_adapters(
+            classifier.backbone,
+            block_indices=metadata["lora_block_indices"],
+            target_modules=metadata["lora_target_modules"],
+            rank=int(metadata["lora_rank"]),
+            alpha=float(metadata["lora_alpha"]),
+            dropout=float(metadata["lora_dropout"]),
+        )
+        if tuple(report.block_indices) != tuple(metadata["lora_block_indices"]):
+            raise RuntimeError("Loaded LoRA block indices differ from checkpoint metadata.")
+        load_lora_state_dict(classifier.backbone.model, saved_lora_state)
+
     try:
         classifier.head.load_state_dict(
             state_dict,
@@ -855,7 +1061,7 @@ def build_model50m_classifier(
     过程：
         1. 加载并冻结 Backbone；
         2. 构建 Flatten/Mean 聚合器；
-        3. 构建线性任务头；
+        3. 构建配置指定的任务头；
         4. 可选加载已有分类头。
     """
     backbone = Model50MBackbone(

@@ -31,6 +31,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# Tests import both installable sources and repository-owned script modules.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
-addopts = "-ra --basetemp=.pytest_tmp"
+# The repository resides on an external macOS volume in supported developer
+# setups; use a local temp directory to avoid AppleDouble sidecar artifacts.
+addopts = "-ra --basetemp=/tmp/ncc-oi-bci-pytest"

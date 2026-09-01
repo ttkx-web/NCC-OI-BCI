@@ -297,7 +297,8 @@ git checkout feat/downstream-4s
 ```bash
 conda env create -f environment.yml
 conda activate bci-dayloop
-python -m pip install -e .
+# Install the platform-approved PyTorch wheel first; then:
+python -m pip install -e . --no-deps
 ```
 
 ### 7.3 macOS / CPU 环境

@@ -1,0 +1,2641 @@
+from __future__ import annotations
+
+"""
+Train a LOSO CBRaMod frozen-backbone population head on BNCI2014_001.
+
+For one target subject:
+
+    Population training:
+        all non-target subjects / 0train
+
+    Population validation:
+        all non-target subjects / 1test
+
+    Final independent test:
+        target subject / 1test
+
+The target subject is never used to train or select the population head.
+
+The CBRaMod backbone is frozen. Only the downstream classification head is
+updated. The default head is the official CBRaMod MLP head:
+
+    Flatten(22 * 4 * 200)
+    -> Linear(..., 800) -> ELU -> Dropout
+    -> Linear(800, 200) -> ELU -> Dropout
+    -> Linear(200, 4)
+"""
+
+import argparse
+import csv
+import hashlib
+import json
+import random
+import subprocess
+import time
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+)
+from torch.utils.data import DataLoader, TensorDataset
+
+from _bootstrap import ROOT
+
+from bci_dayloop.data.sequential_dataset import (
+    SequentialDatasetMetadata,
+    load_sequential_dataset,
+    resolve_population_split_plan,
+)
+from bci_dayloop.data.channel_selection import select_named_channels
+from bci_dayloop.data.splits import (
+    WithinSubjectTrialSplit,
+    resolve_within_subject_trial_split,
+)
+from bci_dayloop.models.cbramod.backbone import (
+    CBraModBackbone,
+)
+from bci_dayloop.models.cbramod.classifier import (
+    CBraModClassifier,
+    build_cbramod_classifier,
+)
+from bci_dayloop.models.cbramod.config import (
+    CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE,
+    CBRAMOD_STRICT22_PROFILE,
+    CBraModConfig,
+    resolve_cbramod_deployment_profile,
+)
+from bci_dayloop.models.cbramod.preprocessing import (
+    CBraModPipelinePreprocessor,
+)
+from bci_dayloop.models.cbramod.runtime import (
+    save_cbramod_classifier_checkpoint,
+)
+from bci_dayloop.preprocessing.canonical import (
+    SignalCanonicalizer,
+)
+from bci_dayloop.runtime.types import RawEEGWindow
+from bci_dayloop.utils.config import dump_yaml
+from bci_dayloop.data.trial_windows import (
+    select_direct_trial_window,
+)
+
+# ---------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureSplit:
+    """
+    冻结 CBRaMod backbone 后的特征集合。
+
+    features:
+        [N, 22, 4, 200]
+
+    labels:
+        [N]
+
+    source_trial_ids:
+        使用 subject_id 和原始 trial_id 编码后的全局唯一 ID。
+    """
+
+    features: torch.Tensor
+    labels: torch.Tensor
+    source_trial_ids: np.ndarray
+    subject_ids: np.ndarray
+    session_name: str
+
+    def __post_init__(self) -> None:
+        num_samples = int(self.features.shape[0])
+
+        if self.features.ndim != 4:
+            raise ValueError(
+                "features must have shape [N, C, S, D], got "
+                f"{tuple(self.features.shape)}."
+            )
+
+        if tuple(self.labels.shape) != (num_samples,):
+            raise ValueError(
+                "labels shape mismatch: expected "
+                f"{(num_samples,)}, got "
+                f"{tuple(self.labels.shape)}."
+            )
+
+        if self.source_trial_ids.shape != (num_samples,):
+            raise ValueError(
+                "source_trial_ids shape mismatch: expected "
+                f"{(num_samples,)}, got "
+                f"{self.source_trial_ids.shape}."
+            )
+
+        if self.subject_ids.shape != (num_samples,):
+            raise ValueError(
+                "subject_ids shape mismatch: expected "
+                f"{(num_samples,)}, got "
+                f"{self.subject_ids.shape}."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class Metrics:
+    loss: float
+    accuracy: float
+    balanced_accuracy: float
+    macro_f1: float
+    confusion_matrix: list[list[int]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "loss": self.loss,
+            "accuracy": self.accuracy,
+            "balanced_accuracy": self.balanced_accuracy,
+            "macro_f1": self.macro_f1,
+            "confusion_matrix": self.confusion_matrix,
+        }
+
+
+# ---------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------
+
+def resolve_cbramod_time_segments(
+    *,
+    window_seconds: float,
+    target_sample_rate: float,
+    points_per_patch: int = 200,
+) -> int:
+    """
+    官方 CBraMod 保持每个 patch 为 200 点。
+
+    在 200 Hz 下，这等价于要求 window_seconds 是整数秒。
+    """
+    if window_seconds <= 0:
+        raise ValueError(
+            "--window-seconds must be positive."
+        )
+
+    if target_sample_rate <= 0:
+        raise ValueError(
+            "--target-sample-rate must be positive."
+        )
+
+    target_samples_float = (
+        window_seconds * target_sample_rate
+    )
+    target_samples = int(round(target_samples_float))
+
+    if not np.isclose(
+        target_samples_float,
+        target_samples,
+        rtol=0.0,
+        atol=1e-6,
+    ):
+        raise ValueError(
+            "CBraMod window duration does not map to an "
+            "integer number of samples: "
+            f"{window_seconds} s × "
+            f"{target_sample_rate} Hz = "
+            f"{target_samples_float}."
+        )
+
+    if target_samples % points_per_patch != 0:
+        raise ValueError(
+            "CBraMod currently requires an integer number "
+            "of 200-sample patches. At 200 Hz, "
+            "--window-seconds must be an integer number "
+            f"of seconds. Got {window_seconds}s -> "
+            f"{target_samples} samples."
+        )
+
+    time_segments = target_samples // points_per_patch
+
+    if time_segments <= 0:
+        raise ValueError(
+            "CBraMod time_segments must be positive."
+        )
+
+    return time_segments
+
+def resolve_repo_path(
+    value: str | Path,
+) -> Path:
+    path = Path(value).expanduser()
+
+    if not path.is_absolute():
+        path = ROOT / path
+
+    return path.resolve()
+
+
+def resolve_default_artifact_paths(
+    *,
+    metadata: SequentialDatasetMetadata,
+    target_subject: int,
+    window_tag: str,
+    model_path_component: str = "cbramod",
+    split_mode: str | None = None,
+) -> tuple[Path, Path]:
+    dataset_name = str(metadata.dataset_name).strip()
+    if not dataset_name:
+        raise ValueError("Loaded dataset_name must be non-empty.")
+
+    run_base = ROOT / "runs" / "stage1" / dataset_name
+    head_base = ROOT / "checkpoints" / "heads" / "stage1" / dataset_name
+    if split_mode is not None:
+        run_base /= split_mode
+        head_base /= split_mode
+    run_dir = run_base / f"subject_{target_subject:02d}" / model_path_component / window_tag
+    head_path = head_base / f"subject_{target_subject:02d}" / model_path_component / window_tag / "head.pt"
+    return head_path, run_dir
+
+
+def atomic_write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary = path.with_suffix(
+        f"{path.suffix}.tmp"
+    )
+
+    temporary.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    temporary.replace(path)
+
+
+def sha256_file(
+    path: Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk_size)
+
+            if not block:
+                break
+
+            digest.update(block)
+
+    return digest.hexdigest()
+
+
+def stable_json_hash(
+    payload: Mapping[str, Any],
+) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_preprocessing_manifest(
+    *,
+    config: CBraModConfig,
+    source_unit: str,
+    direct_trial_anchor: str,
+    deployment_profile: Any | None = None,
+    completion_matrix_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build the persisted preprocessing contract without loading a model."""
+    manifest = {
+        "source_unit": str(source_unit),
+        "standard_channels": list(config.standard_channels),
+        "target_sample_rate": config.target_sample_rate,
+        "window_seconds": config.window_seconds,
+        "time_segments": config.time_segments,
+        "points_per_patch": config.points_per_patch,
+        "input_unit": config.input_unit,
+        "filter_enabled": config.filter_enabled,
+        "filter_low_hz": config.filter_low_hz,
+        "filter_high_hz": config.filter_high_hz,
+        "filter_order": config.filter_order,
+        "reference_mode": config.reference_mode,
+        "normalization": config.normalization,
+        "zscore_eps": config.zscore_eps,
+        "strict_window_duration": config.strict_window_duration,
+        "window_tolerance_seconds": config.window_tolerance_seconds,
+        "training_source_trial_selection": {
+            "policy": "one_contiguous_window_per_source_trial",
+            "anchor": direct_trial_anchor,
+            "padding": False,
+            "cross_trial_concatenation": False,
+        },
+        "missing_channel_policy": config.missing_channel_policy,
+        "min_observed_channels": config.min_observed_channels,
+        "spline_alpha": config.spline_alpha,
+    }
+    if deployment_profile is not None:
+        manifest.update(
+            {
+                "deployment_profile": deployment_profile.name,
+                "training_channel_source_count": deployment_profile.training_channel_source_count,
+                "observed_channel_count": len(deployment_profile.observed_channel_names),
+                "observed_channel_names": list(deployment_profile.observed_channel_names),
+                "simulated_missing_channels": list(deployment_profile.simulated_missing_channels),
+                "channel_completion_source": deployment_profile.channel_completion_source,
+                "completion_matrix_sha256": completion_matrix_sha256,
+            }
+        )
+    return manifest
+
+
+def state_dict_sha256(
+    state_dict: Mapping[str, torch.Tensor],
+) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def current_git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+    ):
+        return None
+
+    value = result.stdout.strip()
+
+    return value or None
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def normalize_subjects(
+    values: Sequence[int],
+) -> list[int]:
+    subjects = sorted(set(int(value) for value in values))
+
+    if not subjects:
+        raise ValueError(
+            "At least one subject must be provided."
+        )
+
+    invalid = [
+        subject
+        for subject in subjects
+        if subject <= 0
+    ]
+
+    if invalid:
+        raise ValueError(
+            f"Subject IDs must be positive, got {invalid}."
+        )
+
+    return subjects
+
+
+def encode_source_trial_id(
+    subject_id: int,
+    trial_id: int,
+) -> int:
+    """
+    将文件内 trial_id 编成全局唯一 int64：
+
+    high 32 bits: subject_id
+    low 32 bits : trial_id
+    """
+
+    subject_id = int(subject_id)
+    trial_id = int(trial_id)
+
+    if subject_id <= 0:
+        raise ValueError(
+            f"subject_id must be positive, got {subject_id}."
+        )
+
+    if not 0 <= trial_id < 2**32:
+        raise ValueError(
+            "trial_id must be in [0, 2**32), got "
+            f"{trial_id}."
+        )
+
+    return (subject_id << 32) | trial_id
+
+
+def class_counts(
+    labels: np.ndarray,
+    class_names: Sequence[str],
+) -> dict[str, int]:
+    labels = np.asarray(labels, dtype=np.int64)
+
+    return {
+        str(class_name): int(
+            np.sum(labels == class_index)
+        )
+        for class_index, class_name in enumerate(
+            class_names
+        )
+    }
+
+
+def resolve_class_names(
+    *, metadata: SequentialDatasetMetadata,
+    explicit_class_names: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Resolve classifier semantics from the dataset contract, not BNCI defaults."""
+    metadata_names = tuple(str(name).strip() for name in metadata.class_names)
+    class_names = (
+        tuple(str(name).strip() for name in explicit_class_names)
+        if explicit_class_names is not None else metadata_names
+    )
+    if not class_names or len(class_names) != len(metadata_names):
+        raise ValueError("class_names length must match the dataset class count.")
+    if not all(class_names) or len(set(class_names)) != len(class_names):
+        raise ValueError("class_names must be non-empty and unique.")
+    return class_names
+
+
+def validate_labels(
+    labels: np.ndarray,
+    *,
+    num_classes: int,
+    split_name: str,
+) -> None:
+    labels = np.asarray(labels, dtype=np.int64)
+
+    if labels.ndim != 1:
+        raise ValueError(
+            f"{split_name}: labels must be 1-D, got "
+            f"{labels.shape}."
+        )
+
+    if len(labels) == 0:
+        raise ValueError(
+            f"{split_name}: labels are empty."
+        )
+
+    invalid = labels[
+        (labels < 0)
+        | (labels >= num_classes)
+    ]
+
+    if len(invalid) > 0:
+        raise ValueError(
+            f"{split_name}: labels outside "
+            f"[0, {num_classes - 1}]: "
+            f"{sorted(set(invalid.tolist()))}."
+        )
+
+
+def validate_no_trial_leakage(
+    left: FeatureSplit,
+    right: FeatureSplit,
+    *,
+    left_name: str,
+    right_name: str,
+) -> None:
+    overlap = np.intersect1d(
+        left.source_trial_ids,
+        right.source_trial_ids,
+    )
+
+    if len(overlap) > 0:
+        raise RuntimeError(
+            f"Source-trial leakage between {left_name} and "
+            f"{right_name}. Example encoded IDs: "
+            f"{overlap[:10].tolist()}."
+        )
+
+
+def validate_metadata_compatibility(
+    reference: SequentialDatasetMetadata,
+    candidate: SequentialDatasetMetadata,
+    *,
+    subject_id: int,
+    path: Path,
+) -> None:
+    mismatches: list[str] = []
+
+    if reference.dataset_name != candidate.dataset_name:
+        mismatches.append(
+            "dataset_name "
+            f"{candidate.dataset_name!r} != "
+            f"{reference.dataset_name!r}"
+        )
+
+    if reference.class_names != candidate.class_names:
+        mismatches.append(
+            "class_names differ"
+        )
+
+    if mismatches:
+        raise ValueError(
+            f"Metadata mismatch for subject {subject_id} "
+            f"at {path}: {'; '.join(mismatches)}."
+        )
+
+
+def resolve_subject_file(
+    *,
+    data_root: Path,
+    data_pattern: str,
+    subject_id: int,
+) -> Path:
+    try:
+        formatted = data_pattern.format(
+            subject=subject_id
+        )
+    except (KeyError, ValueError) as error:
+        raise ValueError(
+            "--data-pattern must be a valid Python format "
+            "string containing {subject}; for example "
+            "'subject_{subject:02d}.h5'."
+        ) from error
+
+    candidates = [
+        data_root / formatted,
+        data_root / f"subject_{subject_id:02d}.h5",
+        data_root / f"bnci2014_001_s{subject_id:02d}.h5",
+        ROOT
+        / "data"
+        / "processed"
+        / f"bnci2014_001_s{subject_id:02d}.h5",
+    ]
+
+    unique_candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    for candidate in candidates:
+        resolved = resolve_repo_path(candidate)
+
+        if resolved not in seen:
+            unique_candidates.append(resolved)
+            seen.add(resolved)
+
+    for candidate in unique_candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not find HDF5 data for subject {subject_id}. "
+        "Tried:\n"
+        + "\n".join(
+            f"  - {candidate}"
+            for candidate in unique_candidates
+        )
+    )
+
+
+# ---------------------------------------------------------------------
+# Frozen feature extraction
+# ---------------------------------------------------------------------
+
+
+def prepare_cbramod_trials(
+    *,
+    data: np.ndarray,
+    metadata: SequentialDatasetMetadata,
+    trial_ids: np.ndarray,
+    subject_id: int,
+    session_name: str,
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> np.ndarray:
+    """
+    将 HDF5 的 [N, C, T] trial 转成 CBRaMod 的 [N, 22, 4, 200]。
+    """
+
+    values = np.asarray(data, dtype=np.float32)
+
+    if values.ndim != 3:
+        raise ValueError(
+            "HDF5 trials must have shape [N, C, T], got "
+            f"{values.shape}."
+        )
+
+    if len(trial_ids) != len(values):
+        raise ValueError(
+            "trial_ids length does not match number of trials."
+        )
+
+    values, selected_channel_names = select_named_channels(
+        values,
+        source_channel_names=metadata.channel_names,
+        requested_channel_names=observed_channel_names,
+        channel_axis=1,
+    )
+
+    prepared_trials: list[np.ndarray] = []
+
+    for index, trial in enumerate(values):
+        raw_window = RawEEGWindow(
+            data=trial,
+            channel_names=list(
+                selected_channel_names
+            ),
+            sample_rate=float(metadata.sample_rate),
+            unit=str(metadata.unit),
+            layout="CT",
+            trial_id=str(trial_ids[index]),
+            metadata={
+                "subject_id": int(subject_id),
+                "session": session_name,
+                "source": "train_cbramod_population_head",
+            },
+        )
+
+        canonical_window = canonicalizer.transform(
+            raw_window
+        )
+
+        prepared = preprocessor.transform(
+            canonical_window
+        )
+
+        diagnostics = prepared.diagnostics
+        expected_observed = tuple(
+            str(name).upper() for name in selected_channel_names
+        )
+        actual_observed = tuple(
+            str(name).upper()
+            for name in diagnostics.get("observed_channel_names", ())
+        )
+        if actual_observed != expected_observed:
+            raise RuntimeError(
+                "CBRaMod training preprocessor observed unexpected channels: "
+                f"expected={expected_observed}, actual={actual_observed}."
+            )
+        expected_missing = tuple(
+            str(name).upper() for name in simulated_missing_channels
+        )
+        actual_missing = tuple(
+            str(name).upper()
+            for name in diagnostics.get("missing_channel_names", ())
+        )
+        if actual_missing != expected_missing:
+            raise RuntimeError(
+                "CBRaMod training missing-channel simulation changed: "
+                f"expected={expected_missing}, actual={actual_missing}."
+            )
+        if int(diagnostics.get("duplicate_channel_count", -1)) != 0:
+            raise RuntimeError(
+                "CBRaMod training input must not contain duplicate channels."
+            )
+        actual_completion_sha256 = diagnostics.get(
+            "completion_matrix_sha256"
+        )
+        if actual_completion_sha256 != expected_completion_matrix_sha256:
+            raise RuntimeError(
+                "CBRaMod training completion matrix SHA-256 does not match "
+                "the deployment profile."
+            )
+
+        signal = prepared.model_input["signal"]
+
+        if not isinstance(signal, torch.Tensor):
+            raise TypeError(
+                "CBraMod preprocessor did not return a Tensor "
+                "under model_input['signal']."
+            )
+
+        expected_shape = (
+            1,
+            preprocessor.config.n_channels,
+            preprocessor.config.time_segments,
+            preprocessor.config.points_per_patch,
+        )
+
+        if tuple(signal.shape) != expected_shape:
+            raise RuntimeError(
+                "Unexpected CBRaMod prepared trial shape. "
+                f"Expected {expected_shape}, got "
+                f"{tuple(signal.shape)}."
+            )
+
+        prepared_trials.append(
+            signal[0].detach().cpu().numpy()
+        )
+
+    return np.ascontiguousarray(
+        np.stack(prepared_trials, axis=0),
+        dtype=np.float32,
+    )
+
+
+@torch.no_grad()
+def extract_frozen_features(
+    *,
+    backbone: CBraModBackbone,
+    prepared_trials: np.ndarray,
+    batch_size: int,
+) -> torch.Tensor:
+    """
+    输入：
+        prepared_trials: [N, 22, 4, 200]
+
+    输出：
+        features: [N, 22, 4, 200]，保存在 CPU。
+    """
+
+    if batch_size <= 0:
+        raise ValueError(
+            f"batch_size must be positive, got {batch_size}."
+        )
+
+    values = np.asarray(
+        prepared_trials,
+        dtype=np.float32,
+    )
+
+    expected_tail = backbone.config.expected_unbatched_shape
+
+    if values.ndim != 4:
+        raise ValueError(
+            "prepared_trials must have shape [N, C, S, P], "
+            f"got {values.shape}."
+        )
+
+    if tuple(values.shape[1:]) != expected_tail:
+        raise ValueError(
+            "prepared_trials shape mismatch. Expected "
+            f"[N, {expected_tail[0]}, "
+            f"{expected_tail[1]}, "
+            f"{expected_tail[2]}], got "
+            f"{values.shape}."
+        )
+
+    backbone.freeze()
+
+    outputs: list[torch.Tensor] = []
+
+    for start in range(0, len(values), batch_size):
+        end = min(start + batch_size, len(values))
+
+        batch = torch.from_numpy(
+            values[start:end]
+        ).to(
+            backbone.device,
+            dtype=torch.float32,
+            non_blocking=(
+                backbone.device.type == "cuda"
+            ),
+        )
+
+        features = backbone.encode(batch)
+
+        outputs.append(
+            features.detach().cpu()
+        )
+
+    result = torch.cat(outputs, dim=0).contiguous()
+
+    expected_shape = (
+        len(values),
+        backbone.config.n_channels,
+        backbone.config.time_segments,
+        backbone.config.backbone_output_dim,
+    )
+
+    if tuple(result.shape) != expected_shape:
+        raise RuntimeError(
+            "Unexpected frozen CBRaMod feature shape. "
+            f"Expected {expected_shape}, got "
+            f"{tuple(result.shape)}."
+        )
+
+    return result
+
+
+def build_subject_feature_split(
+    *,
+    subject_id: int,
+    session_name: str,
+    subject_path: Path,
+    reference_metadata: SequentialDatasetMetadata | None,
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> tuple[FeatureSplit, SequentialDatasetMetadata]:
+    dataset = load_sequential_dataset(subject_path, session=session_name)
+    if reference_metadata is not None:
+        validate_metadata_compatibility(
+            reference_metadata, dataset.metadata, subject_id=subject_id, path=subject_path,
+        )
+    return build_feature_split_from_session_data(
+        subject_id=subject_id, session_name=session_name, subject_path=subject_path,
+        metadata=dataset.metadata, loaded=sequential_dataset_trial_data(dataset),
+        canonicalizer=canonicalizer, preprocessor=preprocessor, backbone=backbone,
+        feature_batch_size=feature_batch_size, direct_trial_anchor=direct_trial_anchor,
+        observed_channel_names=observed_channel_names,
+        simulated_missing_channels=simulated_missing_channels,
+        expected_completion_matrix_sha256=expected_completion_matrix_sha256,
+    )
+
+
+def sequential_dataset_trial_data(dataset: Any) -> dict[str, np.ndarray]:
+    """Expose adapter-owned trial arrays without reordering or changing HDF5."""
+    return {
+        name: np.asarray(getattr(dataset, name))
+        for name in (
+            "data", "labels", "subject_ids", "session_ids", "trial_ids",
+            "trial_ordinals", "window_ids",
+        )
+    }
+
+
+def trainer_subject_ids(values: object, *, subject_id: int, expected: int) -> np.ndarray:
+    """Map adapter-native identities to the requested trainer subject safely."""
+    source_ids = np.asarray(values).reshape(-1)
+    if source_ids.shape != (expected,):
+        raise ValueError("adapter subject_ids length does not match trial count.")
+    if not all(str(value).strip() for value in source_ids):
+        raise ValueError("adapter subject_ids must be non-empty.")
+    # Numeric adapters can be checked exactly.  Dataset-native textual IDs
+    # (e.g. P01 and SEED-01) are provenance identities, while the CLI target
+    # subject is the stable population-training identity.
+    try:
+        numeric_ids = source_ids.astype(np.int64)
+    except (TypeError, ValueError):
+        return np.full(expected, int(subject_id), dtype=np.int64)
+    if not np.all(numeric_ids == int(subject_id)):
+        raise ValueError(
+            f"adapter subject_ids do not match subject {subject_id}: "
+            f"{sorted(set(numeric_ids.tolist()))}."
+        )
+    return numeric_ids
+
+
+def build_feature_split_from_session_data(
+    *,
+    subject_id: int,
+    session_name: str,
+    subject_path: Path,
+    metadata: SequentialDatasetMetadata,
+    loaded: Mapping[str, np.ndarray],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> tuple[FeatureSplit, SequentialDatasetMetadata]:
+    """Encode a selected SequentialDataset subset without losing provenance."""
+    data = np.asarray(loaded["data"], dtype=np.float32)
+    labels = np.asarray(loaded["labels"], dtype=np.int64)
+    trial_ids = np.asarray(loaded["trial_ids"], dtype=str)
+    subject_ids = trainer_subject_ids(
+        loaded["subject_ids"], subject_id=subject_id, expected=len(data)
+    )
+
+    if data.ndim != 3:
+        raise ValueError(
+            f"{subject_path}: expected [N, C, T] data, got "
+            f"{data.shape}."
+        )
+
+    if len(data) == 0:
+        raise ValueError(
+            f"{subject_path}: session {session_name!r} is empty."
+        )
+
+    if len(labels) != len(data):
+        raise ValueError(
+            f"{subject_path}: labels length mismatch."
+        )
+
+    loaded_sessions = set(np.asarray(loaded["session_ids"], dtype=str).tolist())
+    if loaded_sessions != {session_name}:
+        raise ValueError(
+            f"{subject_path}: expected only session {session_name!r}, "
+            f"got {sorted(loaded_sessions)}."
+        )
+
+    validate_labels(
+        labels,
+        num_classes=len(metadata.class_names),
+        split_name=(
+            f"subject_{subject_id:02d}/{session_name}"
+        ),
+    )
+
+    if (
+        metadata.dataset_name == "workload_pbci_hackathon"
+        and not np.isclose(metadata.window_sec, preprocessor.config.window_seconds, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(
+            "Workload trials must be consumed at their persisted window duration; "
+            f"dataset={metadata.window_sec}, requested={preprocessor.config.window_seconds}."
+        )
+
+    data, _ = select_direct_trial_window(
+        data,
+        sample_rate=float(metadata.sample_rate),
+        window_seconds=preprocessor.config.window_seconds,
+        anchor=direct_trial_anchor,
+        context=(
+            f"subject_{subject_id:02d}/"
+            f"{session_name}"
+        ),
+    )
+
+    prepared_trials = prepare_cbramod_trials(
+        data=data,
+        metadata=metadata,
+        trial_ids=trial_ids,
+        subject_id=subject_id,
+        session_name=session_name,
+        canonicalizer=canonicalizer,
+        preprocessor=preprocessor,
+        observed_channel_names=observed_channel_names,
+        simulated_missing_channels=simulated_missing_channels,
+        expected_completion_matrix_sha256=(
+            expected_completion_matrix_sha256
+        ),
+    )
+
+    features = extract_frozen_features(
+        backbone=backbone,
+        prepared_trials=prepared_trials,
+        batch_size=feature_batch_size,
+    )
+
+    global_trial_ids = np.asarray(
+        [f"{subject_id}:{session_name}:{trial_id}" for trial_id in trial_ids],
+        dtype=str,
+    )
+
+    return (
+        FeatureSplit(
+            features=features,
+            labels=torch.from_numpy(
+                labels.astype(np.int64, copy=False)
+            ),
+            source_trial_ids=global_trial_ids,
+            subject_ids=subject_ids,
+            session_name=session_name,
+        ),
+        metadata,
+    )
+
+
+def select_trial_rows(
+    trial_data: Mapping[str, np.ndarray], indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select source trials without modifying adapter-owned HDF5 arrays."""
+    indices = np.asarray(indices, dtype=np.int64)
+    return {key: np.asarray(values)[indices] for key, values in trial_data.items()}
+
+
+def select_trial_ids(
+    trial_data: Mapping[str, np.ndarray], trial_ids: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select source IDs safely even when adapters use textual trial IDs."""
+    requested = np.asarray(trial_ids, dtype=str)
+    available = np.asarray(trial_data["trial_ids"], dtype=str)
+    selected = select_trial_rows(trial_data, np.flatnonzero(np.isin(available, requested)))
+    selected_ids = np.asarray(selected["trial_ids"], dtype=str)
+    if set(selected_ids.tolist()) != set(requested.tolist()):
+        missing = sorted(set(requested.tolist()) - set(selected_ids.tolist()))
+        raise RuntimeError(f"Selected source trials are missing from the loaded session: {missing[:10]}.")
+    return selected
+
+
+def build_within_subject_train_validation_splits(
+    *,
+    subject_id: int,
+    subject_path: Path,
+    train_session: str,
+    test_session: str,
+    validation_ratio: float,
+    seed: int,
+    class_names: Sequence[str],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> tuple[FeatureSplit, FeatureSplit, SequentialDatasetMetadata, WithinSubjectTrialSplit, dict[str, np.ndarray]]:
+    """Split adapter source trials before preprocessing or frozen encoding."""
+    train_dataset = load_sequential_dataset(subject_path, session=train_session)
+    test_dataset = load_sequential_dataset(subject_path, session=test_session)
+    validate_metadata_compatibility(
+        train_dataset.metadata, test_dataset.metadata,
+        subject_id=subject_id, path=subject_path,
+    )
+    train_data = sequential_dataset_trial_data(train_dataset)
+    test_data = sequential_dataset_trial_data(test_dataset)
+    all_trial_metadata = {
+        key: np.concatenate((train_data[key], test_data[key]), axis=0)
+        for key in train_data
+    }
+    all_trial_metadata["subject_ids"] = np.full(
+        len(all_trial_metadata["labels"]), subject_id, dtype=np.int64
+    )
+    split = resolve_within_subject_trial_split(
+        subject_ids=all_trial_metadata["subject_ids"],
+        session_ids=all_trial_metadata["session_ids"],
+        labels=all_trial_metadata["labels"],
+        subject_id=subject_id,
+        train_session=train_session,
+        test_session=test_session,
+        validation_ratio=validation_ratio,
+        seed=seed,
+        num_classes=len(class_names),
+    )
+    selected_train = select_trial_ids(
+        train_data, all_trial_metadata["trial_ids"][split.train_indices],
+    )
+    selected_validation = select_trial_ids(
+        train_data, all_trial_metadata["trial_ids"][split.validation_indices],
+    )
+    for selected in (selected_train, selected_validation):
+        selected["subject_ids"] = np.full(
+            len(selected["labels"]), subject_id, dtype=np.int64
+        )
+    common = {
+        "subject_id": subject_id, "session_name": train_session,
+        "subject_path": subject_path, "metadata": train_dataset.metadata,
+        "canonicalizer": canonicalizer, "preprocessor": preprocessor,
+        "backbone": backbone, "feature_batch_size": feature_batch_size,
+        "direct_trial_anchor": direct_trial_anchor,
+        "observed_channel_names": observed_channel_names,
+        "simulated_missing_channels": simulated_missing_channels,
+        "expected_completion_matrix_sha256": expected_completion_matrix_sha256,
+    }
+    train_split, _ = build_feature_split_from_session_data(loaded=selected_train, **common)
+    validation_split, _ = build_feature_split_from_session_data(loaded=selected_validation, **common)
+    return train_split, validation_split, train_dataset.metadata, split, all_trial_metadata
+
+
+def build_within_subject_final_test_split(
+    *,
+    subject_id: int,
+    subject_path: Path,
+    metadata: SequentialDatasetMetadata,
+    split: WithinSubjectTrialSplit,
+    all_trial_metadata: Mapping[str, np.ndarray],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> FeatureSplit:
+    """Load and encode the held-out session only after model selection."""
+    dataset = load_sequential_dataset(subject_path, session=split.test_session)
+    validate_metadata_compatibility(metadata, dataset.metadata, subject_id=subject_id, path=subject_path)
+    test_data = select_trial_ids(
+        sequential_dataset_trial_data(dataset),
+        all_trial_metadata["trial_ids"][split.test_indices],
+    )
+    test_split, _ = build_feature_split_from_session_data(
+        subject_id=subject_id, session_name=split.test_session, subject_path=subject_path,
+        metadata=metadata, loaded=test_data, canonicalizer=canonicalizer,
+        preprocessor=preprocessor, backbone=backbone, feature_batch_size=feature_batch_size,
+        direct_trial_anchor=direct_trial_anchor,
+        observed_channel_names=observed_channel_names,
+        simulated_missing_channels=simulated_missing_channels,
+        expected_completion_matrix_sha256=expected_completion_matrix_sha256,
+    )
+    return test_split
+
+
+def combine_feature_splits(
+    splits: Sequence[FeatureSplit],
+    *,
+    session_name: str,
+) -> FeatureSplit:
+    if not splits:
+        raise ValueError(
+            "Cannot combine an empty feature split list."
+        )
+
+    return FeatureSplit(
+        features=torch.cat(
+            [split.features for split in splits],
+            dim=0,
+        ).contiguous(),
+        labels=torch.cat(
+            [split.labels for split in splits],
+            dim=0,
+        ).contiguous(),
+        source_trial_ids=np.concatenate(
+            [
+                split.source_trial_ids
+                for split in splits
+            ],
+            axis=0,
+        ).astype(str, copy=False),
+        subject_ids=np.concatenate(
+            [
+                split.subject_ids
+                for split in splits
+            ],
+            axis=0,
+        ).astype(np.int64, copy=False),
+        session_name=session_name,
+    )
+
+
+# ---------------------------------------------------------------------
+# Optional feature cache
+# ---------------------------------------------------------------------
+
+
+def save_feature_cache(
+    *,
+    path: Path,
+    split_name: str,
+    split: FeatureSplit,
+    manifest: Mapping[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        {
+            "split_name": split_name,
+            "manifest": dict(manifest),
+            "features": split.features.contiguous(),
+            "labels": split.labels.contiguous(),
+            "source_trial_ids": split.source_trial_ids,
+            "subject_ids": split.subject_ids,
+            "session_name": split.session_name,
+        },
+        path,
+    )
+
+
+def load_feature_cache(
+    *,
+    path: Path,
+    split_name: str,
+    expected_manifest: Mapping[str, Any],
+) -> FeatureSplit:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Feature cache was not found: {path}."
+        )
+
+    payload: Any = torch.load(
+        path,
+        map_location="cpu",
+    )
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"Invalid feature cache payload: {path}."
+        )
+
+    if payload.get("split_name") != split_name:
+        raise ValueError(
+            "Feature cache split mismatch: "
+            f"cache={payload.get('split_name')!r}, "
+            f"expected={split_name!r}."
+        )
+
+    if payload.get("manifest") != dict(expected_manifest):
+        raise ValueError(
+            "Feature cache manifest mismatch. Do not reuse "
+            "features created with a different backbone, "
+            "preprocessing configuration, subjects or sessions."
+        )
+
+    required_keys = {
+        "features",
+        "labels",
+        "source_trial_ids",
+        "subject_ids",
+        "session_name",
+    }
+
+    missing = required_keys - set(payload)
+
+    if missing:
+        raise KeyError(
+            f"Feature cache is missing keys: {sorted(missing)}."
+        )
+
+    return FeatureSplit(
+        features=torch.as_tensor(
+            payload["features"],
+            dtype=torch.float32,
+        ).contiguous(),
+        labels=torch.as_tensor(
+            payload["labels"],
+            dtype=torch.int64,
+        ).contiguous(),
+        source_trial_ids=np.asarray(
+            payload["source_trial_ids"],
+            dtype=str,
+        ),
+        subject_ids=np.asarray(
+            payload["subject_ids"],
+            dtype=np.int64,
+        ),
+        session_name=str(payload["session_name"]),
+    )
+
+
+# ---------------------------------------------------------------------
+# Head training and evaluation
+# ---------------------------------------------------------------------
+
+
+def evaluate_head(
+    *,
+    classifier: CBraModClassifier,
+    split: FeatureSplit,
+    device: torch.device,
+    batch_size: int,
+    num_classes: int,
+) -> Metrics:
+    classifier.eval()
+
+    dataset = TensorDataset(
+        split.features,
+        split.labels,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    criterion = nn.CrossEntropyLoss(
+        reduction="sum"
+    )
+
+    total_loss = 0.0
+    total_count = 0
+
+    all_targets: list[np.ndarray] = []
+    all_predictions: list[np.ndarray] = []
+
+    with torch.inference_mode():
+        for features, labels in loader:
+            features = features.to(
+                device,
+                dtype=torch.float32,
+                non_blocking=(
+                    device.type == "cuda"
+                ),
+            )
+
+            labels = labels.to(
+                device,
+                dtype=torch.int64,
+                non_blocking=(
+                    device.type == "cuda"
+                ),
+            )
+
+            logits = classifier(features)
+
+            total_loss += float(
+                criterion(logits, labels).item()
+            )
+
+            total_count += int(labels.shape[0])
+
+            all_targets.append(
+                labels.detach().cpu().numpy()
+            )
+
+            all_predictions.append(
+                logits.argmax(dim=-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+    if total_count <= 0:
+        raise ValueError(
+            "Cannot evaluate an empty feature split."
+        )
+
+    targets = np.concatenate(all_targets)
+    predictions = np.concatenate(all_predictions)
+
+    return Metrics(
+        loss=total_loss / total_count,
+        accuracy=float(
+            accuracy_score(targets, predictions)
+        ),
+        balanced_accuracy=float(
+            balanced_accuracy_score(
+                targets,
+                predictions,
+            )
+        ),
+        macro_f1=float(
+            f1_score(
+                targets,
+                predictions,
+                average="macro",
+                labels=list(range(num_classes)),
+                zero_division=0,
+            )
+        ),
+        confusion_matrix=confusion_matrix(
+            targets,
+            predictions,
+            labels=list(range(num_classes)),
+        ).astype(int).tolist(),
+    )
+
+
+def train_head_epoch(
+    *,
+    classifier: CBraModClassifier,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
+    classifier.train()
+
+    criterion = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    total_count = 0
+
+    for features, labels in loader:
+        features = features.to(
+            device,
+            dtype=torch.float32,
+            non_blocking=(device.type == "cuda"),
+        )
+
+        labels = labels.to(
+            device,
+            dtype=torch.int64,
+            non_blocking=(device.type == "cuda"),
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+
+        logits = classifier(features)
+
+        loss = criterion(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        batch_size = int(labels.shape[0])
+
+        total_loss += float(loss.detach().item()) * batch_size
+        total_count += batch_size
+
+    if total_count <= 0:
+        raise ValueError(
+            "Population training split is empty."
+        )
+
+    return total_loss / total_count
+
+
+def metric_is_better(
+    *,
+    candidate: Metrics,
+    best: Metrics | None,
+    metric_name: str,
+) -> bool:
+    if best is None:
+        return True
+
+    candidate_value = float(
+        getattr(candidate, metric_name)
+    )
+
+    best_value = float(
+        getattr(best, metric_name)
+    )
+
+    if metric_name == "loss":
+        return candidate_value < best_value - 1e-12
+
+    return candidate_value > best_value + 1e-12
+
+
+def write_confusion_matrix_csv(
+    *,
+    path: Path,
+    matrix: Sequence[Sequence[int]],
+    class_names: Sequence[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(
+            ["true_label", *class_names]
+        )
+
+        for class_name, row in zip(
+            class_names,
+            matrix,
+            strict=True,
+        ):
+            writer.writerow(
+                [class_name, *row]
+            )
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train one LOSO CBRaMod frozen-backbone "
+            "population classification head."
+        )
+    )
+
+    parser.add_argument(
+        "--data-root",
+        default="data/processed/bnci2014_001",
+    )
+
+    parser.add_argument(
+        "--data-pattern",
+        default="subject_{subject:02d}.h5",
+        help=(
+            "Subject HDF5 filename pattern. "
+            "Example: subject_{subject:02d}.h5"
+        ),
+    )
+
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        type=int,
+        default=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+    )
+
+    parser.add_argument(
+        "--target-subject",
+        type=int,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--split-mode",
+        choices=("loso", "within-subject"),
+        default="loso",
+        help="Use the population LOSO plan or a source-trial within-subject split.",
+    )
+
+    parser.add_argument(
+        "--train-session",
+        default="0train",
+    )
+
+    parser.add_argument(
+        "--validation-session",
+        default="1test",
+    )
+
+    parser.add_argument(
+        "--final-test-session",
+        default="1test",
+    )
+
+    parser.add_argument(
+        "--test-session",
+        default=None,
+        help="Held-out final-test session for --split-mode within-subject.",
+    )
+
+    parser.add_argument(
+        "--validation-ratio",
+        type=float,
+        default=0.2,
+        help="Source-trial validation fraction for --split-mode within-subject.",
+    )
+
+    parser.add_argument(
+        "--class-names",
+        nargs="+",
+        default=None,
+        help="Optional class names in label order, overriding dataset metadata.",
+    )
+
+    parser.add_argument(
+        "--checkpoint",
+        default=(
+            "checkpoints/backbones/cbramod/"
+            "pretrained_weights.pth"
+        ),
+    )
+
+    parser.add_argument(
+        "--output-head",
+        default=None,
+        help=(
+            "Default: checkpoints/heads/stage1/"
+            "bnci2014_001/subject_XX/cbramod/"
+            "4s_flatten/head.pt"
+        ),
+    )
+
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "Default: runs/stage1/bnci2014_001/"
+            "subject_XX/cbramod/4s_flatten"
+        ),
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cpu",
+    )
+
+    parser.add_argument(
+        "--feature-batch-size",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--head-batch-size",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+    )
+
+    parser.add_argument(
+        "--head-lr",
+        type=float,
+        default=1e-3,
+    )
+
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-3,
+    )
+
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=15,
+    )
+
+    parser.add_argument(
+        "--metric-for-best",
+        choices=[
+            "balanced_accuracy",
+            "macro_f1",
+            "accuracy",
+            "loss",
+        ],
+        default="balanced_accuracy",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    parser.add_argument(
+        "--target-sample-rate",
+        type=float,
+        default=200.0,
+    )
+
+    parser.add_argument(
+        "--window-seconds",
+        "--window-sec",
+        dest="window_seconds",
+        type=float,
+        default=4.0,
+    )
+
+    parser.add_argument(
+        "--deployment-profile",
+        choices=(
+            CBRAMOD_STRICT22_PROFILE,
+            CBRAMOD_NEURACLE_LIVE19_SPLINE22_PROFILE,
+        ),
+        default=CBRAMOD_STRICT22_PROFILE,
+        help=(
+            "strict22 preserves the native 22-channel baseline; "
+            "neuracle_live19_spline22 explicitly removes CPz/P1/P2 "
+            "before the shared runtime preprocessor completes them."
+        ),
+    )
+
+    parser.add_argument(
+        "--direct-trial-anchor",
+        choices=["start", "center", "end"],
+        default="end",
+        help=(
+            "When source trials are longer than "
+            "--window-seconds, choose one contiguous "
+            "direct-trial segment. Default: end."
+        ),
+    )
+
+    parser.add_argument(
+        "--input-unit",
+        default="uV",
+    )
+
+    parser.add_argument(
+        "--filter-enabled",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--filter-low-hz",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--filter-high-hz",
+        type=float,
+        default=75.0,
+    )
+
+    parser.add_argument(
+        "--filter-order",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--reference-mode",
+        choices=["none", "average"],
+        default="none",
+    )
+
+    parser.add_argument(
+        "--normalization",
+        choices=["none", "per_window_zscore", "fixed_100uv"],
+        default="none",
+    )
+    # Accepted only for backward-compatible invocation parsing. Named
+    # deployment profiles remain the sole authority used to build CBraModConfig.
+    parser.add_argument("--missing-channel-policy", choices=["error", "spherical_spline"], default=None)
+    parser.add_argument("--min-observed-channels", type=int, default=None)
+    parser.add_argument("--spline-alpha", type=float, default=None)
+    parser.add_argument(
+        "--head-type",
+        choices=["official_mlp", "linear"],
+        default="official_mlp",
+    )
+
+    parser.add_argument(
+        "--head-hidden-dim-1",
+        type=int,
+        default=800,
+    )
+
+    parser.add_argument(
+        "--head-hidden-dim-2",
+        type=int,
+        default=200,
+    )
+
+    parser.add_argument(
+        "--head-dropout",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--feature-cache-dir",
+        default=None,
+        help=(
+            "Optional frozen feature cache directory. "
+            "Feature cache is never reused unless "
+            "--reuse-feature-cache is set."
+        ),
+    )
+
+    parser.add_argument(
+        "--reuse-feature-cache",
+        action="store_true",
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+
+def main() -> None:
+    args = build_argument_parser().parse_args()
+
+    deployment_profile = resolve_cbramod_deployment_profile(
+        args.deployment_profile
+    )
+
+    time_segments = resolve_cbramod_time_segments(
+        window_seconds=args.window_seconds,
+        target_sample_rate=args.target_sample_rate,
+        points_per_patch=200,
+    )
+
+    window_tag = (
+        f"{args.window_seconds:g}s_flatten"
+    )
+
+    set_seed(args.seed)
+
+    target_subject = int(args.target_subject)
+    if args.split_mode == "loso":
+        subjects = normalize_subjects(args.subjects)
+        if target_subject not in subjects:
+            raise ValueError(
+                "--target-subject must be included in --subjects. "
+                f"Got target={target_subject}, subjects={subjects}."
+            )
+        split_plan = resolve_population_split_plan(
+            subjects, target_subject, args.train_session,
+            args.validation_session, args.final_test_session,
+        )
+        population_subjects = list(split_plan.train_subjects)
+    else:
+        if target_subject <= 0:
+            raise ValueError("--target-subject must be positive.")
+        if args.test_session is None:
+            raise ValueError("--test-session is required for --split-mode within-subject.")
+        if not 0.0 < args.validation_ratio < 1.0:
+            raise ValueError("--validation-ratio must be in (0,1).")
+        subjects = [target_subject]
+        population_subjects = []
+
+    data_root = resolve_repo_path(args.data_root)
+    checkpoint_path = resolve_repo_path(args.checkpoint)
+
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "CBraMod backbone checkpoint was not found: "
+            f"{checkpoint_path}"
+        )
+
+    profile_output_name = (
+        "cbramod"
+        if deployment_profile.name == CBRAMOD_STRICT22_PROFILE
+        else "cbramod_live19_spline22"
+    )
+
+    class_names: tuple[str, ...] | None = None
+    reference_metadata: SequentialDatasetMetadata | None = None
+    subject_paths: dict[int, Path] = {}
+
+    for subject_id in subjects:
+        subject_path = resolve_subject_file(
+            data_root=data_root,
+            data_pattern=args.data_pattern,
+            subject_id=subject_id,
+        )
+
+        subject_paths[subject_id] = subject_path
+
+        metadata = load_sequential_dataset(
+            subject_path, session=args.train_session
+        ).metadata
+
+        if reference_metadata is None:
+            reference_metadata = metadata
+        else:
+            validate_metadata_compatibility(
+                reference_metadata,
+                metadata,
+                subject_id=subject_id,
+                path=subject_path,
+            )
+
+        if class_names is None:
+            class_names = resolve_class_names(
+                metadata=metadata, explicit_class_names=args.class_names,
+            )
+
+    if reference_metadata is None or class_names is None:
+        raise RuntimeError(
+            "Could not resolve dataset metadata."
+        )
+
+    label_mapping = {
+        str(index): str(name) for index, name in enumerate(class_names)
+    }
+
+    default_head_path, default_run_dir = resolve_default_artifact_paths(
+        metadata=reference_metadata,
+        target_subject=target_subject,
+        window_tag=window_tag,
+        model_path_component=profile_output_name,
+        split_mode=args.split_mode,
+    )
+    run_dir = (
+        resolve_repo_path(args.run_dir)
+        if args.run_dir is not None
+        else default_run_dir
+    )
+    output_head_path = (
+        resolve_repo_path(args.output_head)
+        if args.output_head is not None
+        else default_head_path
+    )
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+    config = CBraModConfig(
+        checkpoint_path=checkpoint_path,
+        classifier_path=output_head_path,
+        device=args.device,
+
+        target_sample_rate=args.target_sample_rate,
+        window_seconds=args.window_seconds,
+        n_channels=22,
+        time_segments=time_segments,
+        points_per_patch=200,
+        input_unit=args.input_unit,
+
+        strict_window_duration=True,
+        filter_enabled=bool(args.filter_enabled),
+        filter_low_hz=args.filter_low_hz,
+        filter_high_hz=args.filter_high_hz,
+        filter_order=args.filter_order,
+        reference_mode=args.reference_mode,
+        normalization=args.normalization,
+        missing_channel_policy=(
+            deployment_profile.missing_channel_policy
+        ),
+        min_observed_channels=(
+            deployment_profile.min_observed_channels
+        ),
+        spline_alpha=deployment_profile.spline_alpha,
+
+        num_classes=len(class_names),
+        head_type=args.head_type,
+        head_hidden_dim_1=args.head_hidden_dim_1,
+        head_hidden_dim_2=args.head_hidden_dim_2,
+        head_dropout=args.head_dropout,
+    )
+
+    canonicalizer = SignalCanonicalizer(
+        target_unit=config.input_unit
+    )
+    preprocessor = CBraModPipelinePreprocessor(config)
+    completion_matrix_sha256 = (
+        preprocessor.completion_matrix_sha256_for(
+            deployment_profile.observed_channel_names
+        )
+    )
+
+    backbone_sha256 = sha256_file(checkpoint_path)
+
+    preprocessing_manifest = build_preprocessing_manifest(
+        config=config,
+        source_unit=str(reference_metadata.unit),
+        direct_trial_anchor=args.direct_trial_anchor,
+        deployment_profile=deployment_profile,
+        completion_matrix_sha256=completion_matrix_sha256,
+    )
+
+    preprocessing_hash = stable_json_hash(
+        preprocessing_manifest
+    )
+
+    run_config = {
+        "model_name": "cbramod-frozen-head",
+        "dataset": str(reference_metadata.dataset_name),
+        "split_mode": args.split_mode,
+        "target_subject": target_subject,
+        "population_subjects": population_subjects,
+        "train_session": args.train_session,
+        "validation_session": args.validation_session,
+        "final_test_session": (
+            args.final_test_session if args.split_mode == "loso" else args.test_session
+        ),
+        "validation_ratio": (
+            float(args.validation_ratio) if args.split_mode == "within-subject" else None
+        ),
+        "class_names": list(class_names),
+        "backbone_checkpoint": str(checkpoint_path),
+        "backbone_sha256": backbone_sha256,
+        "output_head": str(output_head_path),
+        "preprocessing": preprocessing_manifest,
+        "preprocessing_hash": preprocessing_hash,
+        "head_type": args.head_type,
+        "feature_batch_size": args.feature_batch_size,
+        "head_batch_size": args.head_batch_size,
+        "epochs": args.epochs,
+        "head_lr": args.head_lr,
+        "weight_decay": args.weight_decay,
+        "patience": args.patience,
+        "metric_for_best": args.metric_for_best,
+        "seed": args.seed,
+        "git_commit": current_git_commit(),
+        "created_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    dump_yaml(
+        run_config,
+        run_dir / "config.yaml",
+    )
+
+    atomic_write_json(
+        run_dir / "preprocessing.json",
+        preprocessing_manifest,
+    )
+
+    print("target subject:", target_subject)
+    print("population subjects:", population_subjects)
+    print("backbone:", checkpoint_path)
+    print("device:", args.device)
+    print("head type:", args.head_type)
+    print("preprocessing hash:", preprocessing_hash)
+
+    backbone = CBraModBackbone(config)
+
+    # 明确断言群体基线中 backbone 完全冻结。
+    frozen_parameters = [
+        name
+        for name, parameter in backbone.named_parameters()
+        if parameter.requires_grad
+    ]
+
+    if frozen_parameters:
+        raise RuntimeError(
+            "CBraMod backbone must be frozen, but these "
+            "parameters are trainable: "
+            f"{frozen_parameters[:10]}."
+        )
+
+    feature_cache_dir = (
+        resolve_repo_path(args.feature_cache_dir)
+        if args.feature_cache_dir is not None
+        else None
+    )
+
+    def build_or_load_split(
+        *,
+        split_name: str,
+        split_subjects: Sequence[int],
+        session_name: str,
+    ) -> FeatureSplit:
+        cache_manifest = {
+            "cache_format_version": 1,
+            "split_name": split_name,
+            "subjects": list(split_subjects),
+            "session_name": session_name,
+            "backbone_sha256": backbone_sha256,
+            "preprocessing_hash": preprocessing_hash,
+            "class_names": list(class_names),
+        }
+
+        cache_path = (
+            feature_cache_dir
+            / (
+                f"{split_name}_"
+                f"{window_tag}_"
+                f"target_{target_subject:02d}_"
+                f"seed_{args.seed}.pt"
+            )
+            if feature_cache_dir is not None
+            else None
+        )
+
+        if (
+            args.reuse_feature_cache
+            and cache_path is not None
+            and cache_path.is_file()
+        ):
+            print(
+                f"loading feature cache: {cache_path}"
+            )
+
+            return load_feature_cache(
+                path=cache_path,
+                split_name=split_name,
+                expected_manifest=cache_manifest,
+            )
+
+        subject_splits: list[FeatureSplit] = []
+
+        for subject_id in split_subjects:
+            print(
+                f"extracting {split_name}: "
+                f"subject_{subject_id:02d}/"
+                f"{session_name}"
+            )
+
+            split, loaded_metadata = (
+                build_subject_feature_split(
+                    subject_id=subject_id,
+                    session_name=session_name,
+                    subject_path=subject_paths[
+                        subject_id
+                    ],
+                    reference_metadata=reference_metadata,
+                    canonicalizer=canonicalizer,
+                    preprocessor=preprocessor,
+                    backbone=backbone,
+                    feature_batch_size=(
+                        args.feature_batch_size
+                    ),
+                    direct_trial_anchor=(
+                        args.direct_trial_anchor
+                    ),
+                    observed_channel_names=(
+                        deployment_profile.observed_channel_names
+                    ),
+                    simulated_missing_channels=(
+                        deployment_profile.simulated_missing_channels
+                    ),
+                    expected_completion_matrix_sha256=(
+                        completion_matrix_sha256
+                    ),
+                )
+            )
+
+            validate_metadata_compatibility(
+                reference_metadata,
+                loaded_metadata,
+                subject_id=subject_id,
+                path=subject_paths[subject_id],
+            )
+
+            subject_splits.append(split)
+
+        combined = combine_feature_splits(
+            subject_splits,
+            session_name=session_name,
+        )
+
+        if cache_path is not None:
+            save_feature_cache(
+                path=cache_path,
+                split_name=split_name,
+                split=combined,
+                manifest=cache_manifest,
+            )
+
+            print(
+                f"saved feature cache: {cache_path}"
+            )
+
+        return combined
+
+    within_subject_split: WithinSubjectTrialSplit | None = None
+    within_subject_all_trials: dict[str, np.ndarray] | None = None
+    if args.split_mode == "loso":
+        population_train = build_or_load_split(
+            split_name="population_train", split_subjects=population_subjects,
+            session_name=args.train_session,
+        )
+        population_validation = build_or_load_split(
+            split_name="population_validation", split_subjects=population_subjects,
+            session_name=args.validation_session,
+        )
+        final_test: FeatureSplit | None = build_or_load_split(
+            split_name="target_final_test", split_subjects=[target_subject],
+            session_name=args.final_test_session,
+        )
+        final_test_session = args.final_test_session
+    else:
+        (
+            population_train, population_validation, within_metadata,
+            within_subject_split, within_subject_all_trials,
+        ) = build_within_subject_train_validation_splits(
+            subject_id=target_subject, subject_path=subject_paths[target_subject],
+            train_session=args.train_session, test_session=str(args.test_session),
+            validation_ratio=args.validation_ratio, seed=args.seed, class_names=class_names,
+            canonicalizer=canonicalizer, preprocessor=preprocessor, backbone=backbone,
+            feature_batch_size=args.feature_batch_size,
+            direct_trial_anchor=args.direct_trial_anchor,
+            observed_channel_names=deployment_profile.observed_channel_names,
+            simulated_missing_channels=deployment_profile.simulated_missing_channels,
+            expected_completion_matrix_sha256=completion_matrix_sha256,
+        )
+        validate_metadata_compatibility(
+            reference_metadata, within_metadata, subject_id=target_subject,
+            path=subject_paths[target_subject],
+        )
+        final_test = None
+        final_test_session = within_subject_split.test_session
+
+    validate_no_trial_leakage(
+        population_train,
+        population_validation,
+        left_name="population_train",
+        right_name="population_validation",
+    )
+
+    if final_test is not None:
+        validate_no_trial_leakage(
+            population_train, final_test,
+            left_name="population_train", right_name="target_final_test",
+        )
+        validate_no_trial_leakage(
+            population_validation, final_test,
+            left_name="population_validation", right_name="target_final_test",
+        )
+
+    classifier = build_cbramod_classifier(config).to(
+        backbone.device
+    )
+
+    optimizer = torch.optim.AdamW(
+        classifier.parameters(),
+        lr=args.head_lr,
+        weight_decay=args.weight_decay,
+    )
+
+    train_dataset = TensorDataset(
+        population_train.features,
+        population_train.labels,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.head_batch_size,
+        shuffle=True,
+        num_workers=0,
+        generator=torch.Generator().manual_seed(
+            args.seed
+        ),
+    )
+
+    best_state: dict[str, torch.Tensor] | None = None
+    best_validation_metrics: Metrics | None = None
+    best_epoch: int | None = None
+    stale_epochs = 0
+
+    training_history: list[dict[str, Any]] = []
+
+    training_started = time.perf_counter()
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_head_epoch(
+            classifier=classifier,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=backbone.device,
+        )
+
+        validation_metrics = evaluate_head(
+            classifier=classifier,
+            split=population_validation,
+            device=backbone.device,
+            batch_size=args.head_batch_size,
+            num_classes=config.num_classes,
+        )
+
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "population_validation": (
+                validation_metrics.to_dict()
+            ),
+        }
+
+        training_history.append(epoch_record)
+
+        current_metric = getattr(
+            validation_metrics,
+            args.metric_for_best,
+        )
+
+        print(
+            f"epoch={epoch:03d} "
+            f"train_loss={train_loss:.6f} "
+            f"val_bacc="
+            f"{validation_metrics.balanced_accuracy:.4f} "
+            f"val_macro_f1="
+            f"{validation_metrics.macro_f1:.4f} "
+            f"selected_{args.metric_for_best}="
+            f"{current_metric:.6f}"
+        )
+
+        if metric_is_better(
+            candidate=validation_metrics,
+            best=best_validation_metrics,
+            metric_name=args.metric_for_best,
+        ):
+            best_state = deepcopy(
+                classifier.state_dict()
+            )
+
+            best_validation_metrics = validation_metrics
+            best_epoch = epoch
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+
+            if stale_epochs >= args.patience:
+                print(
+                    "early stopping: no validation improvement "
+                    f"for {args.patience} epochs."
+                )
+                break
+
+    training_seconds = (
+        time.perf_counter() - training_started
+    )
+
+    if best_state is None or best_epoch is None:
+        raise RuntimeError(
+            "No best classifier checkpoint was selected."
+        )
+
+    classifier.load_state_dict(best_state)
+    classifier.eval()
+
+    if final_test is None:
+        assert within_subject_split is not None
+        assert within_subject_all_trials is not None
+        final_test = build_within_subject_final_test_split(
+            subject_id=target_subject, subject_path=subject_paths[target_subject],
+            metadata=reference_metadata, split=within_subject_split,
+            all_trial_metadata=within_subject_all_trials,
+            canonicalizer=canonicalizer, preprocessor=preprocessor, backbone=backbone,
+            feature_batch_size=args.feature_batch_size,
+            direct_trial_anchor=args.direct_trial_anchor,
+            observed_channel_names=deployment_profile.observed_channel_names,
+            simulated_missing_channels=deployment_profile.simulated_missing_channels,
+            expected_completion_matrix_sha256=completion_matrix_sha256,
+        )
+        validate_no_trial_leakage(
+            population_train, final_test,
+            left_name="population_train", right_name="target_final_test",
+        )
+        validate_no_trial_leakage(
+            population_validation, final_test,
+            left_name="population_validation", right_name="target_final_test",
+        )
+
+    final_test_metrics = evaluate_head(
+        classifier=classifier,
+        split=final_test,
+        device=backbone.device,
+        batch_size=args.head_batch_size,
+        num_classes=config.num_classes,
+    )
+
+    classifier_state_dict_sha256 = state_dict_sha256(
+        classifier.state_dict()
+    )
+
+    if within_subject_split is None:
+        within_subject_metadata: dict[str, Any] | None = None
+    else:
+        assert within_subject_all_trials is not None
+        within_subject_metadata = {
+            "subject": target_subject,
+            "train_session": within_subject_split.train_session,
+            "test_session": within_subject_split.test_session,
+            "validation_ratio": float(args.validation_ratio),
+            "split_seed": int(args.seed),
+            "available_sessions": list(within_subject_split.available_sessions),
+            "train_indices": within_subject_split.train_indices.tolist(),
+            "validation_indices": within_subject_split.validation_indices.tolist(),
+            "test_indices": within_subject_split.test_indices.tolist(),
+            "train_trial_ids": within_subject_all_trials["trial_ids"][within_subject_split.train_indices].tolist(),
+            "validation_trial_ids": within_subject_all_trials["trial_ids"][within_subject_split.validation_indices].tolist(),
+            "test_trial_ids": within_subject_all_trials["trial_ids"][within_subject_split.test_indices].tolist(),
+            "train_class_counts": class_counts(within_subject_all_trials["labels"][within_subject_split.train_indices], class_names),
+            "validation_class_counts": class_counts(within_subject_all_trials["labels"][within_subject_split.validation_indices], class_names),
+            "test_class_counts": class_counts(within_subject_all_trials["labels"][within_subject_split.test_indices], class_names),
+        }
+    run_config["within_subject_split"] = within_subject_metadata
+    dump_yaml(run_config, run_dir / "config.yaml")
+
+    saved_head_path = save_cbramod_classifier_checkpoint(
+        classifier,
+        output_head_path,
+        config=config,
+        class_names=class_names,
+        extra_metadata={
+            "dataset": str(reference_metadata.dataset_name),
+            "split_mode": args.split_mode,
+            "artifact_metadata": {
+                "trained_head": True,
+                "head_type": "population",
+                "is_test_head": False,
+            },
+            "target_subject": target_subject,
+            "population_training_subjects": (
+                population_subjects
+            ),
+            "population_training_session": (
+                args.train_session
+            ),
+            "population_validation_subjects": (
+                population_subjects
+            ),
+            "population_validation_session": (
+                args.validation_session
+            ),
+            "final_test_subject": target_subject,
+            "final_test_session": final_test_session,
+            "label_mapping": label_mapping,
+            "within_subject_split": within_subject_metadata,
+            "best_epoch": best_epoch,
+            "best_metric_name": (
+                args.metric_for_best
+            ),
+            "best_validation_metric": float(
+                getattr(
+                    best_validation_metrics,
+                    args.metric_for_best,
+                )
+            ),
+            "backbone_checkpoint": str(
+                checkpoint_path
+            ),
+            "backbone_sha256": backbone_sha256,
+            "preprocessing_hash": preprocessing_hash,
+            "deployment_profile": deployment_profile.name,
+            "training_channel_source_count": (
+                deployment_profile.training_channel_source_count
+            ),
+            "observed_channel_count": len(
+                deployment_profile.observed_channel_names
+            ),
+            "observed_channel_names": list(
+                deployment_profile.observed_channel_names
+            ),
+            "simulated_missing_channels": list(
+                deployment_profile.simulated_missing_channels
+            ),
+            "missing_channel_policy": (
+                deployment_profile.missing_channel_policy
+            ),
+            "min_observed_channels": (
+                deployment_profile.min_observed_channels
+            ),
+            "spline_alpha": deployment_profile.spline_alpha,
+            "channel_completion_source": (
+                deployment_profile.channel_completion_source
+            ),
+            "completion_matrix_sha256": (
+                completion_matrix_sha256
+            ),
+            "classifier_state_dict_sha256": (
+                classifier_state_dict_sha256
+            ),
+            "seed": args.seed,
+        },
+    )
+    classifier_sha256 = sha256_file(saved_head_path)
+
+    write_confusion_matrix_csv(
+        path=run_dir / "final_confusion_matrix.csv",
+        matrix=final_test_metrics.confusion_matrix,
+        class_names=class_names,
+    )
+
+    report = {
+        "model_name": "cbramod-frozen-head",
+        "dataset": str(reference_metadata.dataset_name),
+        "protocol": (
+            "LOSO population head" if args.split_mode == "loso"
+            else "within-subject cross-session head"
+        ),
+        "split_mode": args.split_mode,
+        "target_subject": target_subject,
+        "population_training_subjects": population_subjects,
+        "population_training_session": (
+            args.train_session
+        ),
+        "population_validation_subjects": (
+            population_subjects
+        ),
+        "population_validation_session": (
+            args.validation_session
+        ),
+        "final_test_subject": target_subject,
+        "final_test_session": final_test_session,
+        "class_names": list(class_names),
+        "label_mapping": label_mapping,
+        "num_classes": int(config.num_classes),
+        "within_subject": within_subject_metadata,
+        "seed": args.seed,
+        "backbone_checkpoint": str(checkpoint_path),
+        "backbone_sha256": backbone_sha256,
+        "classifier_checkpoint": str(saved_head_path),
+        "classifier_sha256": classifier_sha256,
+        "classifier_state_dict_sha256": (
+            classifier_state_dict_sha256
+        ),
+        "artifact_metadata": {
+            "trained_head": True,
+            "head_type": "population",
+            "is_test_head": False,
+        },
+        "deployment_profile": deployment_profile.name,
+        "training_channel_source_count": (
+            deployment_profile.training_channel_source_count
+        ),
+        "observed_channel_count": len(
+            deployment_profile.observed_channel_names
+        ),
+        "observed_channel_names": list(
+            deployment_profile.observed_channel_names
+        ),
+        "simulated_missing_channels": list(
+            deployment_profile.simulated_missing_channels
+        ),
+        "missing_channel_policy": (
+            deployment_profile.missing_channel_policy
+        ),
+        "min_observed_channels": (
+            deployment_profile.min_observed_channels
+        ),
+        "spline_alpha": deployment_profile.spline_alpha,
+        "channel_completion_source": (
+            deployment_profile.channel_completion_source
+        ),
+        "completion_matrix_sha256": completion_matrix_sha256,
+        "preprocessing": preprocessing_manifest,
+        "preprocessing_hash": preprocessing_hash,
+        "best_epoch": best_epoch,
+        "training_seconds": training_seconds,
+        "population_train": {
+            "num_samples": int(
+                population_train.features.shape[0]
+            ),
+            "per_class": class_counts(
+                population_train.labels.numpy(),
+                class_names,
+            ),
+            "subjects": sorted(
+                set(
+                    population_train.subject_ids.tolist()
+                )
+            ),
+        },
+        "population_validation": {
+            "num_samples": int(
+                population_validation.features.shape[0]
+            ),
+            "per_class": class_counts(
+                population_validation.labels.numpy(),
+                class_names,
+            ),
+            "subjects": sorted(
+                set(
+                    population_validation.subject_ids.tolist()
+                )
+            ),
+            "best_metrics": (
+                best_validation_metrics.to_dict()
+            ),
+        },
+        "target_final_test": {
+            "num_samples": int(
+                final_test.features.shape[0]
+            ),
+            "per_class": class_counts(
+                final_test.labels.numpy(),
+                class_names,
+            ),
+            "subjects": sorted(
+                set(final_test.subject_ids.tolist()
+                )
+            ),
+            "metrics": final_test_metrics.to_dict(),
+        },
+        "training_history": training_history,
+        "git_commit": current_git_commit(),
+        "finished_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    atomic_write_json(
+        run_dir / "training_report.json",
+        report,
+    )
+
+    atomic_write_json(
+        run_dir / "final_metrics.json",
+        {
+            "model_name": "cbramod-frozen-head",
+            "target_subject": target_subject,
+            "seed": args.seed,
+            "best_epoch": best_epoch,
+            "population_validation": (
+                best_validation_metrics.to_dict()
+            ),
+            "target_final_test": (
+                final_test_metrics.to_dict()
+            ),
+            "classifier_checkpoint": str(
+                saved_head_path
+            ),
+            "backbone_sha256": backbone_sha256,
+            "preprocessing_hash": preprocessing_hash,
+        },
+    )
+
+    print()
+    print("Training complete.")
+    print("best epoch:", best_epoch)
+    print(
+        "best validation bACC:",
+        f"{best_validation_metrics.balanced_accuracy:.4f}",
+    )
+    print(
+        "final target-test bACC:",
+        f"{final_test_metrics.balanced_accuracy:.4f}",
+    )
+    print(
+        "final target-test macro-F1:",
+        f"{final_test_metrics.macro_f1:.4f}",
+    )
+    print("saved head:", saved_head_path)
+    print("run report:", run_dir / "training_report.json")
+
+
+if __name__ == "__main__":
+    main()

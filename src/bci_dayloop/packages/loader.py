@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -24,6 +23,12 @@ from bci_dayloop.preprocessing.model_50m import (
 )
 from bci_dayloop.runtime.model import RuntimeModel
 from bci_dayloop.utils.config import load_yaml
+from bci_dayloop.packages.common import (
+    required_mapping as _required_mapping,
+    resolve_package_file as _resolve_package_file,
+    sha256_file as _sha256_file,
+    verify_sha256 as _verify_sha256,
+)
 
 import torch
 from torch import nn
@@ -76,89 +81,6 @@ class LoadedRuntimePackage:
             self.runtime_model
             .input_contract
             .sample_rate
-        )
-
-
-def _required_mapping(
-    payload: dict[str, Any],
-    key: str,
-    *,
-    source: Path,
-) -> dict[str, Any]:
-    value = payload.get(key)
-
-    if not isinstance(value, dict):
-        raise ValueError(
-            f"{source} field {key!r} "
-            "must be a mapping."
-        )
-
-    return dict(value)
-
-
-def _resolve_package_file(
-    package_path: Path,
-    value: str,
-    *,
-    logical_name: str,
-) -> Path:
-    relative_path = Path(value)
-
-    if relative_path.is_absolute():
-        raise ValueError(
-            f"{logical_name} must use a package-relative "
-            f"path, got {value!r}."
-        )
-
-    resolved = (
-        package_path / relative_path
-    ).resolve()
-
-    # 防止 "../../outside.pt" 逃出 Package。
-    try:
-        resolved.relative_to(package_path)
-    except ValueError as error:
-        raise ValueError(
-            f"{logical_name} escapes package directory: "
-            f"{value!r}."
-        ) from error
-
-    if not resolved.is_file():
-        raise FileNotFoundError(
-            f"{logical_name} was not found: {resolved}"
-        )
-
-    return resolved
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-
-    with path.open("rb") as handle:
-        for block in iter(
-            lambda: handle.read(1024 * 1024),
-            b"",
-        ):
-            digest.update(block)
-
-    return digest.hexdigest()
-
-
-def _verify_sha256(
-    *,
-    path: Path,
-    expected: str | None,
-    logical_name: str,
-) -> None:
-    if not expected:
-        return
-
-    actual = _sha256_file(path)
-
-    if actual.lower() != str(expected).lower():
-        raise ValueError(
-            f"{logical_name} SHA256 mismatch: "
-            f"expected={expected}, actual={actual}."
         )
 
 

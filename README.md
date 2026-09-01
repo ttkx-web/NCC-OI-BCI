@@ -26,6 +26,10 @@ BNCI2014_001 四分类运动想象：
 - **CBraMod**：已完成统一 Runtime 与 NeuroOnline token 接口接入的公开基线；
 - BIOT / REVE：按后续实验需要再扩展。
 
+### 三状态推理
+
+workload、attention、emotion 使用一个共享 50M Backbone 和三个固定分类头。导出配置位于 `configs/three_mental_states/export.yaml`，显式 CLI 参数优先于 YAML。导出、服务、离线 trial 与等价性验证的入口分别是 `export_50m_multi_head_model_package.py`、`serve_inference.py`、`run_multi_head_trials.py` 和 `verify_three_state_inference.py`；完整调用契约见 [推理服务文档](docs/inference_service.md)。
+
 ---
 
 ## 2. 阶段进度
@@ -529,6 +533,15 @@ python scripts/train_50m_population_head.py \
 ```
 
 `--save-feature-cache` 仅在需要将 frozen feature 写盘时开启；默认可只在内存中训练分类头。
+
+训练 CLI 保持在 `scripts/train_50m_population_head.py`，它是薄入口；
+`runner.py` 提供公开入口与兼容 facade，`workflows.py` 负责高层训练编排，
+`data/features/adaptation/engine/evaluation/artifacts` 分别承担具体职责。
+该入口默认冻结 Backbone，也支持既有的 `--backbone-adaptation partial/lora`，
+且三种模式共享同一 split、评估与 artifact 契约。LoRA 模式会注入 adapter，
+仅训练 adapter 与分类头，不使用 frozen feature cache。旧的 Stage-0.5 脚本已删除；其正式模块入口是
+`PYTHONPATH=src python -m bci_dayloop.training.model_50m.linear_head`，并继续
+作为 population 与 personal 路径复用的 frozen linear-head 实现。
 
 ---
 

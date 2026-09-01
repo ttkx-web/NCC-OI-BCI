@@ -601,6 +601,10 @@ class Model50MAdapter(BaseModelAdapter):
             "name": self.model_name,
             "num_classes": int(self.config.num_classes),
             "aggregation": self.config.aggregation,
+            "head_type": self.config.head_type,
+            "head_hidden_dim": int(self.config.head_hidden_dim),
+            "head_dropout": float(self.config.head_dropout),
+            "head_norm": self.config.head_norm,
             "output_layer_idx": int(self.config.output_layer_idx),
             "window_seconds": float(self.config.window_seconds),
             "target_sample_rate": float(self.config.target_sample_rate),
@@ -659,6 +663,10 @@ class Model50MAdapter(BaseModelAdapter):
         for key, actual, expected in (
             ("num_classes", model.get("num_classes"), self.config.num_classes),
             ("aggregation", model.get("aggregation"), self.config.aggregation),
+            ("head_type", model.get("head_type", "linear"), self.config.head_type),
+            ("head_hidden_dim", model.get("head_hidden_dim", 512), self.config.head_hidden_dim),
+            ("head_dropout", model.get("head_dropout", 0.0), self.config.head_dropout),
+            ("head_norm", model.get("head_norm", "none"), self.config.head_norm),
             ("output_layer_idx", model.get("output_layer_idx"), self.config.output_layer_idx),
         ):
             if actual != expected:
@@ -722,6 +730,10 @@ class Model50MAdapter(BaseModelAdapter):
             dropout=float(model["dropout"]),
             output_layer_idx=int(model["output_layer_idx"]),
             aggregation=model["aggregation"],
+            head_type=model.get("head_type", "linear"),
+            head_hidden_dim=int(model.get("head_hidden_dim", 512)),
+            head_dropout=float(model.get("head_dropout", 0.0)),
+            head_norm=model.get("head_norm", "none"),
             num_classes=int(model["num_classes"]),
             model_n_time_patches=int(
                 model.get("model_n_time_patches", 10)

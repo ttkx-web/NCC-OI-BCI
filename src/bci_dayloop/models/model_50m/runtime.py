@@ -9,6 +9,7 @@ import numpy as np
 from bci_dayloop.models.base import add_batch_dimension
 
 from .adapter import Model50MAdapter
+from .classifier import read_classifier_head_config
 from .config import Model50MConfig
 from .pipeline_preprocessor import Model50MPipelinePreprocessor
 
@@ -226,6 +227,12 @@ def build_50m_runtime(
     output_layer_idx: int = 8,
     aggregation: str = "flatten",
 
+    # None means infer from the self-described classifier checkpoint.
+    head_type: str | None = None,
+    head_hidden_dim: int | None = None,
+    head_dropout: float | None = None,
+    head_norm: str | None = None,
+
     strict_window_duration: bool = True,
     strict_head_metadata: bool = True,
     model_n_time_patches: int = 10,
@@ -283,6 +290,8 @@ def build_50m_runtime(
             f"sample_rate must be positive, got {sample_rate}."
         )
 
+    saved_head_config = read_classifier_head_config(classifier_path)
+
     config = Model50MConfig(
         checkpoint_path=checkpoint_path,
         classifier_path=classifier_path,
@@ -304,6 +313,26 @@ def build_50m_runtime(
         aggregation=aggregation,
         num_classes=len(normalized_class_names),
         model_n_time_patches=model_n_time_patches,
+        head_type=(
+            saved_head_config["head_type"]
+            if head_type is None
+            else head_type
+        ),
+        head_hidden_dim=(
+            saved_head_config["head_hidden_dim"]
+            if head_hidden_dim is None
+            else head_hidden_dim
+        ),
+        head_dropout=(
+            saved_head_config["head_dropout"]
+            if head_dropout is None
+            else head_dropout
+        ),
+        head_norm=(
+            saved_head_config["head_norm"]
+            if head_norm is None
+            else head_norm
+        ),
     )
 
     adapter = Model50MAdapter(
@@ -347,6 +376,10 @@ def build_50m_runtime_from_metadata(
 
     output_layer_idx: int,
     aggregation: str,
+    head_type: str | None = None,
+    head_hidden_dim: int | None = None,
+    head_dropout: float | None = None,
+    head_norm: str | None = None,
     strict_head_metadata: bool = True,
 
 ) -> Model50MRuntime:
@@ -400,6 +433,10 @@ def build_50m_runtime_from_metadata(
 
     output_layer_idx=output_layer_idx,
     aggregation=aggregation,
+    head_type=head_type,
+    head_hidden_dim=head_hidden_dim,
+    head_dropout=head_dropout,
+    head_norm=head_norm,
     strict_window_duration=True,
     strict_head_metadata=strict_head_metadata,
 )

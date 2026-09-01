@@ -27,6 +27,7 @@ _EXPORTS = {
         "inspect_hdf5_dataset",
     ),
     "HDF5Metadata": (".hdf5_dataset", "HDF5Metadata"),
+    "open_trial_reader": (".trial_reader", "open_trial_reader"),
     "write_hdf5": (".hdf5_dataset", "write_hdf5"),
     "SequentialDataset": (".sequential_dataset", "SequentialDataset"),
     "SequentialDatasetMetadata": (

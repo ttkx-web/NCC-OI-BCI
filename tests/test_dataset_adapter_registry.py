@@ -162,7 +162,7 @@ def test_registry_fails_closed_for_unknown_hdf5_layout(
         (
             _write_workload,
             "S1",
-            ["P03"] * 4,
+            [3] * 4,
             ("C3", "C4"),
             [
                 "P03:S1:MATBeasy:000000",

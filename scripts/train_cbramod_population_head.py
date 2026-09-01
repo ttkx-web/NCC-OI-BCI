@@ -58,6 +58,10 @@ from bci_dayloop.data.sequential_dataset import (
     resolve_population_split_plan,
 )
 from bci_dayloop.data.channel_selection import select_named_channels
+from bci_dayloop.data.splits import (
+    WithinSubjectTrialSplit,
+    resolve_within_subject_trial_split,
+)
 from bci_dayloop.models.cbramod.backbone import (
     CBraModBackbone,
 )
@@ -240,6 +244,7 @@ def resolve_default_artifact_paths(
     target_subject: int,
     window_tag: str,
     model_path_component: str = "cbramod",
+    split_mode: str = "loso",
 ) -> tuple[Path, Path]:
     dataset_name = str(metadata.dataset_name).strip()
     if not dataset_name:
@@ -250,6 +255,7 @@ def resolve_default_artifact_paths(
         / "runs"
         / "stage1"
         / dataset_name
+        / split_mode
         / f"subject_{target_subject:02d}"
         / model_path_component
         / window_tag
@@ -260,6 +266,7 @@ def resolve_default_artifact_paths(
         / "heads"
         / "stage1"
         / dataset_name
+        / split_mode
         / f"subject_{target_subject:02d}"
         / model_path_component
         / window_tag
@@ -488,6 +495,23 @@ def class_counts(
             class_names
         )
     }
+
+
+def resolve_class_names(
+    *, metadata: SequentialDatasetMetadata,
+    explicit_class_names: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Resolve classifier semantics from the dataset contract, not BNCI defaults."""
+    metadata_names = tuple(str(name).strip() for name in metadata.class_names)
+    class_names = (
+        tuple(str(name).strip() for name in explicit_class_names)
+        if explicit_class_names is not None else metadata_names
+    )
+    if not class_names or len(class_names) != len(metadata_names):
+        raise ValueError("class_names length must match the dataset class count.")
+    if not all(class_names) or len(set(class_names)) != len(class_names):
+        raise ValueError("class_names must be non-empty and unique.")
+    return class_names
 
 
 def validate_labels(
@@ -860,20 +884,53 @@ def build_subject_feature_split(
     expected_completion_matrix_sha256: str | None = None,
 ) -> tuple[FeatureSplit, SequentialDatasetMetadata]:
     dataset = load_sequential_dataset(subject_path, session=session_name)
-    metadata = dataset.metadata
-
     if reference_metadata is not None:
         validate_metadata_compatibility(
-            reference_metadata,
-            metadata,
-            subject_id=subject_id,
-            path=subject_path,
+            reference_metadata, dataset.metadata, subject_id=subject_id, path=subject_path,
         )
+    return build_feature_split_from_session_data(
+        subject_id=subject_id, session_name=session_name, subject_path=subject_path,
+        metadata=dataset.metadata, loaded=sequential_dataset_trial_data(dataset),
+        canonicalizer=canonicalizer, preprocessor=preprocessor, backbone=backbone,
+        feature_batch_size=feature_batch_size, direct_trial_anchor=direct_trial_anchor,
+        observed_channel_names=observed_channel_names,
+        simulated_missing_channels=simulated_missing_channels,
+        expected_completion_matrix_sha256=expected_completion_matrix_sha256,
+    )
 
-    data = np.asarray(dataset.data, dtype=np.float32)
-    labels = np.asarray(dataset.labels, dtype=np.int64)
-    trial_ids = np.asarray(dataset.trial_ids, dtype=str)
-    subject_ids = np.full(len(data), subject_id, dtype=np.int64)
+
+def sequential_dataset_trial_data(dataset: Any) -> dict[str, np.ndarray]:
+    """Expose adapter-owned trial arrays without reordering or changing HDF5."""
+    return {
+        name: np.asarray(getattr(dataset, name))
+        for name in (
+            "data", "labels", "subject_ids", "session_ids", "trial_ids",
+            "trial_ordinals", "window_ids",
+        )
+    }
+
+
+def build_feature_split_from_session_data(
+    *,
+    subject_id: int,
+    session_name: str,
+    subject_path: Path,
+    metadata: SequentialDatasetMetadata,
+    loaded: Mapping[str, np.ndarray],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> tuple[FeatureSplit, SequentialDatasetMetadata]:
+    """Encode a selected SequentialDataset subset without losing provenance."""
+    data = np.asarray(loaded["data"], dtype=np.float32)
+    labels = np.asarray(loaded["labels"], dtype=np.int64)
+    trial_ids = np.asarray(loaded["trial_ids"], dtype=str)
+    subject_ids = np.asarray(loaded["subject_ids"], dtype=np.int64)
 
     if data.ndim != 3:
         raise ValueError(
@@ -889,6 +946,17 @@ def build_subject_feature_split(
     if len(labels) != len(data):
         raise ValueError(
             f"{subject_path}: labels length mismatch."
+        )
+
+    if len(subject_ids) != len(data) or not np.all(subject_ids == subject_id):
+        raise ValueError(
+            f"{subject_path}: adapter subject_ids do not match subject {subject_id}."
+        )
+    loaded_sessions = set(np.asarray(loaded["session_ids"], dtype=str).tolist())
+    if loaded_sessions != {session_name}:
+        raise ValueError(
+            f"{subject_path}: expected only session {session_name!r}, "
+            f"got {sorted(loaded_sessions)}."
         )
 
     validate_labels(
@@ -957,6 +1025,126 @@ def build_subject_feature_split(
         ),
         metadata,
     )
+
+
+def select_trial_rows(
+    trial_data: Mapping[str, np.ndarray], indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select source trials without modifying adapter-owned HDF5 arrays."""
+    indices = np.asarray(indices, dtype=np.int64)
+    return {key: np.asarray(values)[indices] for key, values in trial_data.items()}
+
+
+def select_trial_ids(
+    trial_data: Mapping[str, np.ndarray], trial_ids: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Select source IDs safely even when adapters use textual trial IDs."""
+    requested = np.asarray(trial_ids, dtype=str)
+    available = np.asarray(trial_data["trial_ids"], dtype=str)
+    selected = select_trial_rows(trial_data, np.flatnonzero(np.isin(available, requested)))
+    selected_ids = np.asarray(selected["trial_ids"], dtype=str)
+    if set(selected_ids.tolist()) != set(requested.tolist()):
+        missing = sorted(set(requested.tolist()) - set(selected_ids.tolist()))
+        raise RuntimeError(f"Selected source trials are missing from the loaded session: {missing[:10]}.")
+    return selected
+
+
+def build_within_subject_train_validation_splits(
+    *,
+    subject_id: int,
+    subject_path: Path,
+    train_session: str,
+    test_session: str,
+    validation_ratio: float,
+    seed: int,
+    class_names: Sequence[str],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> tuple[FeatureSplit, FeatureSplit, SequentialDatasetMetadata, WithinSubjectTrialSplit, dict[str, np.ndarray]]:
+    """Split adapter source trials before preprocessing or frozen encoding."""
+    train_dataset = load_sequential_dataset(subject_path, session=train_session)
+    test_dataset = load_sequential_dataset(subject_path, session=test_session)
+    validate_metadata_compatibility(
+        train_dataset.metadata, test_dataset.metadata,
+        subject_id=subject_id, path=subject_path,
+    )
+    train_data = sequential_dataset_trial_data(train_dataset)
+    test_data = sequential_dataset_trial_data(test_dataset)
+    all_trial_metadata = {
+        key: np.concatenate((train_data[key], test_data[key]), axis=0)
+        for key in train_data
+    }
+    split = resolve_within_subject_trial_split(
+        subject_ids=all_trial_metadata["subject_ids"],
+        session_ids=all_trial_metadata["session_ids"],
+        labels=all_trial_metadata["labels"],
+        subject_id=subject_id,
+        train_session=train_session,
+        test_session=test_session,
+        validation_ratio=validation_ratio,
+        seed=seed,
+        num_classes=len(class_names),
+    )
+    selected_train = select_trial_ids(
+        train_data, all_trial_metadata["trial_ids"][split.train_indices],
+    )
+    selected_validation = select_trial_ids(
+        train_data, all_trial_metadata["trial_ids"][split.validation_indices],
+    )
+    common = {
+        "subject_id": subject_id, "session_name": train_session,
+        "subject_path": subject_path, "metadata": train_dataset.metadata,
+        "canonicalizer": canonicalizer, "preprocessor": preprocessor,
+        "backbone": backbone, "feature_batch_size": feature_batch_size,
+        "direct_trial_anchor": direct_trial_anchor,
+        "observed_channel_names": observed_channel_names,
+        "simulated_missing_channels": simulated_missing_channels,
+        "expected_completion_matrix_sha256": expected_completion_matrix_sha256,
+    }
+    train_split, _ = build_feature_split_from_session_data(loaded=selected_train, **common)
+    validation_split, _ = build_feature_split_from_session_data(loaded=selected_validation, **common)
+    return train_split, validation_split, train_dataset.metadata, split, all_trial_metadata
+
+
+def build_within_subject_final_test_split(
+    *,
+    subject_id: int,
+    subject_path: Path,
+    metadata: SequentialDatasetMetadata,
+    split: WithinSubjectTrialSplit,
+    all_trial_metadata: Mapping[str, np.ndarray],
+    canonicalizer: SignalCanonicalizer,
+    preprocessor: CBraModPipelinePreprocessor,
+    backbone: CBraModBackbone,
+    feature_batch_size: int,
+    direct_trial_anchor: str,
+    observed_channel_names: Sequence[str] | None = None,
+    simulated_missing_channels: Sequence[str] = (),
+    expected_completion_matrix_sha256: str | None = None,
+) -> FeatureSplit:
+    """Load and encode the held-out session only after model selection."""
+    dataset = load_sequential_dataset(subject_path, session=split.test_session)
+    validate_metadata_compatibility(metadata, dataset.metadata, subject_id=subject_id, path=subject_path)
+    test_data = select_trial_ids(
+        sequential_dataset_trial_data(dataset),
+        all_trial_metadata["trial_ids"][split.test_indices],
+    )
+    test_split, _ = build_feature_split_from_session_data(
+        subject_id=subject_id, session_name=split.test_session, subject_path=subject_path,
+        metadata=metadata, loaded=test_data, canonicalizer=canonicalizer,
+        preprocessor=preprocessor, backbone=backbone, feature_batch_size=feature_batch_size,
+        direct_trial_anchor=direct_trial_anchor,
+        observed_channel_names=observed_channel_names,
+        simulated_missing_channels=simulated_missing_channels,
+        expected_completion_matrix_sha256=expected_completion_matrix_sha256,
+    )
+    return test_split
 
 
 def combine_feature_splits(
@@ -1085,7 +1273,7 @@ def load_feature_cache(
         ).contiguous(),
         source_trial_ids=np.asarray(
             payload["source_trial_ids"],
-            dtype=np.int64,
+            dtype=str,
         ),
         subject_ids=np.asarray(
             payload["subject_ids"],
@@ -1347,6 +1535,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--split-mode",
+        choices=("loso", "within-subject"),
+        default="loso",
+        help="Use the population LOSO plan or a source-trial within-subject split.",
+    )
+
+    parser.add_argument(
         "--train-session",
         default="0train",
     )
@@ -1359,6 +1554,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--final-test-session",
         default="1test",
+    )
+
+    parser.add_argument(
+        "--test-session",
+        default=None,
+        help="Held-out final-test session for --split-mode within-subject.",
+    )
+
+    parser.add_argument(
+        "--validation-ratio",
+        type=float,
+        default=0.2,
+        help="Source-trial validation fraction for --split-mode within-subject.",
+    )
+
+    parser.add_argument(
+        "--class-names",
+        nargs="+",
+        default=None,
+        help="Optional class names in label order, overriding dataset metadata.",
     )
 
     parser.add_argument(
@@ -1524,11 +1739,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=["none", "per_window_zscore", "fixed_100uv"],
         default="none",
     )
-    # Retain the historical knobs for CLI compatibility. Deployment artifacts
-    # are produced from the named profile unless callers explicitly override it.
-    parser.add_argument("--missing-channel-policy", choices=["error", "spherical_spline"], default=None)
-    parser.add_argument("--min-observed-channels", type=int, default=None)
-    parser.add_argument("--spline-alpha", type=float, default=None)
     parser.add_argument(
         "--head-type",
         choices=["official_mlp", "linear"],
@@ -1595,23 +1805,28 @@ def main() -> None:
 
     set_seed(args.seed)
 
-    subjects = normalize_subjects(args.subjects)
     target_subject = int(args.target_subject)
-
-    if target_subject not in subjects:
-        raise ValueError(
-            "--target-subject must be included in --subjects. "
-            f"Got target={target_subject}, subjects={subjects}."
+    if args.split_mode == "loso":
+        subjects = normalize_subjects(args.subjects)
+        if target_subject not in subjects:
+            raise ValueError(
+                "--target-subject must be included in --subjects. "
+                f"Got target={target_subject}, subjects={subjects}."
+            )
+        split_plan = resolve_population_split_plan(
+            subjects, target_subject, args.train_session,
+            args.validation_session, args.final_test_session,
         )
-
-    split_plan = resolve_population_split_plan(subjects, target_subject, args.train_session, args.validation_session, args.final_test_session)
-    population_subjects = list(split_plan.train_subjects)
-
-    if not population_subjects:
-        raise ValueError(
-            "LOSO population training requires at least one "
-            "non-target subject."
-        )
+        population_subjects = list(split_plan.train_subjects)
+    else:
+        if target_subject <= 0:
+            raise ValueError("--target-subject must be positive.")
+        if args.test_session is None:
+            raise ValueError("--test-session is required for --split-mode within-subject.")
+        if not 0.0 < args.validation_ratio < 1.0:
+            raise ValueError("--validation-ratio must be in (0,1).")
+        subjects = [target_subject]
+        population_subjects = []
 
     data_root = resolve_repo_path(args.data_root)
     checkpoint_path = resolve_repo_path(args.checkpoint)
@@ -1656,9 +1871,8 @@ def main() -> None:
             )
 
         if class_names is None:
-            class_names = tuple(
-                str(name)
-                for name in metadata.class_names
+            class_names = resolve_class_names(
+                metadata=metadata, explicit_class_names=args.class_names,
             )
 
     if reference_metadata is None or class_names is None:
@@ -1666,11 +1880,16 @@ def main() -> None:
             "Could not resolve dataset metadata."
         )
 
+    label_mapping = {
+        str(index): str(name) for index, name in enumerate(class_names)
+    }
+
     default_head_path, default_run_dir = resolve_default_artifact_paths(
         metadata=reference_metadata,
         target_subject=target_subject,
         window_tag=window_tag,
         model_path_component=profile_output_name,
+        split_mode=args.split_mode,
     )
     run_dir = (
         resolve_repo_path(args.run_dir)
@@ -1749,11 +1968,17 @@ def main() -> None:
     run_config = {
         "model_name": "cbramod-frozen-head",
         "dataset": str(reference_metadata.dataset_name),
+        "split_mode": args.split_mode,
         "target_subject": target_subject,
         "population_subjects": population_subjects,
         "train_session": args.train_session,
         "validation_session": args.validation_session,
-        "final_test_session": args.final_test_session,
+        "final_test_session": (
+            args.final_test_session if args.split_mode == "loso" else args.test_session
+        ),
+        "validation_ratio": (
+            float(args.validation_ratio) if args.split_mode == "within-subject" else None
+        ),
         "class_names": list(class_names),
         "backbone_checkpoint": str(checkpoint_path),
         "backbone_sha256": backbone_sha256,
@@ -1923,23 +2148,43 @@ def main() -> None:
 
         return combined
 
-    population_train = build_or_load_split(
-        split_name="population_train",
-        split_subjects=population_subjects,
-        session_name=args.train_session,
-    )
-
-    population_validation = build_or_load_split(
-        split_name="population_validation",
-        split_subjects=population_subjects,
-        session_name=args.validation_session,
-    )
-
-    final_test = build_or_load_split(
-        split_name="target_final_test",
-        split_subjects=[target_subject],
-        session_name=args.final_test_session,
-    )
+    within_subject_split: WithinSubjectTrialSplit | None = None
+    within_subject_all_trials: dict[str, np.ndarray] | None = None
+    if args.split_mode == "loso":
+        population_train = build_or_load_split(
+            split_name="population_train", split_subjects=population_subjects,
+            session_name=args.train_session,
+        )
+        population_validation = build_or_load_split(
+            split_name="population_validation", split_subjects=population_subjects,
+            session_name=args.validation_session,
+        )
+        final_test: FeatureSplit | None = build_or_load_split(
+            split_name="target_final_test", split_subjects=[target_subject],
+            session_name=args.final_test_session,
+        )
+        final_test_session = args.final_test_session
+    else:
+        (
+            population_train, population_validation, within_metadata,
+            within_subject_split, within_subject_all_trials,
+        ) = build_within_subject_train_validation_splits(
+            subject_id=target_subject, subject_path=subject_paths[target_subject],
+            train_session=args.train_session, test_session=str(args.test_session),
+            validation_ratio=args.validation_ratio, seed=args.seed, class_names=class_names,
+            canonicalizer=canonicalizer, preprocessor=preprocessor, backbone=backbone,
+            feature_batch_size=args.feature_batch_size,
+            direct_trial_anchor=args.direct_trial_anchor,
+            observed_channel_names=deployment_profile.observed_channel_names,
+            simulated_missing_channels=deployment_profile.simulated_missing_channels,
+            expected_completion_matrix_sha256=completion_matrix_sha256,
+        )
+        validate_metadata_compatibility(
+            reference_metadata, within_metadata, subject_id=target_subject,
+            path=subject_paths[target_subject],
+        )
+        final_test = None
+        final_test_session = within_subject_split.test_session
 
     validate_no_trial_leakage(
         population_train,
@@ -1948,19 +2193,15 @@ def main() -> None:
         right_name="population_validation",
     )
 
-    validate_no_trial_leakage(
-        population_train,
-        final_test,
-        left_name="population_train",
-        right_name="target_final_test",
-    )
-
-    validate_no_trial_leakage(
-        population_validation,
-        final_test,
-        left_name="population_validation",
-        right_name="target_final_test",
-    )
+    if final_test is not None:
+        validate_no_trial_leakage(
+            population_train, final_test,
+            left_name="population_train", right_name="target_final_test",
+        )
+        validate_no_trial_leakage(
+            population_validation, final_test,
+            left_name="population_validation", right_name="target_final_test",
+        )
 
     classifier = build_cbramod_classifier(config).to(
         backbone.device
@@ -2072,6 +2313,29 @@ def main() -> None:
     classifier.load_state_dict(best_state)
     classifier.eval()
 
+    if final_test is None:
+        assert within_subject_split is not None
+        assert within_subject_all_trials is not None
+        final_test = build_within_subject_final_test_split(
+            subject_id=target_subject, subject_path=subject_paths[target_subject],
+            metadata=reference_metadata, split=within_subject_split,
+            all_trial_metadata=within_subject_all_trials,
+            canonicalizer=canonicalizer, preprocessor=preprocessor, backbone=backbone,
+            feature_batch_size=args.feature_batch_size,
+            direct_trial_anchor=args.direct_trial_anchor,
+            observed_channel_names=deployment_profile.observed_channel_names,
+            simulated_missing_channels=deployment_profile.simulated_missing_channels,
+            expected_completion_matrix_sha256=completion_matrix_sha256,
+        )
+        validate_no_trial_leakage(
+            population_train, final_test,
+            left_name="population_train", right_name="target_final_test",
+        )
+        validate_no_trial_leakage(
+            population_validation, final_test,
+            left_name="population_validation", right_name="target_final_test",
+        )
+
     final_test_metrics = evaluate_head(
         classifier=classifier,
         split=final_test,
@@ -2084,6 +2348,30 @@ def main() -> None:
         classifier.state_dict()
     )
 
+    if within_subject_split is None:
+        within_subject_metadata: dict[str, Any] | None = None
+    else:
+        assert within_subject_all_trials is not None
+        within_subject_metadata = {
+            "subject": target_subject,
+            "train_session": within_subject_split.train_session,
+            "test_session": within_subject_split.test_session,
+            "validation_ratio": float(args.validation_ratio),
+            "split_seed": int(args.seed),
+            "available_sessions": list(within_subject_split.available_sessions),
+            "train_indices": within_subject_split.train_indices.tolist(),
+            "validation_indices": within_subject_split.validation_indices.tolist(),
+            "test_indices": within_subject_split.test_indices.tolist(),
+            "train_trial_ids": within_subject_all_trials["trial_ids"][within_subject_split.train_indices].tolist(),
+            "validation_trial_ids": within_subject_all_trials["trial_ids"][within_subject_split.validation_indices].tolist(),
+            "test_trial_ids": within_subject_all_trials["trial_ids"][within_subject_split.test_indices].tolist(),
+            "train_class_counts": class_counts(within_subject_all_trials["labels"][within_subject_split.train_indices], class_names),
+            "validation_class_counts": class_counts(within_subject_all_trials["labels"][within_subject_split.validation_indices], class_names),
+            "test_class_counts": class_counts(within_subject_all_trials["labels"][within_subject_split.test_indices], class_names),
+        }
+    run_config["within_subject_split"] = within_subject_metadata
+    dump_yaml(run_config, run_dir / "config.yaml")
+
     saved_head_path = save_cbramod_classifier_checkpoint(
         classifier,
         output_head_path,
@@ -2091,6 +2379,7 @@ def main() -> None:
         class_names=class_names,
         extra_metadata={
             "dataset": str(reference_metadata.dataset_name),
+            "split_mode": args.split_mode,
             "artifact_metadata": {
                 "trained_head": True,
                 "head_type": "population",
@@ -2110,9 +2399,9 @@ def main() -> None:
                 args.validation_session
             ),
             "final_test_subject": target_subject,
-            "final_test_session": (
-                args.final_test_session
-            ),
+            "final_test_session": final_test_session,
+            "label_mapping": label_mapping,
+            "within_subject_split": within_subject_metadata,
             "best_epoch": best_epoch,
             "best_metric_name": (
                 args.metric_for_best
@@ -2171,7 +2460,11 @@ def main() -> None:
     report = {
         "model_name": "cbramod-frozen-head",
         "dataset": str(reference_metadata.dataset_name),
-        "protocol": "LOSO population head",
+        "protocol": (
+            "LOSO population head" if args.split_mode == "loso"
+            else "within-subject cross-session head"
+        ),
+        "split_mode": args.split_mode,
         "target_subject": target_subject,
         "population_training_subjects": population_subjects,
         "population_training_session": (
@@ -2184,8 +2477,11 @@ def main() -> None:
             args.validation_session
         ),
         "final_test_subject": target_subject,
-        "final_test_session": args.final_test_session,
+        "final_test_session": final_test_session,
         "class_names": list(class_names),
+        "label_mapping": label_mapping,
+        "num_classes": int(config.num_classes),
+        "within_subject": within_subject_metadata,
         "seed": args.seed,
         "backbone_checkpoint": str(checkpoint_path),
         "backbone_sha256": backbone_sha256,

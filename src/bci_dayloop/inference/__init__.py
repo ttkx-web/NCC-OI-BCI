@@ -5,6 +5,7 @@ from .neuroonline_forward import (
 )
 from .realtime import (
     DecodeResult,
+    MultiHeadDecodeResult,
     SlidingWindowDecoder,
 )
 
@@ -16,13 +17,28 @@ from .neuroonline_strategy import (
 from .predictor import (
     PreparedPredictor,
 )
+from .multi_head import (
+    HeadPrediction,
+    MultiHeadPrediction,
+    MultiHeadPredictor,
+)
+from .window_inference import (
+    infer_eeg_window,
+    named_predictions,
+)
 
 __all__ = [
     "DecodeResult",
+    "HeadPrediction",
+    "MultiHeadPrediction",
+    "MultiHeadPredictor",
+    "MultiHeadDecodeResult",
     "NeuroOnlineConfig",
     "NeuroOnlineForward",
     "NeuroOnlineForwardResult",
     "NeuroOnlineStrategy",
     "SlidingWindowDecoder",
     "build_neuroonline_forward",
+    "infer_eeg_window",
+    "named_predictions",
 ]

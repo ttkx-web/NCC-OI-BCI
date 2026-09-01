@@ -230,7 +230,7 @@ NCC-OI-BCI/
 ├── scripts/
 │   ├── prepare_bnci2014_001.py
 │   ├── inspect_dataset.py
-│   ├── train_50m_linear_head.py
+│   ├── train_50m_population_head.py
 │   ├── export_50m_model_package.py
 │   ├── test_50m_offline_window.py
 │   ├── replay_offline.py
@@ -415,7 +415,7 @@ conda activate bci-dayloop
 仓库已经定义了正式分类头路径。仅在需要重新训练分类头时执行：
 
 ```bash
-python scripts/train_50m_linear_head.py \
+PYTHONPATH=src python -m bci_dayloop.training.model_50m.linear_head \
   --data data/processed/bnci2014_001_s01.h5 \
   --train-session 0train \
   --test-session 1test \

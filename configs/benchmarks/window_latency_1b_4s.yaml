@@ -20,4 +20,4 @@ benchmark:
 
   candidates:
     - id: model_1b_4s
-      package: model_packages/stage1_1b/bnci2014_001/subject_01/population/4s_flatten/v1
+      package: model_packages/1b/bnci2014_001/subject_01/population/4s_flatten/v1

@@ -167,6 +167,8 @@ def preprocessing_contract(config: Model1BConfig) -> dict[str, Any]:
         "num_tokens": config.num_tokens,
         "zscore_enabled": config.zscore_enabled,
         "zscore_eps": config.zscore_eps,
+        "missing_channel_fill_value": config.missing_channel_fill_value,
+        "window_tolerance_seconds": config.window_tolerance_seconds,
         "tokenization": "channel_major",
         "token_inputs_dtype": "torch.float32",
         "token_indices_dtype": "torch.int64",

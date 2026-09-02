@@ -19,7 +19,16 @@ __all__ = [
     "Model1BBatchedInput",
     "Model1BTokenizedInput",
     "Model1BTokenizer",
+    "Model1BRuntime",
     "classifier_input_dim",
     "flatten_token_embeddings",
+    "build_1b_runtime",
     "load_backbone_checkpoint",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"Model1BRuntime", "build_1b_runtime"}:
+        from .runtime import Model1BRuntime, build_1b_runtime
+        return {"Model1BRuntime": Model1BRuntime, "build_1b_runtime": build_1b_runtime}[name]
+    raise AttributeError(name)

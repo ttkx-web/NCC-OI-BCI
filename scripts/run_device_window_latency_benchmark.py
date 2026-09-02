@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import torch
+import numpy as np
 
 try:
     from _bootstrap import ROOT
@@ -32,6 +33,8 @@ from bci_dayloop.benchmarking.reporting import (
     write_window_records_csv,
 )
 from bci_dayloop.benchmarking.windows import DeviceWindowProvider
+from bci_dayloop.models.model_1b import Model1BBackbone, Model1BConfig
+from bci_dayloop.models.model_1b.latency import Model1BLatencyRunner
 from bci_dayloop.packages.loader import load_runtime_package
 from bci_dayloop.realtime.neuracle_jellyfish import (
     NeuracleJellyFishConfig,
@@ -40,6 +43,7 @@ from bci_dayloop.realtime.neuracle_jellyfish import (
 from bci_dayloop.realtime.pipeline import RealtimeEEGWindowPipeline
 from bci_dayloop.realtime.runtime_bridge import RealtimeRuntimeBridge
 from bci_dayloop.realtime.runtime_policy import RealtimeModelPolicyRegistry
+from bci_dayloop.realtime.runtime_policy import Model1BLatencyRealtimePolicy
 from bci_dayloop.realtime.window_contract import (
     APPROVED_REALTIME_WINDOW_SECONDS,
     NEURACLE_SOURCE_SAMPLING_RATE,
@@ -155,6 +159,111 @@ def _prepared_contract(loaded: object) -> tuple[int, ...]:
     raise ValueError(f"unsupported benchmark model_type: {model_type!r}")
 
 
+def _latency_summary(values: list[float]) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or len(array) == 0 or not np.isfinite(array).all():
+        raise ValueError("latency-only benchmark values must be finite and non-empty")
+    return {
+        "count": float(len(array)), "mean": float(array.mean()), "min": float(array.min()),
+        "p50": float(np.quantile(array, 0.50, method="linear")),
+        "p95": float(np.quantile(array, 0.95, method="linear")), "max": float(array.max()),
+    }
+
+
+def _run_1b_backbone_latency_only(
+    *,
+    args: argparse.Namespace,
+    config_path: Path,
+    benchmark: Mapping[str, object],
+) -> int:
+    """Run the approved live-window path without a classifier or package."""
+    source_config = _require_mapping(benchmark, "source")
+    schedule = _require_mapping(benchmark, "schedule")
+    output = _require_mapping(benchmark, "output")
+    backbone_payload = _require_mapping(benchmark, "backbone")
+    if benchmark.get("latency_only") is not True:
+        raise ValueError("1B benchmark must declare benchmark.latency_only=true")
+    host = os.environ.get(str(source_config.get("host_env", "")).strip())
+    if not host:
+        raise ValueError("1B device benchmark requires its configured live host environment variable")
+    device = args.device or str(benchmark.get("device", "cuda"))
+    window_sec = float(schedule.get("window_sec", 4.0))
+    step_sec = float(schedule.get("step_sec", REALTIME_STEP_SECONDS))
+    warmup = int(schedule.get("warmup_windows", 20))
+    measured = int(schedule.get("measured_windows", 200))
+    if window_sec not in APPROVED_REALTIME_WINDOW_SECONDS or step_sec != REALTIME_STEP_SECONDS:
+        raise ValueError("1B latency-only benchmark requires an approved 1/2/3/4s window and 0.5s step")
+    if warmup != 20 or measured != 200:
+        raise ValueError("1B latency-only benchmark is fixed at warmup=20 / measured=200")
+    checkpoint = resolve_path(str(backbone_payload.get("checkpoint", "")))
+    config = Model1BConfig(checkpoint_path=checkpoint, device=device, window_seconds=window_sec)
+    backbone = Model1BBackbone(config)
+    runner = Model1BLatencyRunner(config, backbone)
+    runtime = runner.runtime
+    bridge = RealtimeRuntimeBridge(runtime, policy=Model1BLatencyRealtimePolicy())
+    source = NeuracleJellyFishSource(NeuracleJellyFishConfig(
+        host=host, port=int(source_config.get("port", 8712)),
+        expected_sampling_rate=float(source_config.get("expected_sampling_rate", 1000.0)),
+    ))
+    duration_sec = float(args.duration_sec if args.duration_sec is not None else source_config.get("duration_sec", 150.0))
+    provider = DeviceWindowProvider(
+        source=source,
+        pipeline=RealtimeEEGWindowPipeline.from_runtime_input_contract(
+            runtime.input_contract, sampling_rate=NEURACLE_SOURCE_SAMPLING_RATE, step_seconds=step_sec,
+        ),
+        bridge=bridge, duration_sec=duration_sec, maximum_windows=warmup + measured,
+    )
+    output_root = resolve_path(args.output_root) if args.output_root else resolve_path(str(output.get("root_dir")))
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_dir = output_root / run_id
+    if output_dir.exists():
+        raise FileExistsError(f"benchmark output directory already exists: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=False)
+    if torch.device(device).type == "cuda":
+        torch.cuda.reset_peak_memory_stats(torch.device(device))
+    records: list[dict[str, object]] = []
+    try:
+        for index, item in enumerate(provider):
+            record = runner.run_one(item.raw_window, prepare_validator=item.prepare_validator)
+            if index < warmup:
+                continue
+            records.append({
+                "sequence_index": item.sequence_index, "window_id": item.window_id,
+                "preprocessing_ms": record.preprocessing_ms, "tokenization_ms": record.tokenization_ms,
+                "encoder_ms": record.encoder_ms, "compute_total_ms": record.compute_total_ms,
+                "embedding_shape": list(record.embedding_shape),
+            })
+            if len(records) == measured:
+                break
+    finally:
+        provider.close()
+    if len(records) != measured:
+        raise RuntimeError(f"1B latency-only benchmark collected {len(records)} of {measured} measured windows")
+    integrity = provider.source_integrity
+    if not _source_integrity_passes(integrity) or integrity["pipeline_failed_windows"] != 0:
+        raise RuntimeError("1B latency-only benchmark source/pipeline integrity gate failed")
+    peak_memory = None
+    if torch.device(device).type == "cuda":
+        peak_memory = int(torch.cuda.max_memory_allocated(torch.device(device)))
+    summary = {
+        "schema_version": 1, "mode": "device_backbone_latency_only", "latency_only": True,
+        "warning": "No classifier, logits, probabilities, labels, or Runtime Model Package are used or produced.",
+        "device": device, "checkpoint": _safe_path(checkpoint), "checkpoint_source_key": backbone.load_report.checkpoint_source_key if backbone.load_report else None,
+        "ignored_pretraining_head_keys": list(backbone.load_report.ignored_pretraining_head_keys if backbone.load_report else ()),
+        "window_sec": window_sec, "step_sec": step_sec, "warmup_windows": warmup, "measured_windows": measured,
+        "embedding_shape": [1, config.num_tokens, config.d_model], "peak_gpu_memory_bytes": peak_memory,
+        "latency_ms": {key: _latency_summary([float(row[key]) for row in records]) for key in ("preprocessing_ms", "tokenization_ms", "encoder_ms", "compute_total_ms")},
+        "source_integrity": integrity,
+    }
+    serialized_summary = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+    (output_dir / "benchmark_manifest.json").write_text(serialized_summary, encoding="utf-8")
+    # Keep the existing device benchmark's discoverable summary filename while
+    # retaining a latency-only schema that has no prediction fields.
+    (output_dir / "summary.json").write_text(serialized_summary, encoding="utf-8")
+    (output_dir / "window_records.json").write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -174,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
     config_path = resolve_path(args.config)
     payload = load_yaml(config_path)
     benchmark = _require_mapping(payload, "benchmark")
+    if benchmark.get("mode") == "device_backbone_latency_only":
+        return _run_1b_backbone_latency_only(args=args, config_path=config_path, benchmark=benchmark)
     if benchmark.get("mode") != "device":
         raise ValueError("live benchmark config must set benchmark.mode=device")
     source_config = _require_mapping(benchmark, "source")

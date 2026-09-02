@@ -309,6 +309,51 @@ class Model50MRealtimePolicy(RealtimeModelPolicy):
         return None
 
 
+class Model1BLatencyRealtimePolicy(Model50MRealtimePolicy):
+    """Stage2B gate for the non-classifying 1B latency-only backbone path.
+
+    This policy deliberately cannot validate or create a Runtime Model Package.
+    It reuses the approved 59-to-64 source mapping and prepared-input checks,
+    while requiring the final 1B encoder layer rather than a 50M classifier
+    aggregation setting.
+    """
+
+    model_type = "model_1b_latency_only"
+    policy_id = "model_1b_latency_only_neuracle_59_to_standard64_v1"
+
+    def validate_package(self, package: RuntimePackageLike) -> None:
+        raise ValueError(
+            "1B latency-only backbone must not be used as a Runtime Model Package"
+        )
+
+    def _runtime_contract_failure(
+        self,
+        runtime_model: RuntimePrepareOnly,
+    ) -> str | None:
+        contract = runtime_model.input_contract
+        if contract.channel_names != self.mapping.target_channel_names:
+            return "1B latency-only channel order does not match the approved policy"
+        if contract.sample_rate != 100.0:
+            return "1B latency-only runtime must declare 64 channels at 100 Hz"
+        try:
+            validate_approved_realtime_window_contract(contract, sampling_rate=100.0)
+        except ValueError as exc:
+            return str(exc)
+        if (
+            contract.input_unit != EEG_UNIT
+            or contract.model_input_keys != ("signal", "channel_valid_mask")
+        ):
+            return "1B latency-only input contract does not match approved preprocessing keys"
+        config = getattr(getattr(runtime_model, "input_transform", None), "config", None)
+        if (
+            config is None
+            or getattr(config, "output_layer_idx", None) != 19
+            or getattr(config, "latency_only", None) is not True
+        ):
+            return "1B latency-only runtime must expose final encoder layer 19 only"
+        return None
+
+
 class LaBraMRealtimePolicy(RealtimeModelPolicy):
     model_type = "labram"
     policy_id = "labram_package_required_channels_v1"

@@ -73,6 +73,17 @@ def test_frozen_4s_schedule_remains_supported() -> None:
     assert allowed == (4.0,)
 
 
+def test_1b_latency_only_config_is_explicitly_non_classifying() -> None:
+    payload = load_yaml(Path("configs/benchmarks/model_1b_backbone_latency_live_4s.yaml"))
+    benchmark = payload["benchmark"]
+    assert benchmark["mode"] == "device_backbone_latency_only"
+    assert benchmark["latency_only"] is True
+    assert benchmark["schedule"]["window_sec"] == 4.0
+    assert benchmark["schedule"]["warmup_windows"] == 20
+    assert benchmark["schedule"]["measured_windows"] == 200
+    assert "candidates" not in benchmark
+
+
 @pytest.mark.parametrize(
     ("model_type", "window_sec", "expected"),
     [

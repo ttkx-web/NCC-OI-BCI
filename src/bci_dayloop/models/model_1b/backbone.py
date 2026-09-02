@@ -204,6 +204,13 @@ def resolve_device(requested: str | torch.device) -> torch.device:
     return device
 
 
+def _matches_requested_device(actual: torch.device, requested: torch.device) -> bool:
+    """Treat ``cuda`` as the current CUDA device, as Tensor.to(cuda) does."""
+    if actual.type != requested.type:
+        return False
+    return requested.index is None or actual.index == requested.index
+
+
 class Model1BBackbone(nn.Module):
     """Checkpoint-backed wrapper that exposes final token embeddings, never logits."""
 
@@ -268,10 +275,15 @@ class Model1BBackbone(nn.Module):
         if (
             tuple(embeddings.shape) != expected
             or embeddings.dtype != torch.float32
-            or embeddings.device != self.device_object
+            or not _matches_requested_device(embeddings.device, self.device_object)
             or not torch.isfinite(embeddings).all()
         ):
-            raise RuntimeError(f"1B final encoder output is invalid; expected {expected}, got {tuple(embeddings.shape)}")
+            raise RuntimeError(
+                "1B final encoder output is invalid; "
+                f"expected shape={expected}, dtype=torch.float32, device={self.device_object}; "
+                f"got shape={tuple(embeddings.shape)}, dtype={embeddings.dtype}, "
+                f"device={embeddings.device}, finite={bool(torch.isfinite(embeddings).all())}"
+            )
         return embeddings
 
     def forward(self, batch: Model1BBatchedInput) -> torch.Tensor:

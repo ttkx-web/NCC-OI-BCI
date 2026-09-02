@@ -180,10 +180,14 @@ class Model1BBackboneRunner:
             embedding = self.backbone.extract_embeddings(prepared.as_batched_input())
         expected = (prepared.batch_size, prepared.num_tokens, self.config.d_model)
         backbone_device = self.backbone.device_object
+        device_matches = (
+            embedding.device.type == backbone_device.type
+            and (backbone_device.index is None or embedding.device.index == backbone_device.index)
+        )
         if (
             tuple(embedding.shape) != expected
             or embedding.dtype != torch.float32
-            or embedding.device != backbone_device
+            or not device_matches
             or not torch.isfinite(embedding).all()
         ):
             raise RuntimeError(

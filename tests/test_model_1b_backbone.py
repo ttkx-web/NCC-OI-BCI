@@ -7,7 +7,11 @@ import numpy as np
 import pytest
 import torch
 
-from bci_dayloop.models.model_1b.backbone import Model1BBackbone, load_backbone_checkpoint
+from bci_dayloop.models.model_1b.backbone import (
+    Model1BBackbone,
+    _matches_requested_device,
+    load_backbone_checkpoint,
+)
 from bci_dayloop.models.model_1b.config import Model1BConfig
 from bci_dayloop.models.model_1b.runner import Model1BBackboneRunner
 from bci_dayloop.models.model_50m.config import STANDARD_64_CHANNELS
@@ -52,6 +56,11 @@ class _FakeBackbone:
             dtype=torch.float32,
             device=self.device_object,
         )
+
+
+def test_unsuffixed_cuda_device_accepts_cuda_zero_tensor_device() -> None:
+    assert _matches_requested_device(torch.device("cuda:0"), torch.device("cuda"))
+    assert not _matches_requested_device(torch.device("cuda:1"), torch.device("cuda:0"))
 
 
 def _raw_window(seconds: float, *, sample_rate: float = 100.0) -> RawEEGWindow:

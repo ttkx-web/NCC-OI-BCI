@@ -18,7 +18,7 @@ model:
 
 replay:
   # A formal 1B Package fixes its own 4-second flatten head contract.
-  model_package: model_packages/stage1_1b/bnci2014_001/subject_01/population/4s_flatten/v1
+  model_package: model_packages/1b/bnci2014_001/subject_01/population/4s_flatten/v1
   acquirer: replay
   session: 1test
   speed: 1.0

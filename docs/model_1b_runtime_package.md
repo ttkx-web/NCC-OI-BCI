@@ -11,7 +11,7 @@
 python scripts/export_1b_model_package.py \
   --backbone-checkpoint checkpoints/backbones/1b/pretrain_checkpoint_4.pt \
   --head-checkpoint /path/to/1b_4s_population_head.pt \
-  --output-dir model_packages/stage1_1b/bnci2014_001/subject_01/population/4s_flatten/v1 \
+  --output-dir model_packages/1b/bnci2014_001/subject_01/population/4s_flatten/v1 \
   --device cuda
 ```
 

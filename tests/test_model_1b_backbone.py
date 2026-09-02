@@ -93,6 +93,10 @@ def test_runner_prepares_and_extracts_variable_windows(window_seconds: float) ->
     assert prepared.token_inputs.dtype == torch.float32
     assert prepared.token_channel_indices.dtype == torch.int64
     assert prepared.token_time_indices.dtype == torch.int64
+    assert "1b:reuse_50m_preprocessing" in prepared.preprocessing_trace
+    assert prepared.diagnostics["model_type"] == "model_1b"
+    assert prepared.diagnostics["num_time_patches"] == int(window_seconds)
+    assert prepared.diagnostics["token_count"] == expected_tokens
     assert embedding.shape == (1, expected_tokens, 2048)
     assert embedding.dtype == torch.float32
     assert torch.isfinite(embedding).all()

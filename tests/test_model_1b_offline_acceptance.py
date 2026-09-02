@@ -138,7 +138,7 @@ def test_1b_replay_and_benchmark_configs_are_static_4s_package_contracts() -> No
     assert replay["replay"]["window_sec"] == 4.0
     assert replay["replay"]["step_sec"] == 0.5
     assert replay["replay"]["model_package"] == (
-        "model_packages/stage1_1b/bnci2014_001/subject_01/"
+        "model_packages/1b/bnci2014_001/subject_01/"
         "population/4s_flatten/v1"
     )
     assert replay["online"]["strategy"] == "none"

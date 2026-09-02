@@ -46,6 +46,24 @@ class Model1BPreparedInput:
     def device(self) -> torch.device:
         return self.token_inputs.device
 
+    @property
+    def preprocessing_trace(self) -> tuple[str, ...]:
+        """Expose the common Runtime prepared-input trace without mutation."""
+        return tuple(
+            str(step)
+            for step in self.prepared_model_input.preprocessing_trace
+        )
+
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        """Expose common Runtime observability fields for Replay and benchmark."""
+        return {
+            **self.prepared_model_input.diagnostics,
+            "model_type": "model_1b",
+            "num_time_patches": self.num_time_patches,
+            "token_count": self.num_tokens,
+        }
+
     def as_batched_input(self) -> Model1BBatchedInput:
         return Model1BBatchedInput(
             token_inputs=self.token_inputs,

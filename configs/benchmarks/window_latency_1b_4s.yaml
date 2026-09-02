@@ -1,0 +1,23 @@
+benchmark:
+  mode: replay
+  device: cuda
+
+  data:
+    path: data/processed/bnci2014_001/subject_01.h5
+    session: 1test
+    source_mode: continuous_session
+
+  schedule:
+    window_sec: 4.0
+    step_sec: 0.5
+    align_decision_endpoints: true
+    warmup_windows: 20
+    measured_windows: 200
+
+  output:
+    root_dir: runs/benchmarks/window_latency_1b_4s
+    write_per_window_csv: true
+
+  candidates:
+    - id: model_1b_4s
+      package: model_packages/stage1_1b/bnci2014_001/subject_01/population/4s_flatten/v1

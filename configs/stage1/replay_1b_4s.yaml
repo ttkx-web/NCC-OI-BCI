@@ -1,0 +1,43 @@
+project:
+  seed: 42
+  run_dir: runs/stage1_1b/bnci2014_001/subject_01/replay/population/4s_flatten
+
+data:
+  dataset: BNCI2014_001
+  subject: 1
+  output_hdf5: data/processed/bnci2014_001/subject_01.h5
+  train_session: 0train
+  test_session: 1test
+  trial_tmin_sec: 2.0
+  trial_tmax_sec: 6.0
+
+model:
+  name: 1b-frozen-flatten-linear
+  device: cuda
+  freeze_encoder: true
+
+replay:
+  # A formal 1B Package fixes its own 4-second flatten head contract.
+  model_package: model_packages/stage1_1b/bnci2014_001/subject_01/population/4s_flatten/v1
+  acquirer: replay
+  session: 1test
+  speed: 1.0
+  loop: false
+  window_sec: 4.0
+  step_sec: 0.5
+  confidence_threshold: 0.55
+  max_windows: 100
+  jsonl_log: runs/stage1_1b/bnci2014_001/subject_01/replay/population/4s_flatten/pipeline_windows.jsonl
+  summary_json: runs/stage1_1b/bnci2014_001/subject_01/replay/population/4s_flatten/replay_summary.json
+
+labels:
+  class_names: [left_hand, right_hand, feet, tongue]
+  command_map:
+    left_hand: LEFT
+    right_hand: RIGHT
+    feet: FORWARD
+    tongue: STOP
+
+# 1B formal-package replay is static inference only in this stage.
+online:
+  strategy: none

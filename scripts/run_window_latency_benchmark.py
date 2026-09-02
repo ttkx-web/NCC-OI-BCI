@@ -206,6 +206,8 @@ def resolve_settings(
     device_override: str | None,
     output_root_override: str | None,
     run_id_override: str | None,
+    warmup_windows_override: int | None,
+    measured_windows_override: int | None,
     no_verify_hashes: bool,
 ) -> BenchmarkSettings:
     benchmark = required_mapping(
@@ -265,10 +267,14 @@ def resolve_settings(
 
     step_sec = float(schedule.get("step_sec", 0.5))
     warmup_windows = int(
-        schedule.get("warmup_windows", 20)
+        warmup_windows_override
+        if warmup_windows_override is not None
+        else schedule.get("warmup_windows", 20)
     )
     measured_windows = int(
-        schedule.get("measured_windows", 200)
+        measured_windows_override
+        if measured_windows_override is not None
+        else schedule.get("measured_windows", 200)
     )
 
     if step_sec <= 0:
@@ -577,6 +583,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--warmup-windows",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for benchmark.schedule.warmup_windows."
+        ),
+    )
+
+    parser.add_argument(
+        "--measured-windows",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for benchmark.schedule.measured_windows."
+        ),
+    )
+
+    parser.add_argument(
         "--no-verify-hashes",
         action="store_true",
         help=(
@@ -600,6 +624,8 @@ def main() -> int:
         device_override=args.device,
         output_root_override=args.output_root,
         run_id_override=args.run_id,
+        warmup_windows_override=args.warmup_windows,
+        measured_windows_override=args.measured_windows,
         no_verify_hashes=args.no_verify_hashes,
     )
 

@@ -24,6 +24,21 @@ https://github.com/AbabababaSmart/EEG_pretrain
 接入的部署 blocker；实现以 `Model50MConfig` 的标准通道与已验证 preprocessing 为
 准。checkpoint 仍未自行携带该份外部确认的通道/单位元数据。
 
+## 当前 1B backbone 开发状态（2026-09-02）
+
+本仓库现有的可复用基础执行链路是
+`RawEEGWindow → Model1BPreparedInput → final encoder embedding`，公开入口为
+`Model1BBackboneRunner.prepare(raw_window)` 与
+`Model1BBackboneRunner.extract_embeddings(prepared)`：
+
+| 字段 | 当前实现值 | 证据文件 | 结论 |
+|---|---|---|---|
+| prepared token 输入 | 1/4/10 秒分别为 `[1,64,100]` / `[1,256,100]` / `[1,640,100]`；token 为 `float32`，channel/time index 为 `int64` | `src/bci_dayloop/models/model_1b/runner.py`; `config.py` | 只接受 1–10 个整秒 patch；超过 10 秒、短于 1 秒和非整秒立即报错 |
+| embedding 输出 | `[B,64*num_time_patches,2048]`，取 final encoder layer（index 19） | `runner.py:Model1BBackboneRunner.extract_embeddings`; `backbone.py:Model1BBackbone.extract_embeddings` | 输出仅为特征，不是 logits 或类别 |
+| 原始窗口预处理 | 使用内部已验证的 50M 通道映射、滤波、参考、重采样、Z-score 和 channel-major tokenization | `model_1b/preprocessing.py`; `model_1b/tokenization.py` | 不依赖外部 `EEG_pretrain` 仓库或 `sys.path` 注入 |
+| checkpoint 加载 | 只载入精确的 `tokenizer.*`、`channel_embed.*`、`time_embed.*`、`encoder.*`；仅忽略并报告 `head.*` | `model_1b/backbone.py:load_backbone_checkpoint` | `head.*` 是 TimeFreqTokenHead 预训练重建头；不存在分类头 |
+| 分类部署 | 无分类 logits、概率或标签输出 | `model_1b/runner.py`; formal checkpoint `model_state_dict` | **不能直接用于分类部署**；下一阶段须训练分类头并导出正式 Runtime Model Package |
+
 ## 审计方法和 checkpoint 格式
 
 checkpoint 是 PyTorch ZIP 序列化文件（内含

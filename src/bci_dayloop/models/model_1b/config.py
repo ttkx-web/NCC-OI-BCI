@@ -1,13 +1,14 @@
-"""Configuration for the latency-only 1B EEG backbone.
+"""Configuration for the checkpoint-backed 1B EEG backbone.
 
 This module intentionally does not define a classifier, labels, aggregation,
-or a Runtime Model Package contract.  It describes only the checkpoint-backed
-preprocessing/tokenization and encoder path used for latency measurement.
+or a Runtime Model Package contract.  It describes the reusable raw-window to
+final-encoder-embedding path only.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 from bci_dayloop.models.model_50m.config import STANDARD_64_CHANNELS
@@ -45,13 +46,13 @@ class Model1BConfig:
     mlp_ratio: float = 4.0
     dropout: float = 0.1
 
-    # Checkpoint has ten learned temporal positions.  A latency run may use
-    # only positions 0..N-1 for a 1/2/3/4 second window.
+    # The formal checkpoint has ten learned temporal positions.  Runtime
+    # windows may use the prefix positions 0..N-1 for N=1..10 seconds.
     model_n_time_patches: int = 10
     output_layer_idx: int = 19
 
-    # Explicit safety marker used by the latency-only runtime/policy.  It is
-    # not an inference-classification mode.
+    # Compatibility marker for the separately committed live-latency entry.
+    # It has no effect on this module's RawEEGWindow-to-embedding API.
     latency_only: bool = True
 
     def __post_init__(self) -> None:
@@ -64,6 +65,13 @@ class Model1BConfig:
             raise ValueError("1B backbone requires non-overlapping 1.0 second patches")
         if not 1.0 <= self.window_seconds <= 10.0:
             raise ValueError("1B window_seconds must be in [1.0, 10.0]")
+        if not math.isclose(
+            self.window_seconds / self.patch_seconds,
+            round(self.window_seconds / self.patch_seconds),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("1B window_seconds must contain an integer number of 1-second patches")
         if self.target_num_points % self.patch_num_points != 0:
             raise ValueError("1B window must split exactly into 1-second patches")
         if self.model_n_time_patches != 10:
@@ -73,11 +81,11 @@ class Model1BConfig:
         if (self.d_model, self.n_heads, self.depth, self.mlp_ratio, self.dropout) != (2048, 16, 20, 4.0, 0.1):
             raise ValueError("1B architecture must match the formal checkpoint")
         if self.output_layer_idx != 19:
-            raise ValueError("latency-only 1B extraction must use final layer index 19")
+            raise ValueError("1B backbone extraction must use final layer index 19")
         if self.reference_mode != "none":
             raise ValueError("confirmed 1B preprocessing requires reference_mode='none'")
         if not self.latency_only:
-            raise ValueError("Model1BConfig is latency-only; classification is not supported")
+            raise ValueError("the existing 1B benchmark policy requires latency_only=True")
 
     @property
     def target_num_points(self) -> int:

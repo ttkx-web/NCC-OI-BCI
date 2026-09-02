@@ -1,4 +1,4 @@
-"""Checkpoint-strict, latency-only 1B EEG encoder.
+"""Checkpoint-strict 1B EEG encoder.
 
 The deployment graph deliberately ends at the final Transformer token
 embedding.  ``head.*`` in the pretraining checkpoint is TimeFreqTokenHead and
@@ -102,9 +102,15 @@ class BackboneLoadReport:
     checkpoint_source_key: str
     loaded_tensor_count: int
     loaded_parameter_count: int
-    ignored_pretraining_head_keys: tuple[str, ...]
+    ignored_keys: tuple[str, ...]
+    missing_keys: tuple[str, ...]
     load_seconds: float
     device: str
+
+    @property
+    def ignored_pretraining_head_keys(self) -> tuple[str, ...]:
+        """Compatibility spelling that makes the ignored head explicit."""
+        return self.ignored_keys
 
 
 class _ConfigPlaceholder:
@@ -146,25 +152,22 @@ def _extract_state_dict(checkpoint: Any) -> tuple[Mapping[str, torch.Tensor], st
     return value, "model_state_dict"
 
 
-def _normalize_key(key: str) -> str:
-    for prefix in ("module.", "_orig_mod."):
-        while key.startswith(prefix):
-            key = key[len(prefix):]
-    return key[len("backbone."):] if key.startswith("backbone.") else key
-
-
 def load_backbone_checkpoint(model: EEGBackbone1B, checkpoint_path: Path | str, *, device: torch.device) -> BackboneLoadReport:
     path = Path(checkpoint_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"1B checkpoint was not found: {path}")
     started = time.perf_counter()
-    raw_state_dict, source_key = _extract_state_dict(_safe_torch_load(path, device))
+    # Keep checkpoint tensors on CPU while loading.  Mapping this 3.8 GB file
+    # directly to CUDA would temporarily require a second full GPU copy in
+    # addition to the already-constructed 1B model.
+    raw_state_dict, source_key = _extract_state_dict(
+        _safe_torch_load(path, torch.device("cpu"))
+    )
     target = model.state_dict()
     compatible: dict[str, torch.Tensor] = {}
     head_keys: list[str] = []
     unexpected: list[str] = []
-    for original_key, value in raw_state_dict.items():
-        key = _normalize_key(original_key)
+    for key, value in raw_state_dict.items():
         if key.startswith("head."):
             head_keys.append(key)
         elif key in target:
@@ -187,7 +190,7 @@ def load_backbone_checkpoint(model: EEGBackbone1B, checkpoint_path: Path | str, 
         checkpoint_path=str(path), checkpoint_source_key=source_key,
         loaded_tensor_count=len(compatible),
         loaded_parameter_count=sum(tensor.numel() for tensor in compatible.values()),
-        ignored_pretraining_head_keys=tuple(sorted(head_keys)),
+        ignored_keys=tuple(sorted(head_keys)), missing_keys=tuple(missing),
         load_seconds=time.perf_counter() - started, device=str(device),
     )
 
@@ -202,7 +205,7 @@ def resolve_device(requested: str | torch.device) -> torch.device:
 
 
 class Model1BBackbone(nn.Module):
-    """Latency-only wrapper that exposes final token embeddings, never logits."""
+    """Checkpoint-backed wrapper that exposes final token embeddings, never logits."""
 
     def __init__(self, config: Model1BConfig, *, load_checkpoint: bool = True) -> None:
         super().__init__()
@@ -220,19 +223,56 @@ class Model1BBackbone(nn.Module):
     def num_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self.model.parameters())
 
-    def forward(self, batch: Model1BBatchedInput) -> torch.Tensor:
+    def _validate_batch(self, batch: Model1BBatchedInput) -> None:
         batch.validate()
         if batch.num_tokens != self.config.num_tokens or batch.patch_len != self.config.patch_num_points:
             raise ValueError(
                 f"1B batch must be [B,{self.config.num_tokens},{self.config.patch_num_points}] for {self.config.window_seconds}s"
             )
+        tensors = (
+            batch.token_inputs,
+            batch.token_channel_indices,
+            batch.token_time_indices,
+            batch.token_valid_mask,
+            batch.channel_valid_mask,
+        )
+        if any(tensor.device != batch.token_inputs.device for tensor in tensors):
+            raise ValueError("all 1B prepared token tensors must be on the same device")
+        if batch.token_inputs.dtype != torch.float32:
+            raise TypeError("1B token_inputs must be torch.float32")
+        if batch.token_channel_indices.dtype != torch.int64:
+            raise TypeError("1B token_channel_indices must be torch.int64")
+        if batch.token_time_indices.dtype != torch.int64:
+            raise TypeError("1B token_time_indices must be torch.int64")
+        if batch.token_valid_mask.dtype != torch.float32 or batch.channel_valid_mask.dtype != torch.float32:
+            raise TypeError("1B validity masks must be torch.float32")
+        if not torch.isfinite(batch.token_inputs).all():
+            raise ValueError("1B token_inputs contains NaN or Inf")
+        if batch.channel_valid_mask.shape != (batch.batch_size, self.config.n_channels):
+            raise ValueError(
+                "1B channel_valid_mask must have shape "
+                f"[{batch.batch_size}, {self.config.n_channels}]"
+            )
+
+    def extract_embeddings(self, batch: Model1BBatchedInput) -> torch.Tensor:
+        """Return final-layer token embeddings with shape ``[B, S, 2048]``."""
+        self._validate_batch(batch)
         batch = batch.to(self.device_object)
-        with torch.no_grad():
+        self.model.eval()
+        with torch.inference_mode():
             embeddings = self.model(
                 batch.token_inputs, batch.token_channel_indices, batch.token_time_indices,
                 return_layer_idx=self.config.output_layer_idx,
             )
         expected = (batch.batch_size, self.config.num_tokens, self.config.d_model)
-        if tuple(embeddings.shape) != expected or not torch.isfinite(embeddings).all():
+        if (
+            tuple(embeddings.shape) != expected
+            or embeddings.dtype != torch.float32
+            or embeddings.device != self.device_object
+            or not torch.isfinite(embeddings).all()
+        ):
             raise RuntimeError(f"1B final encoder output is invalid; expected {expected}, got {tuple(embeddings.shape)}")
         return embeddings
+
+    def forward(self, batch: Model1BBatchedInput) -> torch.Tensor:
+        return self.extract_embeddings(batch)

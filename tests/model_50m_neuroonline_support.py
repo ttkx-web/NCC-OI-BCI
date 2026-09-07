@@ -90,6 +90,7 @@ class Tiny50MAdapter:
 def build_backend(
     *,
     aggregation: str = "flatten",
+    num_classes: int = 3,
 ) -> Model50MBackend:
     torch.manual_seed(42)
 
@@ -112,7 +113,7 @@ def build_backend(
         model_n_time_patches=2,
         output_layer_idx=0,
         aggregation=aggregation,
-        num_classes=3,
+        num_classes=num_classes,
     )
 
     return Model50MBackend(Tiny50MAdapter(config))

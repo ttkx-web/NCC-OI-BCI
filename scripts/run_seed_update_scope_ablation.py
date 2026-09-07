@@ -100,7 +100,15 @@ def validate_output_root(input_root: Path, output_root: Path) -> None:
 
 def normalized_neuroonline_config(value: object) -> dict[str, Any]:
     payload = dict(_mapping(value, "neuroonline_config"))
-    payload.setdefault("update_scope", "generator_and_head")
+    defaults = asdict(NeuroOnlineConfig())
+    for key in (
+        "update_scope",
+        "update_trigger",
+        "min_feedback_per_class",
+        "memory_strategy",
+        "balanced_memory_per_class",
+    ):
+        payload.setdefault(key, defaults[key])
     return payload
 
 

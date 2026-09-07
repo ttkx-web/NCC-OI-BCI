@@ -4,6 +4,7 @@ import copy
 import time
 
 from collections import (
+    Counter,
     OrderedDict,
     deque,
 )
@@ -48,6 +49,16 @@ VALID_UPDATE_SCOPES = (
     "head_only",
 )
 
+VALID_UPDATE_TRIGGERS = (
+    "feedback_count",
+    "class_coverage",
+)
+
+VALID_MEMORY_STRATEGIES = (
+    "recent_fifo",
+    "class_balanced_history",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class NeuroOnlineConfig:
@@ -70,6 +81,10 @@ class NeuroOnlineConfig:
 
     # 在线更新参数
     update_scope: str = "generator_and_head"
+    update_trigger: str = "feedback_count"
+    min_feedback_per_class: int = 1
+    memory_strategy: str = "recent_fifo"
+    balanced_memory_per_class: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
@@ -104,6 +119,24 @@ class NeuroOnlineConfig:
                 "update_scope must be one of "
                 f"{VALID_UPDATE_SCOPES}, got {self.update_scope!r}."
             )
+
+        if self.update_trigger not in VALID_UPDATE_TRIGGERS:
+            raise ValueError(
+                "update_trigger must be one of "
+                f"{VALID_UPDATE_TRIGGERS}, got {self.update_trigger!r}."
+            )
+
+        if self.memory_strategy not in VALID_MEMORY_STRATEGIES:
+            raise ValueError(
+                "memory_strategy must be one of "
+                f"{VALID_MEMORY_STRATEGIES}, got {self.memory_strategy!r}."
+            )
+
+        if self.min_feedback_per_class <= 0:
+            raise ValueError("min_feedback_per_class must be positive.")
+
+        if self.balanced_memory_per_class <= 0:
+            raise ValueError("balanced_memory_per_class must be positive.")
 
         if self.num_subject_codes <= 0:
             raise ValueError(
@@ -484,6 +517,17 @@ class NeuroOnlineStrategy(
             )
         )
 
+        self._balanced_training_buffers: dict[
+            int,
+            deque[_BufferedSample],
+        ] = {}
+        self._label_counts_seen: Counter[int] = Counter()
+        self._feedback_count_total = 0
+        self._num_classes = 0
+        self._latest_feedback_evaluation_ordinal: int | None = None
+        self._first_update_evaluation_ordinal: int | None = None
+        self._first_update_label_histogram: dict[str, int] | None = None
+
         self._feedback_since_update = 0
         self._update_step = 0
         self._model_revision = (
@@ -530,9 +574,9 @@ class NeuroOnlineStrategy(
 
     @property
     def buffered_sample_count(self) -> int:
-        return len(
-            self._training_buffer
-        )
+        if self.config.memory_strategy == "recent_fifo":
+            return len(self._training_buffer)
+        return sum(len(items) for items in self._balanced_training_buffers.values())
 
     @property
     def pending_observation_count(
@@ -541,6 +585,103 @@ class NeuroOnlineStrategy(
         return len(
             self._pending_observations
         )
+
+    def _label_histogram(
+        self,
+        samples: list[_BufferedSample] | None = None,
+    ) -> dict[str, int]:
+        counts = Counter(
+            sample.label
+            for sample in (samples if samples is not None else [])
+        )
+        return {
+            str(label): int(counts[label])
+            for label in range(self._num_classes)
+        }
+
+    def _seen_label_histogram(self) -> dict[str, int]:
+        return {
+            str(label): int(self._label_counts_seen[label])
+            for label in range(self._num_classes)
+        }
+
+    def _memory_label_histogram(self) -> dict[str, int]:
+        if self.config.memory_strategy == "recent_fifo":
+            return self._label_histogram(list(self._training_buffer))
+        return {
+            str(label): len(self._balanced_training_buffers[label])
+            for label in range(self._num_classes)
+        }
+
+    def _class_coverage_satisfied(self) -> bool:
+        return self._num_classes > 0 and all(
+            self._label_counts_seen[label] >= self.config.min_feedback_per_class
+            for label in range(self._num_classes)
+        )
+
+    def _select_update_samples(self) -> list[_BufferedSample]:
+        if self.config.memory_strategy == "recent_fifo":
+            return list(self._training_buffer)
+
+        available_labels = [
+            label
+            for label in range(self._num_classes)
+            if self._balanced_training_buffers[label]
+        ]
+        if not available_labels:
+            return []
+        n_per_class = min(
+            self.config.balanced_memory_per_class,
+            min(
+                len(self._balanced_training_buffers[label])
+                for label in available_labels
+            ),
+        )
+        selected: list[_BufferedSample] = []
+        for label in available_labels:
+            selected.extend(list(self._balanced_training_buffers[label])[-n_per_class:])
+        return selected
+
+    def _telemetry(
+        self,
+        *,
+        trigger_reason: str,
+        trigger_satisfied: bool,
+        update_applied: bool,
+        selected_samples: list[_BufferedSample] | None = None,
+    ) -> dict[str, object]:
+        selected = selected_samples or []
+        memory_histogram = self._memory_label_histogram()
+        available_memory_classes = [
+            label
+            for label in range(self._num_classes)
+            if memory_histogram[str(label)] > 0
+        ]
+        missing_memory_classes = [
+            label
+            for label in range(self._num_classes)
+            if memory_histogram[str(label)] == 0
+        ]
+        return {
+            "update_trigger": self.config.update_trigger,
+            "memory_strategy": self.config.memory_strategy,
+            "trigger_satisfied": trigger_satisfied,
+            "feedback_count_total": self._feedback_count_total,
+            "model_class_count": self._num_classes,
+            "label_counts_seen": self._seen_label_histogram(),
+            "class_coverage_satisfied": self._class_coverage_satisfied(),
+            "min_feedback_per_class": self.config.min_feedback_per_class,
+            "available_memory_classes": available_memory_classes,
+            "missing_memory_classes": missing_memory_classes,
+            "memory_label_histogram": memory_histogram,
+            "selected_update_label_histogram": self._label_histogram(selected),
+            "selected_update_sample_count": len(selected),
+            "trigger_reason": trigger_reason,
+            "update_applied": update_applied,
+            "update_step": self._update_step,
+            "first_update_evaluation_ordinal": self._first_update_evaluation_ordinal,
+            "first_update_label_histogram": self._first_update_label_histogram,
+        }
 
     @property
     def parameter_audit(self) -> dict[str, int | str]:
@@ -674,6 +815,14 @@ class NeuroOnlineStrategy(
                 "NeuroOnline adaptation: "
                 f"{type(backend).__name__}."
             )
+
+        self._num_classes = int(backend.num_classes)
+        if self._num_classes <= 0:
+            raise ValueError("NeuroOnline backend num_classes must be positive.")
+        self._balanced_training_buffers = {
+            label: deque(maxlen=self.config.balanced_memory_per_class)
+            for label in range(self._num_classes)
+        }
 
         # 让 Generator 初始化可复现。
         torch.manual_seed(
@@ -941,21 +1090,31 @@ class NeuroOnlineStrategy(
             .pop(observation_id)
         )
 
-        self._training_buffer.append(
-            _BufferedSample(
-                observation_id=(
-                    observation_id
-                ),
-                model_input=model_input,
-                label=label,
-            )
+        sample = _BufferedSample(
+            observation_id=observation_id,
+            model_input=model_input,
+            label=label,
         )
 
+        if self.config.memory_strategy == "recent_fifo":
+            self._training_buffer.append(sample)
+        else:
+            self._balanced_training_buffers[label].append(sample)
+
+        self._feedback_count_total += 1
+        self._label_counts_seen[label] += 1
         self._feedback_since_update += 1
+        evaluation_ordinal = feedback.metadata.get("trial_ordinal")
+        if isinstance(evaluation_ordinal, Integral) and not isinstance(
+            evaluation_ordinal, bool
+        ):
+            self._latest_feedback_evaluation_ordinal = int(evaluation_ordinal)
 
     def _not_applied_result(
         self,
         reason: str,
+        *,
+        trigger_satisfied: bool = False,
     ) -> OnlineUpdateResult:
         return OnlineUpdateResult(
             strategy_name=self.name,
@@ -970,15 +1129,18 @@ class NeuroOnlineStrategy(
             latency_ms=0.0,
             reason=reason,
             metrics={
-                "buffered_samples": len(
-                    self._training_buffer
-                ),
+                "buffered_samples": self.buffered_sample_count,
                 "pending_observations": len(
                     self._pending_observations
                 ),
                 "feedback_since_update": (
                     self
                     ._feedback_since_update
+                ),
+                **self._telemetry(
+                    trigger_reason=reason,
+                    trigger_satisfied=trigger_satisfied,
+                    update_applied=False,
                 ),
             },
         )
@@ -1009,19 +1171,31 @@ class NeuroOnlineStrategy(
                 "initialize()."
             )
 
-        buffered_count = len(
-            self._training_buffer
+        buffered_count = self.buffered_sample_count
+        warmup_count = (
+            buffered_count
+            if self.config.memory_strategy == "recent_fifo"
+            else self._feedback_count_total
         )
 
-        if (
-            buffered_count
-            < self.config.warmup_feedback
-        ):
-            return self._not_applied_result(
-                "waiting for warmup feedback: "
-                f"{buffered_count}/"
-                f"{self.config.warmup_feedback}"
-            )
+        if self._update_step == 0:
+            if self.config.update_trigger == "feedback_count" and (
+                warmup_count < self.config.warmup_feedback
+            ):
+                return self._not_applied_result(
+                    "waiting for warmup feedback: "
+                    f"{warmup_count}/"
+                    f"{self.config.warmup_feedback}"
+                )
+            if (
+                self.config.update_trigger == "class_coverage"
+                and not self._class_coverage_satisfied()
+            ):
+                return self._not_applied_result(
+                    "waiting for class coverage: "
+                    f"seen={self._seen_label_histogram()}, "
+                    f"minimum={self.config.min_feedback_per_class}"
+                )
 
         if (
             self._feedback_since_update
@@ -1042,9 +1216,12 @@ class NeuroOnlineStrategy(
         backend = self.forward_model.backend
         generator = self.forward_model.generator
 
-        samples = list(
-            self._training_buffer
-        )
+        samples = self._select_update_samples()
+        if not samples:
+            return self._not_applied_result(
+                "update trigger satisfied but memory contains no samples",
+                trigger_satisfied=True,
+            )
 
         started = time.perf_counter()
 
@@ -1052,6 +1229,7 @@ class NeuroOnlineStrategy(
         total_examples = 0
         batch_count = 0
         last_gradient_norm = 0.0
+        gradient_clipping_count = 0
 
         train_generator = self.config.update_scope != "head_only"
         train_head = self.config.update_scope != "generator_only"
@@ -1173,6 +1351,8 @@ class NeuroOnlineStrategy(
                         .cpu()
                         .item()
                     )
+                    if last_gradient_norm > self.config.max_grad_norm:
+                        gradient_clipping_count += 1
 
                     optimizer.step()
 
@@ -1210,6 +1390,14 @@ class NeuroOnlineStrategy(
                 "NeuroOnline update used no samples."
             )
 
+        if self._update_step == 0:
+            self._first_update_evaluation_ordinal = (
+                self._latest_feedback_evaluation_ordinal
+                if self._latest_feedback_evaluation_ordinal is not None
+                else self._feedback_count_total
+            )
+            self._first_update_label_histogram = self._label_histogram(samples)
+
         self._update_step += 1
 
         self._model_revision = (
@@ -1246,11 +1434,19 @@ class NeuroOnlineStrategy(
                     self.config
                     .epochs_per_update
                 ),
-                "buffered_samples": len(
-                    self._training_buffer
-                ),
+                "buffered_samples": self.buffered_sample_count,
                 "last_gradient_norm": (
                     last_gradient_norm
+                ),
+                "gradient_clipping_count": gradient_clipping_count,
+                "gradient_clipping_rate": (
+                    gradient_clipping_count / batch_count
+                ),
+                **self._telemetry(
+                    trigger_reason="update_conditions_satisfied",
+                    trigger_satisfied=True,
+                    update_applied=True,
+                    selected_samples=samples,
                 ),
                 **self.parameter_audit,
                 "gate_alpha": float(
@@ -1334,6 +1530,18 @@ class NeuroOnlineStrategy(
             in self._training_buffer
         ]
 
+        balanced_buffer_state = {
+            str(label): [
+                {
+                    "observation_id": sample.observation_id,
+                    "model_input": _clone_model_input_to_cpu(sample.model_input),
+                    "label": sample.label,
+                }
+                for sample in samples
+            ]
+            for label, samples in self._balanced_training_buffers.items()
+        }
+
         return {
             "strategy_name": self.name,
             "config": asdict(
@@ -1359,6 +1567,18 @@ class NeuroOnlineStrategy(
             ),
             "training_buffer": (
                 buffer_state
+            ),
+            "balanced_training_buffers": balanced_buffer_state,
+            "feedback_count_total": self._feedback_count_total,
+            "label_counts_seen": self._seen_label_histogram(),
+            "latest_feedback_evaluation_ordinal": (
+                self._latest_feedback_evaluation_ordinal
+            ),
+            "first_update_evaluation_ordinal": (
+                self._first_update_evaluation_ordinal
+            ),
+            "first_update_label_histogram": (
+                self._first_update_label_histogram
             ),
         }
 
@@ -1394,6 +1614,18 @@ class NeuroOnlineStrategy(
         saved_config = state.get(
             "config"
         )
+
+        if isinstance(saved_config, dict):
+            saved_config = dict(saved_config)
+            legacy_defaults = asdict(NeuroOnlineConfig())
+            for key in (
+                "update_scope",
+                "update_trigger",
+                "min_feedback_per_class",
+                "memory_strategy",
+                "balanced_memory_per_class",
+            ):
+                saved_config.setdefault(key, legacy_defaults[key])
 
         if saved_config != asdict(
             self.config
@@ -1593,6 +1825,70 @@ class NeuroOnlineStrategy(
                     label=label,
                 )
             )
+
+        for samples in self._balanced_training_buffers.values():
+            samples.clear()
+        balanced_buffer_state = state.get("balanced_training_buffers", {})
+        if not isinstance(balanced_buffer_state, dict):
+            raise TypeError("balanced_training_buffers must be a dictionary.")
+        for label_text, items in balanced_buffer_state.items():
+            label = int(label_text)
+            if label not in self._balanced_training_buffers:
+                raise ValueError("Saved balanced-memory label is outside class range.")
+            if not isinstance(items, list):
+                raise TypeError("Each balanced-memory buffer must be a list.")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise TypeError("Each balanced-memory item must be a dictionary.")
+                model_input = item.get("model_input")
+                if not isinstance(model_input, (torch.Tensor, dict)):
+                    raise TypeError("Saved balanced-memory model_input is invalid.")
+                saved_label = int(item["label"])
+                if saved_label != label:
+                    raise ValueError("Balanced-memory key and sample label differ.")
+                self._balanced_training_buffers[label].append(
+                    _BufferedSample(
+                        observation_id=str(item["observation_id"]),
+                        model_input=_clone_model_input_to_cpu(model_input),
+                        label=saved_label,
+                    )
+                )
+
+        restored_samples = [
+            *self._training_buffer,
+            *[
+                sample
+                for samples in self._balanced_training_buffers.values()
+                for sample in samples
+            ],
+        ]
+        self._feedback_count_total = int(
+            state.get("feedback_count_total", len(restored_samples))
+        )
+        label_counts = state.get("label_counts_seen")
+        if label_counts is None:
+            label_counts = dict(Counter(sample.label for sample in restored_samples))
+        if not isinstance(label_counts, dict):
+            raise TypeError("label_counts_seen must be a dictionary.")
+        self._label_counts_seen = Counter(
+            {int(label): int(count) for label, count in label_counts.items()}
+        )
+        latest_ordinal = state.get("latest_feedback_evaluation_ordinal")
+        self._latest_feedback_evaluation_ordinal = (
+            None if latest_ordinal is None else int(latest_ordinal)
+        )
+        first_ordinal = state.get("first_update_evaluation_ordinal")
+        self._first_update_evaluation_ordinal = (
+            None if first_ordinal is None else int(first_ordinal)
+        )
+        first_histogram = state.get("first_update_label_histogram")
+        if first_histogram is not None and not isinstance(first_histogram, dict):
+            raise TypeError("first_update_label_histogram must be a dictionary.")
+        self._first_update_label_histogram = (
+            None
+            if first_histogram is None
+            else {str(label): int(count) for label, count in first_histogram.items()}
+        )
 
         # 不恢复旧 session 中尚未收到反馈的预测。
         self._pending_observations.clear()

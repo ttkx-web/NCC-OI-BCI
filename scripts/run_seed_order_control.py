@@ -10,11 +10,13 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from _bootstrap import ROOT
+
+from bci_dayloop.inference.neuroonline_strategy import NeuroOnlineConfig
 
 
 DEFAULT_SUBJECTS = (1, 2, 3)
@@ -199,6 +201,20 @@ def _overall(summary: Mapping[str, Any], mode: str) -> Mapping[str, Any]:
     return _mapping(metrics.get("overall"), f"{mode}.metrics.overall")
 
 
+def _normalized_neuroonline_config(summary: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(_mapping(summary.get("neuroonline_config"), "neuroonline_config"))
+    defaults = asdict(NeuroOnlineConfig())
+    for key in (
+        "update_scope",
+        "update_trigger",
+        "min_feedback_per_class",
+        "memory_strategy",
+        "balanced_memory_per_class",
+    ):
+        payload.setdefault(key, defaults[key])
+    return payload
+
+
 def check_static_invariance(
     original_summary: Mapping[str, Any],
     shuffled_summary: Mapping[str, Any],
@@ -238,7 +254,9 @@ def collect_result(plan: OrderControlPlan) -> dict[str, Any]:
     order_control = _mapping(shuffled.get("order_control"), "order_control")
     if order_control.get("evaluation_order") != "random_permutation":
         raise RuntimeError("Shuffled summary lacks random_permutation provenance.")
-    if original.get("neuroonline_config") != shuffled.get("neuroonline_config"):
+    if _normalized_neuroonline_config(original) != _normalized_neuroonline_config(
+        shuffled
+    ):
         raise RuntimeError("NeuroOnline config differs from the frozen benchmark.")
 
     invariance = check_static_invariance(original, shuffled)

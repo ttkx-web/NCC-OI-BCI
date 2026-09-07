@@ -27,7 +27,9 @@ from bci_dayloop.data.sequential_dataset import (
 from bci_dayloop.inference.neuroonline_strategy import (
     NeuroOnlineConfig,
     NeuroOnlineStrategy,
+    VALID_MEMORY_STRATEGIES,
     VALID_UPDATE_SCOPES,
+    VALID_UPDATE_TRIGGERS,
 )
 from bci_dayloop.runtime.adaptation_types import (
     AdaptationContext,
@@ -108,6 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Auditable NeuroOnline parameter update scope.",
     )
+    parser.add_argument(
+        "--update-trigger",
+        choices=VALID_UPDATE_TRIGGERS,
+        default=None,
+    )
+    parser.add_argument("--min-feedback-per-class", type=int, default=None)
+    parser.add_argument(
+        "--memory-strategy",
+        choices=VALID_MEMORY_STRATEGIES,
+        default=None,
+    )
+    parser.add_argument("--balanced-memory-per-class", type=int, default=None)
     return parser
 
 
@@ -211,6 +225,22 @@ def resolve_settings(
             neuroonline_config,
             update_scope=str(update_scope),
         )
+    config_overrides = {
+        "update_trigger": getattr(args, "update_trigger", None),
+        "min_feedback_per_class": getattr(args, "min_feedback_per_class", None),
+        "memory_strategy": getattr(args, "memory_strategy", None),
+        "balanced_memory_per_class": getattr(
+            args, "balanced_memory_per_class", None
+        ),
+    }
+    neuroonline_config = replace(
+        neuroonline_config,
+        **{
+            key: value
+            for key, value in config_overrides.items()
+            if value is not None
+        },
+    )
 
     return SequentialSettings(
         data_path=resolve_path(data_value),

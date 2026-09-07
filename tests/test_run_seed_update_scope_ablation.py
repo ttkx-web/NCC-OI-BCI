@@ -50,7 +50,14 @@ def _mode(balanced_accuracy: float, *, updates: int = 0) -> dict:
 
 def _frozen_summary(data: Path, package: Path) -> dict:
     config = asdict(NeuroOnlineConfig())
-    config.pop("update_scope")  # Frozen Stage3 summaries predate the scope field.
+    for key in (
+        "update_scope",
+        "update_trigger",
+        "min_feedback_per_class",
+        "memory_strategy",
+        "balanced_memory_per_class",
+    ):
+        config.pop(key)  # Frozen Stage3 summaries predate diagnostic config fields.
     return {
         "data": {"path": str(data)},
         "runtime_package": {"path": str(package)},

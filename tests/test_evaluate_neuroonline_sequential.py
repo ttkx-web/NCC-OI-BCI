@@ -357,6 +357,29 @@ def test_cli_update_scope_overrides_yaml_without_changing_other_settings(tmp_pat
     assert resolved.neuroonline_config.warmup_feedback == 32
 
 
+def test_cli_trigger_and_memory_overrides_are_explicit(tmp_path):
+    args = seq.build_parser().parse_args(
+        [
+            "--data", str(tmp_path / "data.h5"),
+            "--model-package", str(tmp_path / "pkg"),
+            "--update-trigger", "class_coverage",
+            "--min-feedback-per-class", "8",
+            "--memory-strategy", "class_balanced_history",
+            "--balanced-memory-per-class", "32",
+        ]
+    )
+    resolved = seq.resolve_settings(
+        args,
+        {"project": {"run_dir": str(tmp_path / "runs")}},
+    )
+    config = resolved.neuroonline_config
+    assert config.update_trigger == "class_coverage"
+    assert config.min_feedback_per_class == 8
+    assert config.memory_strategy == "class_balanced_history"
+    assert config.balanced_memory_per_class == 32
+    assert config.update_scope == "generator_and_head"
+
+
 def test_post_warmup_starts_after_warmup_feedback():
     records = [
         {

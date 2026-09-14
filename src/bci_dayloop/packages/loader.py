@@ -14,6 +14,7 @@ from bci_dayloop.models.model_50m.backend import (
 )
 from bci_dayloop.models.model_50m.config import (
     Model50MConfig,
+    STANDARD_64_CHANNELS,
 )
 from bci_dayloop.preprocessing.canonical import (
     SignalCanonicalizer,
@@ -44,6 +45,13 @@ from bci_dayloop.models.labram_linear import (
 )
 from bci_dayloop.preprocessing.labram import (
     LaBraMInputTransform,
+)
+from bci_dayloop.models.model_1b.runtime import (
+    Model1BRuntime,
+    build_1b_runtime,
+)
+from bci_dayloop.training.model_1b.population import (
+    load_1b_head_checkpoint,
 )
 
 
@@ -810,6 +818,119 @@ def _load_50m_package(
     )
 
 
+def _load_1b_package(
+    *,
+    package_path: Path,
+    package_payload: dict[str, Any],
+    device: str,
+    verify_hashes: bool,
+) -> LoadedRuntimePackage:
+    package_yaml = package_path / "package.yaml"
+    model = _required_mapping(package_payload, "model", source=package_yaml)
+    files = _required_mapping(package_payload, "files", source=package_yaml)
+    contract = _required_mapping(package_payload, "input_contract", source=package_yaml)
+    runtime_config = _required_mapping(package_payload, "runtime", source=package_yaml)
+    package_metadata = _required_mapping(package_payload, "package", source=package_yaml)
+    backbone_path = _resolve_package_file(package_path, str(files["backbone"]), logical_name="backbone")
+    head_path = _resolve_package_file(package_path, str(files["head"]), logical_name="1B linear head")
+    preprocessing_path = _resolve_package_file(package_path, str(files["preprocessing"]), logical_name="preprocessing config")
+    metrics_path = _resolve_package_file(package_path, str(files["metrics"]), logical_name="metrics")
+    hashes = files.get("sha256", {})
+    if not isinstance(hashes, dict):
+        raise ValueError("files.sha256 must be a mapping")
+    if verify_hashes:
+        _verify_sha256(path=backbone_path, expected=hashes.get("backbone"), logical_name="backbone")
+        _verify_sha256(path=head_path, expected=hashes.get("head"), logical_name="1B linear head")
+
+    class_names = tuple(str(name) for name in model.get("class_names", ()))
+    num_classes = int(model.get("num_classes", 0))
+    if len(class_names) != num_classes or len(set(class_names)) != len(class_names):
+        raise ValueError("model.class_names must be unique and match model.num_classes")
+    expected_mapping = {str(index): name for index, name in enumerate(class_names)}
+    if model.get("label_mapping") != expected_mapping:
+        raise ValueError("model.label_mapping does not match model.class_names order")
+    if model.get("head_type") != "linear" or model.get("aggregation") != "flatten":
+        raise ValueError("1B Runtime Package requires a linear flatten head")
+    window_seconds = float(model.get("window_seconds", -1))
+    num_time_patches = int(model.get("num_time_patches", -1))
+    if not 1.0 <= window_seconds <= 10.0 or window_seconds != float(int(window_seconds)):
+        raise ValueError("1B Package window_seconds must be an integer in [1, 10]")
+    if num_time_patches != int(window_seconds):
+        raise ValueError("1B Package num_time_patches must equal window_seconds")
+    expected_tokens = 64 * num_time_patches
+    expected_input_dim = expected_tokens * 2048
+    if int(model.get("token_count", -1)) != expected_tokens:
+        raise ValueError("1B Package token_count does not match window_seconds")
+    if int(model.get("token_length", -1)) != 100:
+        raise ValueError("1B Package token_length must be 100")
+    if int(model.get("classifier_input_dim", -1)) != expected_input_dim:
+        raise ValueError("1B Package classifier_input_dim does not match window_seconds")
+    expected_architecture = {
+        "d_model": 2048, "n_heads": 16, "depth": 20,
+        "output_layer_idx": 19, "model_n_time_patches": 10,
+    }
+    if {key: model.get(key) for key in expected_architecture} != expected_architecture:
+        raise ValueError("1B Package architecture does not match the formal checkpoint")
+    if float(contract.get("window_sec", -1)) != window_seconds:
+        raise ValueError("input_contract.window_sec does not match model.window_seconds")
+    if int(contract.get("num_samples", -1)) != int(window_seconds * 100):
+        raise ValueError("input_contract.num_samples does not match 1B window_seconds")
+    contract_channels = tuple(str(name) for name in contract.get("channel_names", ()))
+    model_channels = tuple(str(name) for name in model.get("standard_channels", ()))
+    if len(contract_channels) != 64 or len(set(contract_channels)) != 64:
+        raise ValueError("1B Package input_contract must contain exactly 64 unique channels")
+    if model_channels != contract_channels:
+        raise ValueError("1B Package model/input_contract channel order mismatch")
+    if contract_channels != STANDARD_64_CHANNELS:
+        raise ValueError("1B Package channel order does not match the verified standard 64-channel contract")
+
+    preprocessing = load_yaml(preprocessing_path)
+    canonicalizer_config = _required_mapping(preprocessing, "canonicalizer", source=preprocessing_path)
+    transform = _required_mapping(preprocessing, "transform", source=preprocessing_path)
+    if transform.get("type") != "model_1b":
+        raise ValueError("Expected preprocessing transform type 'model_1b'")
+    if float(transform.get("window_seconds", -1)) != window_seconds:
+        raise ValueError("preprocessing window_seconds does not match Package model")
+    if int(transform.get("num_time_patches", -1)) != num_time_patches:
+        raise ValueError("preprocessing num_time_patches does not match Package model")
+
+    backbone_sha = _sha256_file(backbone_path)
+    head, head_metadata = load_1b_head_checkpoint(
+        head_path, window_seconds=window_seconds, class_names=class_names,
+        backbone_sha256=backbone_sha, device="cpu",
+    )
+    if int(head_metadata["classifier_input_dim"]) != expected_input_dim:
+        raise ValueError("1B head metadata classifier_input_dim differs from package.yaml")
+    runtime_model: Model1BRuntime = build_1b_runtime(
+        backbone_checkpoint=backbone_path, head=head, class_names=class_names, device=device,
+        window_seconds=window_seconds, target_sample_rate=float(contract["sample_rate"]),
+        patch_seconds=float(model["patch_seconds"]), patch_stride_seconds=float(model["patch_stride_seconds"]),
+        filter_enabled=bool(transform["filter_enabled"]), filter_low_hz=float(transform["filter_low_hz"]),
+        filter_high_hz=float(transform["filter_high_hz"]), filter_order=int(transform["filter_order"]),
+        reference_mode=str(transform["reference_mode"]), zscore_enabled=bool(transform["zscore_enabled"]),
+        zscore_eps=float(transform["zscore_eps"]), missing_channel_fill_value=float(transform["missing_channel_fill_value"]),
+        strict_window_duration=bool(contract.get("strict_window_duration", True)),
+        window_tolerance_seconds=float(transform.get("window_tolerance_seconds", 0.02)),
+    )
+    _validate_runtime_contract(runtime_model=runtime_model, contract=contract)
+    command_map_raw = runtime_config.get("command_map", {})
+    if not isinstance(command_map_raw, dict):
+        raise ValueError("runtime.command_map must be a mapping")
+    step_sec = float(runtime_config.get("step_sec", 0.5))
+    confidence_threshold = float(runtime_config.get("confidence_threshold", 0.55))
+    if step_sec <= 0 or not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("invalid 1B runtime step_sec or confidence_threshold")
+    return LoadedRuntimePackage(
+        runtime_model=runtime_model, package_path=package_path, model_type="model_1b",
+        model_name="1b-frozen-linear", class_names=class_names,
+        command_map={str(key): str(value) for key, value in command_map_raw.items()},
+        step_sec=step_sec, confidence_threshold=confidence_threshold,
+        is_test_head=bool(package_metadata.get("is_test_head", False)),
+        warning_message=package_metadata.get("warning_message"), metrics=_load_json(metrics_path),
+        package_metadata=package_payload,
+    )
+
+
 def _load_cbramod_package(
     *,
     package_path: Path,
@@ -1316,6 +1437,14 @@ def load_runtime_package(
             verify_hashes=verify_hashes,
         )
 
+    if model_type == "model_1b":
+        return _load_1b_package(
+            package_path=package,
+            package_payload=payload,
+            device=device,
+            verify_hashes=verify_hashes,
+        )
+
     if model_type == "labram":
         return _load_labram_package(
             package_path=package,
@@ -1334,5 +1463,5 @@ def load_runtime_package(
 
     raise ValueError(
         f"Unsupported model type {model_type!r}. "
-        "Currently available: model_50m, labram, cbramod."
+        "Currently available: model_50m, model_1b, labram, cbramod."
     )

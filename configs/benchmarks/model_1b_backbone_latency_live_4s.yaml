@@ -1,0 +1,20 @@
+benchmark:
+  # This is intentionally not a Runtime Model Package benchmark.
+  mode: device_backbone_latency_only
+  latency_only: true
+  device: cuda
+  backbone:
+    checkpoint: checkpoints/backbones/1b/pretrain_checkpoint_4.pt
+  source:
+    host_env: NEURACLE_JELLYFISH_HOST
+    port: 8712
+    expected_sampling_rate: 1000
+    duration_sec: 150
+  schedule:
+    # Placeholder selection; the same runner accepts 1.0/2.0/3.0/4.0 seconds.
+    window_sec: 4.0
+    step_sec: 0.5
+    warmup_windows: 20
+    measured_windows: 200
+  output:
+    root_dir: runs/benchmarks/model_1b_backbone_latency_live_4s

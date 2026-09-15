@@ -1,12 +1,24 @@
-"""Stable contract for the workload, attention, emotion application."""
+"""Stable contracts for shared-50M multi-head inference."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+# Keep ``TASKS`` as the legacy three-head tuple for source/API compatibility.
 TASKS = ("workload", "attention", "emotion")
-TASK_OUTPUT_DIMS: dict[str, int] = {"workload": 2, "attention": 3, "emotion": 3}
+AWAKENING_TASK = "awakening"
+FOUR_HEAD_TASKS = (*TASKS, AWAKENING_TASK)
+TASK_OUTPUT_DIMS: dict[str, int] = {
+    "workload": 2,
+    "attention": 3,
+    "emotion": 3,
+}
+KNOWN_TASK_OUTPUT_DIMS: dict[str, int] = {
+    **TASK_OUTPUT_DIMS,
+    AWAKENING_TASK: 2,
+}
+AWAKENING_CLASS_NAMES = ("non_awakening", "awakening")
 SHARED_FEATURE_CONTRACT: dict[str, Any] = {
     "feature_dim": 65_536, "window_seconds": 2.0, "target_sample_rate": 100.0,
     "embedding_layer_resolved": 9, "embedding_layer_internal_index": 8,
@@ -30,11 +42,47 @@ class HeadPrediction:
     confidence: float
     probabilities: tuple[float, ...]
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ThreeMentalStatePrediction:
-    workload: HeadPrediction
-    attention: HeadPrediction
-    emotion: HeadPrediction
+    """Ordered, task-addressable predictions for any manifest-defined heads.
+
+    The historical class name and ``prediction.workload`` style access remain
+    supported so existing three-head callers do not need to change.
+    """
+
+    _heads: Mapping[str, HeadPrediction]
+
+    def __init__(
+        self,
+        predictions: Mapping[str, HeadPrediction] | None = None,
+        **heads: HeadPrediction,
+    ) -> None:
+        if predictions is not None and heads:
+            raise TypeError("Provide predictions or keyword heads, not both.")
+        values = dict(predictions if predictions is not None else heads)
+        if not values:
+            raise ValueError("A multi-head prediction must contain at least one task.")
+        for task, prediction in values.items():
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("Prediction task_id values must be non-empty strings.")
+            if not isinstance(prediction, HeadPrediction):
+                raise TypeError(
+                    f"{task}: expected HeadPrediction, got {type(prediction).__name__}."
+                )
+        object.__setattr__(self, "_heads", values)
+
+    def __getattr__(self, task: str) -> HeadPrediction:
+        try:
+            return self._heads[task]
+        except KeyError as error:
+            raise AttributeError(task) from error
+
+    @property
+    def task_ids(self) -> tuple[str, ...]:
+        return tuple(self._heads)
+
+    def items(self) -> tuple[tuple[str, HeadPrediction], ...]:
+        return tuple(self._heads.items())
 
 @dataclass(frozen=True, slots=True)
 class ThreeMentalStateDiagnostics:

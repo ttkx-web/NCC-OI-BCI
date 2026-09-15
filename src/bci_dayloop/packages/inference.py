@@ -71,10 +71,23 @@ def _multi_head_contract(payload: dict[str, Any], *, manifest: Path) -> tuple[In
         raise ValueError(f"{manifest}: invalid three-state input/runtime contract.") from error
     if step_sec <= 0 or step_sec > contract.window_sec:
         raise ValueError(f"{manifest}: runtime.step_sec must be in (0, window_sec].")
-    if set(heads) != set(TASKS):
-        raise ValueError(f"{manifest}: three-state heads must contain exactly {TASKS}, got {tuple(sorted(heads))}.")
+    raw_tasks = required_mapping(payload, "model", source=manifest).get("tasks")
+    if raw_tasks is None and set(heads) == set(TASKS):
+        # Compatibility for the earliest schema-v2 three-head fixtures.
+        raw_tasks = list(TASKS)
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise ValueError(f"{manifest}: model.tasks must be a non-empty list.")
+    if any(not isinstance(task, str) for task in raw_tasks):
+        raise ValueError(f"{manifest}: task_id values must be strings.")
+    ordered_tasks = tuple(task.strip() for task in raw_tasks)
+    if any(not task for task in ordered_tasks):
+        raise ValueError(f"{manifest}: task_id values must be non-empty strings.")
+    if len(set(ordered_tasks)) != len(ordered_tasks):
+        raise ValueError(f"{manifest}: task_id values must be unique.")
+    if set(heads) != set(ordered_tasks):
+        raise ValueError(f"{manifest}: model.tasks and heads must contain the same task IDs.")
     tasks: list[InferenceTaskSpec] = []
-    for task in TASKS:
+    for task in ordered_tasks:
         entry = required_mapping(heads, task, source=manifest)
         names = entry.get("class_names")
         if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names):

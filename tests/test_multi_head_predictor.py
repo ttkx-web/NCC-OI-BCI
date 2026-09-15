@@ -196,6 +196,48 @@ def test_predictor_uses_one_shared_feature_and_returns_stable_results() -> None:
     assert all(not parameter.requires_grad for module in modules.values() for parameter in module.parameters())
 
 
+def test_four_heads_still_use_one_preprocessor_and_one_backbone_forward() -> None:
+    predictor, preprocessor, backbone, modules = _fake_predictor()
+    awakening_module = _CountingHead(2)
+    modules["awakening"] = awakening_module
+    awakening = _LoadedHead(
+        info=HeadCheckpointInfo(
+            task="awakening",
+            checkpoint_path=Path("awakening.pt"),
+            class_names=("non_awakening", "awakening"),
+            input_dim=65_536,
+            output_dim=2,
+            metadata={"positive_class_index": 1},
+        ),
+        module=awakening_module,
+    )
+    predictor = MultiHeadPredictor(
+        config=predictor.config,
+        preprocessor=preprocessor,  # type: ignore[arg-type]
+        tokenizer=_FakeTokenizer(),  # type: ignore[arg-type]
+        backbone=backbone,  # type: ignore[arg-type]
+        heads={
+            **{task: _loaded_head(task, module) for task, module in modules.items() if task != "awakening"},
+            "awakening": awakening,
+        },
+    )
+
+    result = predictor.predict(_window())
+    diagnostics = predictor.last_diagnostics
+
+    assert diagnostics is not None
+    assert preprocessor.calls == diagnostics.preprocessing_calls == 1
+    assert backbone.calls == diagnostics.backbone_forwards == 1
+    assert diagnostics.head_forwards == {
+        "workload": 1,
+        "attention": 1,
+        "emotion": 1,
+        "awakening": 1,
+    }
+    assert result.task_ids == ("workload", "attention", "emotion", "awakening")
+    assert result.awakening.label in {"non_awakening", "awakening"}
+
+
 def test_three_state_contract_order_dimensions_and_legacy_aliases() -> None:
     assert TASKS == ("workload", "attention", "emotion")
     assert TASK_OUTPUT_DIMS == {"workload": 2, "attention": 3, "emotion": 3}

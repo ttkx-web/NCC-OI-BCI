@@ -1,7 +1,7 @@
 """Schema, one-window entry point, and localhost HTTP service."""
 from __future__ import annotations
 import json, logging, time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Mapping, Protocol, Sequence
@@ -65,10 +65,9 @@ def infer_eeg_window(predictor: RawWindowPredictor, *, eeg: np.ndarray, sample_r
     return predictor.predict(RawEEGWindow(data=np.ascontiguousarray(data), channel_names=[str(name) for name in channel_names], sample_rate=float(sample_rate_hz), unit="uV", layout="CT", metadata={"source": "one_window_inference"}))
 def named_predictions(prediction: ThreeMentalStatePrediction) -> tuple[Prediction, ...]:
     result = []
-    for field in fields(prediction):
-        head = getattr(prediction, field.name)
-        if not isinstance(head, HeadPrediction): raise TypeError(f"{field.name}: expected HeadPrediction, got {type(head).__name__}.")
-        result.append(Prediction(field.name, int(head.label_id), str(head.label), float(head.confidence), tuple(float(v) for v in head.probabilities)))
+    for task, head in prediction.items():
+        if not isinstance(head, HeadPrediction): raise TypeError(f"{task}: expected HeadPrediction, got {type(head).__name__}.")
+        result.append(Prediction(task, int(head.label_id), str(head.label), float(head.confidence), tuple(float(v) for v in head.probabilities)))
     return tuple(result)
 @dataclass(frozen=True, slots=True)
 class InferenceServiceRuntime:

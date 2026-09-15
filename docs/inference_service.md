@@ -1,6 +1,6 @@
-# 三状态 localhost inference service
+# Shared-50M multi-head inference service
 
-`scripts/serve_inference.py` exposes the formal three-head Runtime Model Package
+`scripts/serve_inference.py` exposes a manifest-defined multi-head Runtime Model Package
 as a local IPC service. It listens on `127.0.0.1:8767` by default and loads the
 package once during startup; every request reuses that predictor instance.
 
@@ -98,6 +98,41 @@ python scripts/verify_three_state_inference.py \
 
 Rust/设备端只负责采集、窗口切分、单位转换和 HTTP 调用；Python Runtime 仍负责通道适配、重采样、滤波、归一化和模型推理。服务不负责滑窗切分。
 
+## 四头包（新增 Awakening）
+
+四头包复用同一份预处理器、tokenizer、50M Backbone 和 flatten feature；只在
+shared feature 后增加 `awakening` Linear head。旧三头包不需要迁移，loader
+按 `package.yaml` 的 `model.tasks` 加载任意数量的唯一 task ID。
+
+Awakening 的固定运行时语义为：
+
+- `task_id=awakening`
+- `class_names=[non_awakening, awakening]`
+- `positive_class_index=1`
+- `Linear(65536, 2)`
+
+导出到独立、可回滚的目录（不会覆盖旧三头包）：
+
+```bash
+python scripts/export_50m_multi_head_model_package.py \
+  --awakening-head checkpoints/heads/stage1/bnci2014_001/subject_01/awakening/subject_01/population/2s_flatten/head.pt \
+  --output model_packages/50m_three_states_plus_awakening \
+  --package-id 50m-three-states-plus-awakening
+```
+
+服务端前台启动：
+
+```bash
+python scripts/serve_inference.py \
+  --model-package model_packages/50m_three_states_plus_awakening \
+  --host 0.0.0.0 \
+  --port 8767 \
+  --device cuda
+```
+
+`0.0.0.0` 只是监听地址。服务器本机用 `http://127.0.0.1:8767`，远端客户端
+用 `http://<服务器实际IP>:8767`。
+
 To make a real-data direct-vs-HTTP check with the same exact window:
 
 ```bash
@@ -107,6 +142,30 @@ python scripts/verify_three_state_inference.py --mode http \
   --device cpu
 ```
 
-It starts an ephemeral localhost server unless `--server-url` is supplied, then
-compares task IDs, class IDs, labels, confidences, and complete probability
-vectors at `rtol=1e-5, atol=1e-6`.
+HTTP 一致性模式只连接显式指定的外部服务，不负责启动或关闭服务。它按
+`task_id`（而不是数组位置）比较 class、label、confidence 和完整 probability
+vector，容差为 `rtol=1e-5, atol=1e-6`：
+
+```bash
+python scripts/verify_three_state_inference.py \
+  --mode http \
+  --model-package model_packages/50m_three_states_plus_awakening \
+  --request /tmp/four_head_real_request.json \
+  --server-url http://127.0.0.1:8767 \
+  --direct-device cuda
+```
+
+显存不足时可先在服务启动前生成 direct reference，再启动服务比较 HTTP：
+
+```bash
+python scripts/verify_three_state_inference.py --mode http --export-only \
+  --model-package model_packages/50m_three_states_plus_awakening \
+  --request /tmp/four_head_real_request.json \
+  --export-reference /tmp/four_head_direct_response.json \
+  --direct-device cuda
+
+python scripts/verify_three_state_inference.py --mode http \
+  --request /tmp/four_head_real_request.json \
+  --reference-response /tmp/four_head_direct_response.json \
+  --server-url http://127.0.0.1:8767
+```

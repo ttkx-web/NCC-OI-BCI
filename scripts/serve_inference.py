@@ -9,7 +9,7 @@ from pathlib import Path
 from _bootstrap import ROOT
 from bci_dayloop.inference.http_service import InferenceServiceRuntime, create_inference_server
 from bci_dayloop.packages import load_inference_package
-from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS, TASKS
+from bci_dayloop.applications.three_mental_states.contract import DEFAULT_PATHS
 from bci_dayloop.packages.inference import THREE_MENTAL_STATES_PREDICTION_MODE
 
 
@@ -35,10 +35,12 @@ def main() -> None:
         raise ValueError("port must be between 0 and 65535.")
 
     package_path = _path(args.model_package)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.info("Loading runtime model package: %s", package_path)
     # Loading happens exactly once, before the server accepts any HTTP request.
     loaded = load_inference_package(package_path, device=args.device)
-    if loaded.prediction_mode != THREE_MENTAL_STATES_PREDICTION_MODE or tuple(task.task_id for task in loaded.tasks) != TASKS:
-        raise ValueError("serve_inference.py requires a three-mental-state Runtime Package (workload, attention, emotion).")
+    if loaded.prediction_mode != THREE_MENTAL_STATES_PREDICTION_MODE:
+        raise ValueError("serve_inference.py requires a shared-50M multi-head Runtime Package.")
     predictor = loaded.predictor
     runtime = InferenceServiceRuntime(
         predictor=predictor,
@@ -46,10 +48,20 @@ def main() -> None:
         device=str(getattr(predictor, "device")),
     )
     server = create_inference_server(args.host, args.port, runtime)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    tasks = ", ".join(task.task_id for task in loaded.tasks)
+    logging.info(
+        "Backbone loaded: model_family=50m device=%s target_sample_rate_hz=%s "
+        "window_seconds=%s feature_dim=%s",
+        predictor.device,
+        loaded.input_contract.sample_rate,
+        loaded.window_sec,
+        getattr(predictor.config, "classifier_input_dim", "unknown"),
+    )
+    logging.info("Loaded prediction heads: %s", tasks)
     print(
         f"NCC-OI-BCI inference service ready at http://{args.host}:{server.server_port} "
-        f"(package={package_path}, device={predictor.device})"
+        f"(package={package_path}, device={predictor.device}, tasks={tasks})",
+        flush=True,
     )
     try:
         server.serve_forever()

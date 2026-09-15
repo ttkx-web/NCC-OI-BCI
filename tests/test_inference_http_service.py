@@ -25,6 +25,7 @@ class FakePredictor:
             workload=HeadPrediction(1, "high", 0.8, (0.2, 0.8)),
             attention=HeadPrediction(2, "focused", 0.7, (0.1, 0.2, 0.7)),
             emotion=HeadPrediction(0, "negative", 0.6, (0.6, 0.3, 0.1)),
+            awakening=HeadPrediction(1, "awakening", 0.9, (0.1, 0.9)),
         )
 
 
@@ -74,8 +75,14 @@ def test_health_and_infer_return_named_predictions(service: tuple[str, FakePredi
     assert response["sequence_start"] == 7
     assert response["sequence_end"] == 9
     assert response["latency_ms"] >= 0
-    assert [item["task_id"] for item in response["predictions"]] == ["workload", "attention", "emotion"]
+    assert [item["task_id"] for item in response["predictions"]] == ["workload", "attention", "emotion", "awakening"]
     assert response["predictions"][0]["probabilities"] == pytest.approx([0.2, 0.8])
+    awakening = response["predictions"][3]
+    assert (awakening["task_id"], awakening["class_id"], awakening["label"]) == (
+        "awakening", 1, "awakening"
+    )
+    assert awakening["confidence"] == pytest.approx(0.9)
+    assert awakening["probabilities"] == pytest.approx([0.1, 0.9])
 
 
 def test_bad_schema_returns_4xx_without_calling_predictor(service: tuple[str, FakePredictor]) -> None:

@@ -269,7 +269,7 @@ class JsonlWindowLogger:
             ),
         }
 
-        if hasattr(result.prediction, "workload"):
+        if hasattr(result.prediction, "items"):
             record.update(
                 {
                     "prediction_type": "multi_head",
@@ -280,11 +280,7 @@ class JsonlWindowLogger:
                             "confidence": value.confidence,
                             "probabilities": list(value.probabilities),
                         }
-                        for task, value in (
-                            ("workload", result.prediction.workload),
-                            ("attention", result.prediction.attention),
-                            ("emotion", result.prediction.emotion),
-                        )
+                        for task, value in result.prediction.items()
                     },
                 }
             )

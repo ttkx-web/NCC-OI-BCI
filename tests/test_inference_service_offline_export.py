@@ -72,3 +72,17 @@ def test_verify_cli_exposes_all_modes_and_fixture_options() -> None:
     args = parser.parse_args(["--mode", "http", "--server-url", "http://127.0.0.1:8767"])
     assert args.server_url == "http://127.0.0.1:8767"
     assert parser.parse_args(["--mode", "all", "--export-request", "request.json"]).mode == "all"
+    args = parser.parse_args([
+        "--mode", "http",
+        "--request", "request.json",
+        "--server-url", "http://127.0.0.1:8767",
+        "--direct-device", "cpu",
+    ])
+    assert args.request == "request.json"
+    assert args.device == "cpu"
+
+
+def test_http_consistency_requires_external_server() -> None:
+    parser = offline.build_parser()
+    args = parser.parse_args(["--mode", "http"])
+    assert args.server_url is None

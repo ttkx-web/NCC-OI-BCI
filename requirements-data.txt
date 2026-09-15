@@ -10,4 +10,4 @@ h5py>=3.10
 PyYAML>=6.0
 mne>=1.6
 moabb>=1.1
-
+pylance>=4.0,<5

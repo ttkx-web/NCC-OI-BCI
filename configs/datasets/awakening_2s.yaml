@@ -1,0 +1,56 @@
+schema_version: 1
+dataset_name: awakening
+data_root: data/processed/awakening_2s
+data_pattern: subject_{subject:02d}.h5
+data_reader: eeg
+canonical_subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+
+classes:
+  names: [non_awakening, awakening]
+  positive_class_index: 1
+
+splits:
+  population_train: S1
+  population_validation: S2
+  target_final_test: S2
+  semantics: deterministic_group_split_by_source_lance_row_id
+  note: S1/S2 are deterministic logical splits, not experimental sessions.
+
+input:
+  sample_rate_hz: 200.0
+  window_seconds: 2.0
+  shape: [62, 400]
+  unit: uV
+
+model_50m:
+  checkpoint: checkpoints/backbones/50m/model_deploy.pt
+  target_sample_rate_hz: 100.0
+  target_shape: [64, 200]
+  patch_seconds: 1.0
+  patch_stride_seconds: 1.0
+  model_n_time_patches: 10
+  output_layer_idx: 8
+  aggregation: flatten
+  feature_dim: 65536
+  head: linear
+  num_classes: 2
+
+channel_profile:
+  id: awakening_62_to_model50m_standard64_v1
+  source: bci_dayloop.data.dataset_registry.AWAKENING_SOURCE_CHANNELS
+  target: bci_dayloop.models.model_50m.config.STANDARD_64_CHANNELS
+  mapped_channel_count: 60
+  ignored_source_channels: [TP9, TP10]
+  missing_model_channels: [AF7, AF8, F9, F10]
+  missing_channel_strategy: zero_with_valid_mask
+  note: Missing-channel zeros are spatial placeholders, never temporal padding.
+
+preprocessing:
+  version: model50m_preprocessing_v1
+  filter_enabled: true
+  filter_low_hz: 0.1
+  filter_high_hz: 75.0
+  reference_mode: none
+  resampler: scipy.signal.resample_poly
+  temporal_padding_allowed: false
+  temporal_cropping_allowed: false

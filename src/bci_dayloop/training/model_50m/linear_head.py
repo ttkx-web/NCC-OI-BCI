@@ -117,6 +117,7 @@ def validate_labels(
     *,
     num_classes: int,
     split_name: str,
+    require_all_classes: bool = True,
 ) -> None:
     labels = np.asarray(labels, dtype=np.int64)
     if labels.ndim != 1:
@@ -131,7 +132,7 @@ def validate_labels(
             f"got {np.unique(labels).tolist()}."
         )
     missing = sorted(set(range(num_classes)) - set(labels.tolist()))
-    if missing:
+    if require_all_classes and missing:
         raise ValueError(f"{split_name} is missing class(es): {missing}.")
 
 
@@ -380,6 +381,7 @@ def build_direct_trial_windows(
     num_classes: int,
     seed: int,
     split_name: str,
+    require_all_classes: bool = True,
 ) -> WindowSet:
     """
     将每个原始 Trial 直接作为一个模型窗口。
@@ -439,6 +441,7 @@ def build_direct_trial_windows(
         labels,
         num_classes=num_classes,
         split_name=split_name,
+        require_all_classes=require_all_classes,
     )
 
     rng = np.random.default_rng(seed)

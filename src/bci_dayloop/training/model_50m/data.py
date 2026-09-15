@@ -210,6 +210,7 @@ def validate_loaded_session(
     allowed_sessions: Sequence[str] | None = None,
     num_classes: int,
     path: Path,
+    require_all_classes: bool = True,
 ) -> None:
     required = {
         "data",
@@ -269,6 +270,7 @@ def validate_loaded_session(
         np.asarray(session_data["labels"], dtype=np.int64),
         num_classes=num_classes,
         split_name=f"subject_{expected_subject:02d}/{expected_session}",
+        require_all_classes=require_all_classes,
     )
 
     signal = np.asarray(session_data["data"])
@@ -377,6 +379,7 @@ def build_subject_window_bundle(
     max_windows_per_class: int | None,
     window_construction: str,
     direct_trial_anchor: str,
+    require_all_classes: bool = True,
 ) -> tuple[WindowBundle, HDF5Metadata, dict[str, Any]]:
     dataset = open_trial_reader(
         data_reader=data_reader,
@@ -407,6 +410,7 @@ def build_subject_window_bundle(
         max_windows_per_class=max_windows_per_class,
         window_construction=window_construction,
         direct_trial_anchor=direct_trial_anchor,
+        require_all_classes=require_all_classes,
     )
     summary.update(
         reader_identity(
@@ -435,6 +439,7 @@ def build_window_bundle_from_session_data(
     max_windows_per_class: int | None,
     window_construction: str,
     direct_trial_anchor: str,
+    require_all_classes: bool = True,
 ) -> tuple[WindowBundle, HDF5Metadata, dict[str, Any]]:
     """Build windows from an already selected source-trial subset."""
     effective_class_names = list(class_names or metadata.class_names)
@@ -446,6 +451,7 @@ def build_window_bundle_from_session_data(
         allowed_sessions=allowed_sessions,
         num_classes=num_classes,
         path=path,
+        require_all_classes=require_all_classes,
     )
 
     raw_trial_ids = np.asarray(session_data["trial_ids"], dtype=np.int64)
@@ -484,6 +490,7 @@ def build_window_bundle_from_session_data(
             split_name=(
                 f"subject_{subject_id:02d}/{session_name}"
             ),
+            require_all_classes=require_all_classes,
         )
 
     elif window_construction == "same_label_concat":
@@ -943,6 +950,7 @@ def build_population_split(
     reference_metadata: HDF5Metadata | None = None,
     window_construction: str,
     direct_trial_anchor: str,
+    require_all_classes_per_subject: bool = True,
 ) -> SplitBuildResult:
     bundles: list[WindowBundle] = []
     summaries: dict[str, Any] = {}
@@ -970,6 +978,7 @@ def build_population_split(
             max_windows_per_class=max_windows_per_class_per_subject,
             window_construction=window_construction,
             direct_trial_anchor=direct_trial_anchor,
+            require_all_classes=require_all_classes_per_subject,
         )
         if common_metadata is None:
             common_metadata = metadata

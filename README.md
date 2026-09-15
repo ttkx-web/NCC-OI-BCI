@@ -109,6 +109,8 @@ python -m pytest -q --basetemp="$PYTEST_TEMP"
 - 每个正式 Package、训练运行和评估输出都应保存 class semantics、preprocessing / checkpoint hash、split 和配置。
 
 数据适配与 CBRaMod 基线细节见 [docs/cbramod_baseline_protocol.md](docs/cbramod_baseline_protocol.md)。
+Awakening 2 秒 frozen-50M 的缓存、训练与评估入口见
+[docs/AWAKENING_50M_TRAINING.md](docs/AWAKENING_50M_TRAINING.md)。
 
 ## 常用工作流
 

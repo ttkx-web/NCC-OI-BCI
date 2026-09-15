@@ -17,6 +17,11 @@ from typing import Iterable, Mapping, Sequence
 import h5py
 import numpy as np
 
+from bci_dayloop.data.dataset_registry import (
+    AWAKENING_2S,
+    AWAKENING_SOURCE_CHANNELS,
+)
+
 
 SAMPLE_RATE = 200.0
 WINDOW_SECONDS = 2.0
@@ -28,19 +33,10 @@ PARENT_ELEMENTS = N_CHANNELS * PARENT_SAMPLES
 SUBWINDOWS_PER_PARENT = PARENT_SAMPLES // WINDOW_SAMPLES
 MIN_ALL_CHANNEL_ZERO_RUN_SAMPLES = 2
 
-CHANNEL_NAMES: tuple[str, ...] = (
-    "Iz", "O2", "Oz", "O1", "PO8", "PO4", "POz", "PO3", "PO7",
-    "P8", "P6", "P4", "P2", "Pz", "P1", "P3", "P5", "P7",
-    "TP10", "TP8", "CP6", "CP4", "CP2", "CPz", "CP1", "CP3",
-    "CP5", "TP7", "TP9", "T8", "C6", "C4", "C2", "Cz", "C1",
-    "C3", "C5", "T7", "FT8", "FC6", "FC4", "FC2", "FCz",
-    "FC1", "FC3", "FC5", "FT7", "F8", "F6", "F4", "F2", "Fz",
-    "F1", "F3", "F5", "F7", "AF4", "AFz", "AF3", "Fp2", "Fpz",
-    "Fp1",
-)
-CLASS_NAMES: tuple[str, ...] = ("non_awakening", "awakening")
+CHANNEL_NAMES = AWAKENING_SOURCE_CHANNELS
+CLASS_NAMES = AWAKENING_2S.class_names
 LABEL_MAPPING: dict[str, str] = {"0": CLASS_NAMES[0], "1": CLASS_NAMES[1]}
-SESSION_SEMANTICS = "deterministic_group_split_by_source_lance_row_id"
+SESSION_SEMANTICS = AWAKENING_2S.session_semantics
 
 
 @dataclass(frozen=True, slots=True)

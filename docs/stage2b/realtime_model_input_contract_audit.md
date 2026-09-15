@@ -56,7 +56,7 @@ Comparison-only alias and case reporting uses the existing `CHANNEL_ALIASES`; it
 
 - The anonymized repository contains no persisted, authoritative ordered list of the 59 live EEG channel names. A true per-name report of matched channels, missing model channels, unexpected channels, aliases, case differences, order differences, and duplicate names cannot be produced without recording or supplying that approved metadata.
 - No existing verified 59-to-64 realtime mapping configuration was found. This audit therefore does not design one.
-- `docs/standard_64_channels.json` ends with `A1`, `A2`, while the code-defined 50M `STANDARD_64_CHANNELS` ends with `F9`, `F10`. The baseline must be resolved against approved checkpoint/package metadata before a mapping can be verified.
+- `docs/standard_64_channels.json` now follows the code-defined 50M `STANDARD_64_CHANNELS` and ends with `F9`, `F10`. The separate 1B builder's historical `A1`, `A2` choice remains a 1B-specific checkpoint/package verification issue.
 - No real checkpoint/package metadata was loaded in this audit. The repository's default 50M Runtime remains a 10-second configuration; code can express 4 seconds, but this audit found no repository test proving a real checkpoint was validated under the four-second configuration.
 - The 50M reference requirement is not checkpoint-confirmed: code default is `none`, while average reference is an optional alternative.
 
